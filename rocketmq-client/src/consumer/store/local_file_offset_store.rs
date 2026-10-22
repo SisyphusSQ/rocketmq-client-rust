@@ -1,0 +1,1264 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+
+use cheetah_string::CheetahString;
+use dashmap::DashMap;
+use parking_lot::Mutex;
+use rocketmq_model::common::message::message_queue::MessageQueue;
+use rocketmq_protocol::protocol::RemotingDeserializable;
+use rocketmq_protocol::protocol::RemotingSerializable;
+use rocketmq_runtime::BudgetCapacity;
+use rocketmq_runtime::BudgetLimit;
+use rocketmq_runtime::BudgetedQueue;
+use rocketmq_runtime::FullPolicy;
+use rocketmq_runtime::QueuePushOutcome;
+use rocketmq_runtime::RateLimit;
+use rocketmq_runtime::ResourceBudget;
+use rocketmq_runtime::ScheduledTaskSnapshot;
+use serde::Serialize;
+use std::sync::LazyLock;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex as TokioMutex;
+use tracing::error;
+use tracing::info;
+use tracing::warn;
+
+use crate::consumer::store::controllable_offset::ControllableOffset;
+use crate::consumer::store::offset_serialize::OffsetSerialize;
+use crate::consumer::store::offset_serialize_wrapper::OffsetSerializeWrapper;
+use crate::consumer::store::offset_store::OffsetStoreTrait;
+use crate::consumer::store::read_offset_type::ReadOffsetType;
+use crate::factory::mq_client_instance::MQClientInstance;
+use crate::runtime::schedule_client_fixed_delay_task_with_context;
+use crate::runtime::spawn_client_tracked_task_with_context;
+use crate::runtime::ClientRuntime;
+use crate::runtime::ClientScheduledTaskHandle;
+use crate::runtime::ClientTrackedTaskHandle;
+use rocketmq_runtime::ChildServiceContext;
+
+const PERSIST_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const PERIODIC_PERSIST_INTERVAL: Duration = Duration::from_secs(5);
+
+// Custom: retain Java's public default directory property for application diagnostics.
+pub static LOCAL_OFFSET_STORE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
+    #[cfg(target_os = "windows")]
+    let home = std::env::var("USERPROFILE").map_or(PathBuf::from("C:\\tmp\\.rocketmq_offsets"), |home| {
+        PathBuf::from(home).join(".rocketmq_offsets")
+    });
+
+    #[cfg(not(target_os = "windows"))]
+    let home = std::env::var("HOME").map_or(PathBuf::from("/tmp/.rocketmq_offsets"), |home| {
+        PathBuf::from(home).join(".rocketmq_offsets")
+    });
+
+    std::env::var("rocketmq.client.localOffsetStoreDir").map_or(home, PathBuf::from)
+});
+
+enum PersistCommand {
+    PersistMQs(
+        HashSet<MessageQueue>,
+        Option<tokio::sync::oneshot::Sender<Result<(), std::io::Error>>>,
+    ),
+    PersistAll(Option<tokio::sync::oneshot::Sender<Result<(), std::io::Error>>>),
+    Shutdown,
+}
+
+impl PersistCommand {
+    fn retained_bytes(&self) -> usize {
+        let payload_bytes = match self {
+            Self::PersistMQs(queues, _) => queues.iter().fold(
+                queues
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<MessageQueue>() + 1),
+                |total, queue| {
+                    total
+                        .saturating_add(queue.topic().len())
+                        .saturating_add(queue.broker_name().len())
+                },
+            ),
+            Self::PersistAll(_) | Self::Shutdown => 0,
+        };
+        std::mem::size_of::<Self>().saturating_add(payload_bytes)
+    }
+}
+
+pub struct LocalFileOffsetStore {
+    client_instance: Arc<MQClientInstance>,
+    group_name: CheetahString,
+    store_path: CheetahString,
+    offset_table: Arc<DashMap<MessageQueue, ControllableOffset>>,
+    dirty_flag: Arc<AtomicBool>,
+    persist_commands: BudgetedQueue<PersistCommand>,
+    persist_handle: Mutex<PersistTaskHandle>,
+}
+
+enum PersistTaskHandle {
+    Tokio {
+        command_handle: ClientTrackedTaskHandle,
+        scheduled_handle: Option<ClientScheduledTaskHandle>,
+        final_persist_healthy: Arc<AtomicBool>,
+    },
+    NotStarted,
+}
+
+impl PersistTaskHandle {
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Tokio {
+                command_handle,
+                scheduled_handle,
+                ..
+            } => command_handle.is_finished() && scheduled_handle.as_ref().is_none_or(|handle| !handle.is_running()),
+            Self::NotStarted => true,
+        }
+    }
+
+    async fn shutdown(self, persist_commands: &BudgetedQueue<PersistCommand>, timeout: Duration) -> bool {
+        match self {
+            Self::Tokio {
+                command_handle,
+                scheduled_handle,
+                final_persist_healthy,
+            } => {
+                let started_at = std::time::Instant::now();
+                let mut healthy = true;
+                if let Some(scheduled_handle) = scheduled_handle {
+                    let report = scheduled_handle.shutdown(timeout).await;
+                    if !report.is_healthy() {
+                        warn!(
+                            report = %report.to_json(),
+                            "local offset store periodic persist shutdown report is unhealthy"
+                        );
+                        healthy = false;
+                    }
+                }
+
+                let command = PersistCommand::Shutdown;
+                let _ = persist_commands.try_push_control(command, std::mem::size_of::<PersistCommand>());
+                let remaining = timeout.checked_sub(started_at.elapsed()).unwrap_or(Duration::ZERO);
+                Self::shutdown_command_task(command_handle, remaining).await
+                    && healthy
+                    && final_persist_healthy.load(Ordering::Acquire)
+            }
+            Self::NotStarted => {
+                let command = PersistCommand::Shutdown;
+                let _ = persist_commands.try_push_control(command, std::mem::size_of::<PersistCommand>());
+                true
+            }
+        }
+    }
+
+    fn shutdown_now(self) {
+        if let Self::Tokio {
+            scheduled_handle: Some(scheduled_handle),
+            ..
+        } = self
+        {
+            let report = scheduled_handle.shutdown_now();
+            if !report.is_healthy() {
+                warn!(
+                    report = %report.to_json(),
+                    "local offset store periodic persist shutdown_now report is unhealthy"
+                );
+            }
+        }
+    }
+
+    async fn shutdown_command_task(handle: ClientTrackedTaskHandle, timeout: Duration) -> bool {
+        let report = handle.shutdown(timeout).await;
+        if !report.is_healthy() {
+            warn!(
+                report = %report.to_json(),
+                "local offset store persist task shutdown report is unhealthy"
+            );
+        }
+        report.is_healthy()
+    }
+
+    fn task_count(&self) -> usize {
+        match self {
+            Self::Tokio {
+                command_handle,
+                scheduled_handle,
+                ..
+            } => {
+                command_handle.task_count()
+                    + scheduled_handle
+                        .as_ref()
+                        .map(ClientScheduledTaskHandle::task_count)
+                        .unwrap_or_default()
+            }
+            Self::NotStarted => 0,
+        }
+    }
+
+    fn schedule_snapshot(&self) -> Vec<ScheduledTaskSnapshot> {
+        match self {
+            Self::Tokio {
+                scheduled_handle: Some(scheduled_handle),
+                ..
+            } => scheduled_handle.schedule_snapshot(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalFileOffsetStoreLifecycleProbe {
+    pub task_count_before_shutdown: usize,
+    pub task_count_after_shutdown: usize,
+    pub scheduled_runs: u64,
+    pub scheduled_skips: u64,
+    pub scheduled_overlaps: u64,
+    pub scheduled_failures: u64,
+    pub persisted_offset_file: bool,
+    pub shutdown_elapsed_us: u128,
+    pub healthy: bool,
+}
+
+impl LocalFileOffsetStore {
+    /// Creates a local offset store with a process-derived command budget.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the process memory limit is unavailable. Production
+    /// composition should prefer [`Self::try_new`].
+    pub fn new(
+        service_context: ChildServiceContext,
+        client_instance: Arc<MQClientInstance>,
+        group_name: CheetahString,
+    ) -> Self {
+        Self::try_new(service_context, client_instance, group_name)
+            .unwrap_or_else(|error| panic!("invalid local offset-store resource budget: {error}"))
+    }
+
+    pub fn try_new(
+        service_context: ChildServiceContext,
+        client_instance: Arc<MQClientInstance>,
+        group_name: CheetahString,
+    ) -> crate::ClientResult<Self> {
+        let store_path = LOCAL_OFFSET_STORE_DIR
+            .clone()
+            .join(client_instance.client_id.as_str())
+            .join(group_name.as_str())
+            .join("offsets.json")
+            .to_string_lossy()
+            .to_string();
+
+        let offset_table = Arc::new(DashMap::new());
+        let dirty_flag = Arc::new(AtomicBool::new(false));
+        let persist_commands = Self::build_persist_command_queue_with_parent(&client_instance.resource_budget())?;
+
+        // Clone for background task
+        let offset_table_clone = offset_table.clone();
+        let dirty_flag_clone = dirty_flag.clone();
+        let store_path_clone = store_path.clone();
+
+        let persist_handle = Self::spawn_background_persist_task_with_interval(
+            &service_context,
+            offset_table_clone,
+            dirty_flag_clone,
+            store_path_clone,
+            persist_commands.clone(),
+            PERIODIC_PERSIST_INTERVAL,
+        );
+
+        Ok(Self {
+            client_instance,
+            group_name,
+            store_path: CheetahString::from(store_path),
+            offset_table,
+            dirty_flag,
+            persist_commands,
+            persist_handle: Mutex::new(persist_handle),
+        })
+    }
+
+    fn build_persist_command_queue() -> crate::ClientResult<BudgetedQueue<PersistCommand>> {
+        Self::build_persist_command_queue_with_parent(&crate::runtime::standalone_client_resource_budget()?)
+    }
+
+    fn build_persist_command_queue_with_parent(
+        parent_budget: &ResourceBudget,
+    ) -> crate::ClientResult<BudgetedQueue<PersistCommand>> {
+        let queue_bytes = (parent_budget.limit().capacity.bytes / 64).max(1);
+        let control_bytes = std::mem::size_of::<PersistCommand>().min(queue_bytes);
+        let budget = parent_budget
+            .child(
+                "local-offset-persist-commands",
+                BudgetLimit::new(1_024, queue_bytes, FullPolicy::Reject)
+                    .with_control_reserve(BudgetCapacity::new(1, control_bytes).with_rate(RateLimit::new(1, 1)))
+                    .with_rate(RateLimit::new(1_024, 1_024))
+                    .with_max_age(Duration::from_secs(30)),
+            )
+            .map_err(|error| {
+                crate::ClientError::config_invalid_source("client.localOffsetStore.commandQueue", true, error)
+            })?;
+        Ok(BudgetedQueue::new(budget))
+    }
+
+    fn spawn_background_persist_task(
+        service_context: &ChildServiceContext,
+        offset_table: Arc<DashMap<MessageQueue, ControllableOffset>>,
+        dirty_flag: Arc<AtomicBool>,
+        store_path: String,
+        persist_commands: BudgetedQueue<PersistCommand>,
+    ) -> PersistTaskHandle {
+        Self::spawn_background_persist_task_with_interval(
+            service_context,
+            offset_table,
+            dirty_flag,
+            store_path,
+            persist_commands,
+            PERIODIC_PERSIST_INTERVAL,
+        )
+    }
+
+    fn spawn_background_persist_task_with_interval(
+        service_context: &ChildServiceContext,
+        offset_table: Arc<DashMap<MessageQueue, ControllableOffset>>,
+        dirty_flag: Arc<AtomicBool>,
+        store_path: String,
+        persist_commands: BudgetedQueue<PersistCommand>,
+        persist_interval: Duration,
+    ) -> PersistTaskHandle {
+        let persist_lock = Arc::new(TokioMutex::new(()));
+        let command_offset_table = offset_table.clone();
+        let command_dirty_flag = dirty_flag.clone();
+        let command_store_path = store_path.clone();
+        let command_persist_lock = persist_lock.clone();
+        // Custom: task termination alone does not prove the final durable write.
+        let final_persist_healthy = Arc::new(AtomicBool::new(false));
+        let command_final_persist_healthy = final_persist_healthy.clone();
+        let task = async move {
+            let healthy = Self::background_persist_task(
+                command_offset_table,
+                command_dirty_flag,
+                command_store_path,
+                persist_commands,
+                command_persist_lock,
+            )
+            .await;
+            command_final_persist_healthy.store(healthy, Ordering::Release);
+        };
+
+        let command_handle = match spawn_client_tracked_task_with_context(
+            service_context,
+            "rocketmq-client-local-offset-store",
+            Box::pin(task),
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                error!("Failed to spawn LocalFileOffsetStore background task: {}", error);
+                return PersistTaskHandle::NotStarted;
+            }
+        };
+
+        let scheduled_offset_table = offset_table;
+        let scheduled_dirty_flag = dirty_flag;
+        let scheduled_store_path = store_path;
+        let scheduled_handle = match schedule_client_fixed_delay_task_with_context(
+            service_context,
+            "rocketmq-client-local-offset-store-periodic",
+            persist_interval,
+            persist_interval,
+            move || {
+                let offset_table = scheduled_offset_table.clone();
+                let dirty_flag = scheduled_dirty_flag.clone();
+                let store_path = scheduled_store_path.clone();
+                let persist_lock = persist_lock.clone();
+                async move {
+                    if dirty_flag.swap(false, Ordering::AcqRel) {
+                        let _guard = persist_lock.lock().await;
+                        if let Err(error) = Self::do_persist(&offset_table, &store_path, None).await {
+                            error!("Background persist failed: {}", error);
+                            dirty_flag.store(true, Ordering::Release);
+                        }
+                    }
+                }
+            },
+        ) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                error!("Failed to spawn LocalFileOffsetStore periodic task: {}", error);
+                None
+            }
+        };
+
+        PersistTaskHandle::Tokio {
+            command_handle,
+            scheduled_handle,
+            final_persist_healthy,
+        }
+    }
+
+    pub async fn shutdown(&self) -> bool {
+        self.shutdown_with_timeout(PERSIST_TASK_SHUTDOWN_TIMEOUT).await
+    }
+
+    pub async fn shutdown_with_timeout(&self, timeout: Duration) -> bool {
+        let handle = {
+            let mut persist_handle = self.persist_handle.lock();
+            std::mem::replace(&mut *persist_handle, PersistTaskHandle::NotStarted)
+        };
+        handle.shutdown(&self.persist_commands, timeout).await
+    }
+
+    fn persist_task_count(&self) -> usize {
+        self.persist_handle.lock().task_count()
+    }
+
+    fn periodic_persist_snapshot(&self) -> Vec<ScheduledTaskSnapshot> {
+        self.persist_handle.lock().schedule_snapshot()
+    }
+
+    // Custom fork: only a genuinely absent primary and backup means no stored offset.
+    async fn read_local_offset(&self) -> crate::ClientResult<Option<OffsetSerializeWrapper>> {
+        match Self::read_offset_file_checked(self.store_path.as_str()).await {
+            Ok(Some(wrapper)) => Ok(Some(wrapper)),
+            Ok(None) => self.read_local_offset_bak().await,
+            Err(primary_error) => match self.read_local_offset_bak().await {
+                Ok(Some(wrapper)) => {
+                    warn!("Recovered local offsets from the backup file");
+                    Ok(Some(wrapper))
+                }
+                _ => Err(primary_error),
+            },
+        }
+    }
+    async fn read_local_offset_bak(&self) -> crate::ClientResult<Option<OffsetSerializeWrapper>> {
+        Self::read_offset_file_checked(&format!("{}.bak", self.store_path)).await
+    }
+    async fn read_offset_file_checked(path: &str) -> crate::ClientResult<Option<OffsetSerializeWrapper>> {
+        let content = match fs::read(path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(crate::ClientError::service_source("local_offset_read", error)),
+        };
+        OffsetSerialize::decode(&content)
+            .map(|value: OffsetSerialize| Some(value.into()))
+            .map_err(|error| crate::ClientError::service_source("local_offset_decode", error))
+    }
+
+    async fn atomic_write_to_file(store_path: &str, content: &str) -> Result<(), std::io::Error> {
+        let tmp_path = format!("{}.tmp", store_path);
+        let bak_path = format!("{}.bak", store_path);
+        let parent = Path::new(store_path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        // Custom: a new broadcast client/group has no offset directory yet.
+        // Propagate creation errors before publishing any ledger file.
+        fs::create_dir_all(parent).await?;
+
+        // 1. Write to temporary file and fsync
+        let mut tmp_file = fs::File::create(&tmp_path).await?;
+        tmp_file.write_all(content.as_bytes()).await?;
+        tmp_file.sync_all().await?;
+        drop(tmp_file);
+
+        // 2. Backup existing file if it exists
+        match fs::metadata(store_path).await {
+            Ok(_) => fs::rename(store_path, &bak_path).await?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        // 3. Atomic rename (POSIX guarantees atomicity)
+        fs::rename(&tmp_path, store_path).await?;
+
+        // 4. Fsync the directory to ensure rename is durable
+        fs::File::open(parent).await?.sync_all().await?;
+
+        Ok(())
+    }
+
+    async fn background_persist_task(
+        offset_table: Arc<DashMap<MessageQueue, ControllableOffset>>,
+        dirty_flag: Arc<AtomicBool>,
+        store_path: String,
+        commands: BudgetedQueue<PersistCommand>,
+        persist_lock: Arc<TokioMutex<()>>,
+    ) -> bool {
+        while let Some(command) = commands.recv_budgeted().await {
+            let (cmd, _permit, _) = command.into_parts();
+            match cmd {
+                PersistCommand::PersistMQs(mqs, reply) => {
+                    let _guard = persist_lock.lock().await;
+                    let result = Self::do_persist(&offset_table, &store_path, Some(mqs)).await;
+                    if let Err(ref e) = result {
+                        error!("Persist MQs failed: {}", e);
+                    }
+                    if let Some(tx) = reply {
+                        tx.send(result).ok();
+                    }
+                }
+                PersistCommand::PersistAll(reply) => {
+                    let _guard = persist_lock.lock().await;
+                    let result = Self::do_persist(&offset_table, &store_path, None).await;
+                    if let Err(ref e) = result {
+                        error!("Persist all failed: {}", e);
+                    }
+                    if let Some(tx) = reply {
+                        tx.send(result).ok();
+                    }
+                }
+                PersistCommand::Shutdown => {
+                    // Final persist before shutdown
+                    if dirty_flag.load(Ordering::Acquire) {
+                        let _guard = persist_lock.lock().await;
+                        if let Err(e) = Self::do_persist(&offset_table, &store_path, None).await {
+                            error!("Final persist on shutdown failed: {}", e);
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    async fn do_persist(
+        offset_table: &DashMap<MessageQueue, ControllableOffset>,
+        store_path: &str,
+        mqs: Option<HashSet<MessageQueue>>,
+    ) -> Result<(), std::io::Error> {
+        // Read existing offsets
+        // Custom fork: a failed read or corrupt existing ledger cannot become an empty success.
+        let existing = match fs::read_to_string(store_path).await {
+            Ok(value) => Some(value),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+
+        let mut wrapper = if let Some(existing) = existing {
+            OffsetSerialize::decode(existing.as_bytes())
+                .map(|v: OffsetSerialize| OffsetSerializeWrapper::from(v))
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+        } else {
+            OffsetSerializeWrapper::default()
+        };
+
+        // Collect offsets to persist
+        match mqs {
+            Some(ref set) => {
+                for mq in set {
+                    if let Some(entry) = offset_table.get(mq) {
+                        wrapper
+                            .offset_table
+                            .insert(mq.clone(), AtomicI64::new(entry.value().get_offset()));
+                    }
+                }
+            }
+            None => {
+                for entry in offset_table.iter() {
+                    wrapper
+                        .offset_table
+                        .insert(entry.key().clone(), AtomicI64::new(entry.value().get_offset()));
+                }
+            }
+        }
+
+        // Serialize
+        let content = OffsetSerialize::from(wrapper)
+            .serialize_json_pretty()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        if content.is_empty() {
+            return Ok(());
+        }
+
+        // Use atomic write function
+        Self::atomic_write_to_file(store_path, &content).await
+    }
+
+    /// Custom fork: return queue/worker/I/O failures to an explicit commit caller.
+    pub(crate) async fn read_from_store_checked(&self, mq: &MessageQueue) -> crate::ClientResult<i64> {
+        let wrapper = self.read_local_offset().await?;
+        let offset = wrapper.and_then(|wrapper| {
+            wrapper
+                .offset_table
+                .get(mq)
+                .map(|offset| offset.load(Ordering::Acquire))
+        });
+        if let Some(offset) = offset {
+            self.update_offset(mq, offset, false).await;
+        }
+        Ok(offset.unwrap_or(-1))
+    }
+
+    /// Explicit commit observes the durable worker result.
+    pub(crate) async fn persist_all_checked(&self, mqs: &HashSet<MessageQueue>) -> crate::ClientResult<()> {
+        if mqs.is_empty() {
+            return Ok(());
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let command = PersistCommand::PersistMQs(mqs.clone(), Some(sender));
+        let size = command.retained_bytes();
+        match self.persist_commands.try_push_data(command, size) {
+            QueuePushOutcome::Rejected { .. } => {
+                return Err(crate::ClientError::service_failed("local_offset_persist_queue"))
+            }
+            _ => {}
+        }
+        receiver
+            .await
+            .map_err(|error| crate::ClientError::service_source("local_offset_persist_worker", error))?
+            .map_err(|error| crate::ClientError::service_source("local_offset_persist_io", error))
+    }
+
+    async fn submit_persist_command(
+        &self,
+        command: PersistCommand,
+        receiver: tokio::sync::oneshot::Receiver<Result<(), std::io::Error>>,
+        operation: &'static str,
+    ) {
+        let retained_bytes = command.retained_bytes();
+        match self.persist_commands.try_push_data(command, retained_bytes) {
+            QueuePushOutcome::Enqueued | QueuePushOutcome::Coalesced { .. } | QueuePushOutcome::DroppedStale { .. } => {
+                Self::await_persist_result(receiver, operation).await
+            }
+            QueuePushOutcome::Rejected { item, rejection } => {
+                drop(item);
+                warn!(
+                    operation,
+                    ?rejection,
+                    "local offset persist queue rejected a scoped command; retrying through the control reserve"
+                );
+
+                let (fallback_sender, fallback_receiver) = tokio::sync::oneshot::channel();
+                let fallback = PersistCommand::PersistAll(Some(fallback_sender));
+                let retained_bytes = fallback.retained_bytes();
+                match self.persist_commands.try_push_control(fallback, retained_bytes) {
+                    QueuePushOutcome::Enqueued
+                    | QueuePushOutcome::Coalesced { .. }
+                    | QueuePushOutcome::DroppedStale { .. } => {
+                        Self::await_persist_result(fallback_receiver, operation).await
+                    }
+                    QueuePushOutcome::Rejected { rejection, .. } => {
+                        error!(
+                            operation,
+                            ?rejection,
+                            "local offset persist control reserve is unavailable; the dirty offset remains eligible \
+                             for periodic persistence"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    async fn await_persist_result(
+        receiver: tokio::sync::oneshot::Receiver<Result<(), std::io::Error>>,
+        operation: &'static str,
+    ) {
+        match receiver.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => error!(operation, %error, "local offset persistence failed"),
+            Err(error) => error!(
+                operation,
+                %error,
+                "local offset persistence worker dropped the completion channel"
+            ),
+        }
+    }
+}
+
+impl OffsetStoreTrait for LocalFileOffsetStore {
+    async fn load(&self) -> crate::ClientResult<()> {
+        let offset_serialize_wrapper = self.read_local_offset().await?;
+        if let Some(offset_serialize_wrapper) = offset_serialize_wrapper {
+            let offset_table = offset_serialize_wrapper.offset_table;
+            self.offset_table.clear();
+            for (mq, offset) in offset_table {
+                let offset = offset.load(Ordering::Relaxed);
+                info!("load consumer's offset, {} {} {}", self.group_name, mq, offset);
+                self.offset_table.insert(mq, ControllableOffset::new(offset));
+            }
+        }
+        Ok(())
+    }
+
+    async fn update_offset(&self, mq: &MessageQueue, offset: i64, increase_only: bool) {
+        self.offset_table
+            .entry(mq.clone())
+            .and_modify(|v| {
+                if increase_only {
+                    v.update(offset, true);
+                } else {
+                    v.update_unconditionally(offset);
+                }
+            })
+            .or_insert_with(|| ControllableOffset::new(offset));
+
+        self.dirty_flag.store(true, Ordering::Release);
+    }
+
+    async fn update_and_freeze_offset(&self, mq: &MessageQueue, offset: i64) {
+        self.offset_table
+            .entry(mq.clone())
+            .and_modify(|v| v.update_and_freeze(offset))
+            .or_insert_with(|| ControllableOffset::new_frozen(offset));
+
+        self.dirty_flag.store(true, Ordering::Release);
+    }
+
+    async fn read_offset(&self, mq: &MessageQueue, type_: ReadOffsetType) -> i64 {
+        match type_ {
+            ReadOffsetType::ReadFromMemory => self
+                .offset_table
+                .get(mq)
+                .map(|entry| entry.value().get_offset())
+                .unwrap_or(-1),
+            ReadOffsetType::MemoryFirstThenStore => {
+                if let Some(offset) = self.offset_table.get(mq).map(|entry| entry.value().get_offset()) {
+                    return offset;
+                }
+                match self.read_local_offset().await {
+                    Ok(offset_serialize_wrapper) => {
+                        if let Some(offset_serialize_wrapper) = offset_serialize_wrapper {
+                            if let Some(offset) = offset_serialize_wrapper.offset_table.get(mq) {
+                                let offset = offset.load(Ordering::Relaxed);
+                                self.update_offset(mq, offset, false).await;
+                                offset
+                            } else {
+                                -1
+                            }
+                        } else {
+                            -1
+                        }
+                    }
+                    Err(_) => -1,
+                }
+            }
+            ReadOffsetType::ReadFromStore => match self.read_local_offset().await {
+                Ok(offset_serialize_wrapper) => {
+                    if let Some(offset_serialize_wrapper) = offset_serialize_wrapper {
+                        if let Some(offset) = offset_serialize_wrapper.offset_table.get(mq) {
+                            let offset = offset.load(Ordering::Relaxed);
+                            self.update_offset(mq, offset, false).await;
+                            offset
+                        } else {
+                            -1
+                        }
+                    } else {
+                        -1
+                    }
+                }
+                Err(_) => -1,
+            },
+        }
+    }
+
+    async fn persist_all(&self, mqs: &HashSet<MessageQueue>) {
+        if mqs.is_empty() {
+            return;
+        }
+
+        // Send persist command and wait for completion to maintain original semantics
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let command = PersistCommand::PersistMQs(mqs.clone(), Some(tx));
+        self.submit_persist_command(command, rx, "persist_all").await;
+    }
+
+    async fn persist(&self, mq: &MessageQueue) {
+        // Send persist command and wait for completion to maintain original semantics
+        let mut set = HashSet::new();
+        set.insert(mq.clone());
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let command = PersistCommand::PersistMQs(set, Some(tx));
+        self.submit_persist_command(command, rx, "persist").await;
+    }
+
+    async fn remove_offset(&self, mq: &MessageQueue) {
+        self.offset_table.remove(mq);
+        self.dirty_flag.store(true, Ordering::Release);
+        info!(
+            "remove unnecessary messageQueue offset. group={}, mq={}, offsetTableSize={}",
+            mq,
+            self.group_name,
+            self.offset_table.len()
+        );
+    }
+
+    async fn clone_offset_table(&self, topic: &str) -> HashMap<MessageQueue, i64> {
+        self.offset_table
+            .iter()
+            .filter(|entry| topic.is_empty() || entry.key().topic_str() == topic)
+            .map(|entry| (entry.key().clone(), entry.value().get_offset()))
+            .collect()
+    }
+
+    async fn update_consume_offset_to_broker(
+        &self,
+        _mq: &MessageQueue,
+        _offset: i64,
+        _is_oneway: bool,
+    ) -> crate::ClientResult<()> {
+        Ok(())
+    }
+}
+
+impl Drop for LocalFileOffsetStore {
+    fn drop(&mut self) {
+        // Send shutdown command to background task
+        let command = PersistCommand::Shutdown;
+        let _ = self
+            .persist_commands
+            .try_push_control(command, std::mem::size_of::<PersistCommand>());
+        let handle = std::mem::replace(self.persist_handle.get_mut(), PersistTaskHandle::NotStarted);
+        handle.shutdown_now();
+        // Note: We can't await the command worker in Drop (it's not async).
+        // The worker receives Shutdown and performs the final persist best-effort.
+    }
+}
+
+#[doc(hidden)]
+pub async fn run_local_file_offset_store_lifecycle_probe(
+    client_runtime: Arc<ClientRuntime>,
+) -> LocalFileOffsetStoreLifecycleProbe {
+    use crate::base::client_config::ClientConfig;
+
+    let root = std::env::temp_dir().join(format!(
+        "rocketmq-rust-local-offset-store-probe-{}",
+        rocketmq_runtime::common::time_utils::current_millis()
+    ));
+    let store_path = root.join("offsets.json").to_string_lossy().to_string();
+    if let Some(parent) = Path::new(&store_path).parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .expect("local offset probe directory should be created");
+    }
+
+    let client_instance = MQClientInstance::new_arc(
+        ClientConfig::default(),
+        0,
+        format!("local-offset-store-probe-{}", std::process::id()),
+        None,
+        client_runtime.component("local-offset-store-probe"),
+        client_runtime.telemetry_handle().clone(),
+        client_runtime.pool().request_future_holder(),
+    );
+    let offset_table = Arc::new(DashMap::<MessageQueue, ControllableOffset>::new());
+    let dirty_flag = Arc::new(AtomicBool::new(false));
+    let persist_commands =
+        LocalFileOffsetStore::build_persist_command_queue().expect("local offset probe persist command queue");
+    let persist_handle = LocalFileOffsetStore::spawn_background_persist_task_with_interval(
+        &client_runtime.component("local-offset-persist-probe"),
+        offset_table.clone(),
+        dirty_flag.clone(),
+        store_path.clone(),
+        persist_commands.clone(),
+        Duration::from_millis(1),
+    );
+    let store = LocalFileOffsetStore {
+        client_instance,
+        group_name: CheetahString::from_static_str("local_offset_store_probe_group"),
+        store_path: CheetahString::from(store_path.clone()),
+        offset_table,
+        dirty_flag,
+        persist_commands,
+        persist_handle: Mutex::new(persist_handle),
+    };
+    let mq = MessageQueue::from_parts("local-offset-store-probe-topic", "broker-a", 0);
+    store.update_offset(&mq, 66, false).await;
+
+    let mut snapshots = store.periodic_persist_snapshot();
+    for _ in 0..100 {
+        if snapshots
+            .iter()
+            .any(|snapshot| snapshot.runs > 0 && snapshot.active_runs == 0)
+            && tokio::fs::try_exists(&store_path).await.unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        snapshots = store.periodic_persist_snapshot();
+    }
+
+    let scheduled_runs = snapshots.iter().map(|snapshot| snapshot.runs).sum();
+    let scheduled_skips = snapshots.iter().map(|snapshot| snapshot.skips).sum();
+    let scheduled_overlaps = snapshots.iter().map(|snapshot| snapshot.overlaps).sum();
+    let scheduled_failures = snapshots.iter().map(|snapshot| snapshot.failures).sum();
+    let task_count_before_shutdown = store.persist_task_count();
+    let persisted_offset_file = tokio::fs::try_exists(&store_path).await.unwrap_or(false);
+    let shutdown_started_at = std::time::Instant::now();
+    let shutdown_healthy = store.shutdown().await;
+    let shutdown_elapsed_us = shutdown_started_at.elapsed().as_micros();
+    let task_count_after_shutdown = store.persist_task_count();
+    let healthy = shutdown_healthy
+        && scheduled_runs > 0
+        && scheduled_overlaps == 0
+        && scheduled_failures == 0
+        && persisted_offset_file
+        && task_count_before_shutdown > 0
+        && task_count_after_shutdown == 0;
+
+    let _ = tokio::fs::remove_file(&store_path).await;
+    let _ = tokio::fs::remove_file(format!("{store_path}.bak")).await;
+    let _ = tokio::fs::remove_file(format!("{store_path}.tmp")).await;
+    let _ = tokio::fs::remove_dir_all(root).await;
+
+    LocalFileOffsetStoreLifecycleProbe {
+        task_count_before_shutdown,
+        task_count_after_shutdown,
+        scheduled_runs,
+        scheduled_skips,
+        scheduled_overlaps,
+        scheduled_failures,
+        persisted_offset_file,
+        shutdown_elapsed_us,
+        healthy,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::pending;
+    use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    use cheetah_string::CheetahString;
+    use dashmap::DashMap;
+    use parking_lot::Mutex;
+    use rocketmq_model::common::message::message_queue::MessageQueue;
+    use rocketmq_protocol::protocol::RemotingDeserializable;
+    use rocketmq_protocol::protocol::RemotingSerializable;
+
+    use super::PersistTaskHandle;
+    use crate::base::client_config::ClientConfig;
+    use crate::consumer::store::controllable_offset::ControllableOffset;
+    use crate::consumer::store::local_file_offset_store::LocalFileOffsetStore;
+    use crate::consumer::store::offset_serialize::OffsetSerialize;
+    use crate::consumer::store::offset_store::OffsetStoreTrait;
+    use crate::consumer::store::read_offset_type::ReadOffsetType;
+    use crate::factory::mq_client_instance::MQClientInstance;
+    use crate::runtime::spawn_client_tracked_task_with_context;
+
+    #[tokio::test]
+    async fn custom_first_persist_creates_instance_group_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new-root/client-id/consumer-group/offsets.json");
+        let mq = MessageQueue::from_parts("broadcast-topic", "broker-a", 0);
+        let offsets = DashMap::new();
+        offsets.insert(mq.clone(), ControllableOffset::new(88));
+
+        LocalFileOffsetStore::do_persist(&offsets, path.to_str().unwrap(), None)
+            .await
+            .expect("first broadcast persistence must create its missing parent directories");
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let persisted = OffsetSerialize::decode(&bytes).unwrap();
+        assert_eq!(
+            persisted.offset_table.get(&mq.serialize_json().unwrap()).copied(),
+            Some(88)
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_corrupt_durable_offset_file_is_reported_and_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("offsets.json");
+        for original in [b"corrupt-ledger".as_slice(), b"".as_slice()] {
+            tokio::fs::write(&path, original).await.unwrap();
+            let error = LocalFileOffsetStore::do_persist(&DashMap::new(), path.to_str().unwrap(), None)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), original);
+        }
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    fn test_runtime() -> Arc<crate::runtime::ClientRuntime> {
+        crate::runtime::test_client_runtime("local-file-offset-store-test")
+    }
+
+    fn test_client_instance(client_id: impl Into<CheetahString>) -> Arc<MQClientInstance> {
+        let runtime = test_runtime();
+        MQClientInstance::new_arc(
+            ClientConfig::default(),
+            0,
+            client_id,
+            None,
+            runtime.component("client-instance"),
+            runtime.telemetry_handle().clone(),
+            runtime.pool().request_future_holder(),
+        )
+    }
+
+    #[test]
+    fn new_with_explicit_runtime_does_not_spawn_during_construction() {
+        let runtime = test_runtime();
+        let client_instance = test_client_instance("local-offset-store-construction-test");
+        let store = LocalFileOffsetStore::new(
+            runtime.component("construction"),
+            client_instance,
+            CheetahString::from_static_str("local_offset_store_no_runtime_group"),
+        );
+
+        drop(store);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn memory_first_then_store_reads_local_file_on_memory_miss_like_java() {
+        let client_id = format!("local-offset-store-read-fallback-test-{}", std::process::id());
+        let group = CheetahString::from(format!("local_offset_store_read_fallback_group_{}", std::process::id()));
+        let runtime = test_runtime();
+        let client_instance = test_client_instance(client_id);
+        let store_dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("tmp")
+            .join("local_offset_store_read_fallback");
+        let store_path = store_dir.join("offsets.json").to_string_lossy().to_string();
+        let offset_table = Arc::new(DashMap::<MessageQueue, ControllableOffset>::new());
+        let dirty_flag = Arc::new(AtomicBool::new(false));
+        let persist_commands = LocalFileOffsetStore::build_persist_command_queue().expect("persist command queue");
+        let persist_handle = LocalFileOffsetStore::spawn_background_persist_task(
+            &runtime.component("read-fallback-persist"),
+            offset_table.clone(),
+            dirty_flag.clone(),
+            store_path.clone(),
+            persist_commands.clone(),
+        );
+        let store = LocalFileOffsetStore {
+            client_instance,
+            group_name: group,
+            store_path: CheetahString::from(store_path),
+            offset_table,
+            dirty_flag,
+            persist_commands,
+            persist_handle: Mutex::new(persist_handle),
+        };
+        let mq = MessageQueue::from_parts("local-offset-store-topic", "broker-a", 0);
+
+        if let Some(parent) = Path::new(store.store_path.as_str()).parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        store.update_offset(&mq, 42, false).await;
+        store.persist(&mq).await;
+        store.offset_table.clear();
+
+        let offset = store.read_offset(&mq, ReadOffsetType::MemoryFirstThenStore).await;
+        assert_eq!(42, offset);
+        assert_eq!(42, store.read_offset(&mq, ReadOffsetType::ReadFromMemory).await);
+
+        let store_path = store.store_path.to_string();
+        store.dirty_flag.store(false, Ordering::Release);
+        drop(store);
+        let _ = tokio::fs::remove_file(&store_path).await;
+        let _ = tokio::fs::remove_file(format!("{store_path}.bak")).await;
+        let _ = tokio::fs::remove_file(format!("{store_path}.tmp")).await;
+    }
+
+    #[tokio::test]
+    async fn custom_shutdown_reports_final_persist_io_failure() {
+        let client_id = format!("local-offset-store-shutdown-test-{}", std::process::id());
+        let group = CheetahString::from(format!("local_offset_store_shutdown_group_{}", std::process::id()));
+        let runtime = test_runtime();
+        let client_instance = test_client_instance(client_id);
+        let directory = tempfile::tempdir().unwrap();
+        let blocked_parent = directory.path().join("not-a-directory");
+        tokio::fs::write(&blocked_parent, b"preserve-this-file").await.unwrap();
+        let store_path = blocked_parent.join("offsets.json").to_string_lossy().to_string();
+        let offset_table = Arc::new(DashMap::<MessageQueue, ControllableOffset>::new());
+        let dirty_flag = Arc::new(AtomicBool::new(false));
+        let persist_commands = LocalFileOffsetStore::build_persist_command_queue().expect("persist command queue");
+        let persist_handle = LocalFileOffsetStore::spawn_background_persist_task(
+            &runtime.component("shutdown-persist"),
+            offset_table.clone(),
+            dirty_flag.clone(),
+            store_path.clone(),
+            persist_commands.clone(),
+        );
+        let store = LocalFileOffsetStore {
+            client_instance,
+            group_name: group,
+            store_path: CheetahString::from(store_path.clone()),
+            offset_table,
+            dirty_flag,
+            persist_commands,
+            persist_handle: Mutex::new(persist_handle),
+        };
+        let mq = MessageQueue::from_parts("local-offset-store-shutdown-topic", "broker-a", 0);
+
+        store.update_offset(&mq, 88, false).await;
+        assert!(
+            !store.shutdown().await,
+            "failed durable final write cannot report healthy shutdown"
+        );
+        assert!(
+            store.persist_handle.lock().is_finished(),
+            "I/O failure must still release worker ownership"
+        );
+        assert_eq!(tokio::fs::read(blocked_parent).await.unwrap(), b"preserve-this-file");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_final_persist() {
+        let client_id = format!("local-offset-store-shutdown-test-{}", std::process::id());
+        let group = CheetahString::from(format!("local_offset_store_shutdown_group_{}", std::process::id()));
+        let runtime = test_runtime();
+        let client_instance = test_client_instance(client_id);
+        let store_dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("tmp")
+            .join("local_offset_store_shutdown");
+        let store_path = store_dir.join("offsets.json").to_string_lossy().to_string();
+        let offset_table = Arc::new(DashMap::<MessageQueue, ControllableOffset>::new());
+        let dirty_flag = Arc::new(AtomicBool::new(false));
+        let persist_commands = LocalFileOffsetStore::build_persist_command_queue().expect("persist command queue");
+        let persist_handle = LocalFileOffsetStore::spawn_background_persist_task(
+            &runtime.component("shutdown-persist"),
+            offset_table.clone(),
+            dirty_flag.clone(),
+            store_path.clone(),
+            persist_commands.clone(),
+        );
+        let store = LocalFileOffsetStore {
+            client_instance,
+            group_name: group,
+            store_path: CheetahString::from(store_path.clone()),
+            offset_table,
+            dirty_flag,
+            persist_commands,
+            persist_handle: Mutex::new(persist_handle),
+        };
+        let mq = MessageQueue::from_parts("local-offset-store-shutdown-topic", "broker-a", 0);
+
+        if let Some(parent) = Path::new(&store_path).parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        store.update_offset(&mq, 88, false).await;
+
+        assert!(store.shutdown().await);
+        assert!(store.shutdown().await, "repeated shutdown should remain healthy");
+        assert!(store.persist_handle.lock().is_finished());
+
+        let content = tokio::fs::read(&store_path).await.unwrap();
+        let persisted = OffsetSerialize::decode(&content).expect("shutdown should persist offsets");
+        let mq_key = mq.serialize_json().expect("message queue should serialize");
+        assert_eq!(persisted.offset_table.get(&mq_key).copied(), Some(88));
+
+        let _ = tokio::fs::remove_file(&store_path).await;
+        let _ = tokio::fs::remove_file(format!("{store_path}.bak")).await;
+        let _ = tokio::fs::remove_file(format!("{store_path}.tmp")).await;
+    }
+
+    #[tokio::test]
+    async fn persist_task_shutdown_aborts_after_timeout() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_task = dropped.clone();
+        let handle = spawn_client_tracked_task_with_context(
+            &crate::runtime::test_service_context("local-offset-store-timeout-test"),
+            "rocketmq-client-local-offset-store-timeout-test",
+            Box::pin(async move {
+                let _drop_flag = DropFlag(dropped_in_task);
+                pending::<()>().await;
+            }),
+        )
+        .expect("timeout test command task should spawn");
+        let handle = PersistTaskHandle::Tokio {
+            command_handle: handle,
+            scheduled_handle: None,
+            final_persist_healthy: Arc::new(AtomicBool::new(false)),
+        };
+        let persist_commands = LocalFileOffsetStore::build_persist_command_queue().expect("persist command queue");
+
+        assert!(
+            !handle
+                .shutdown(&persist_commands, std::time::Duration::from_millis(20))
+                .await
+        );
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn overload_preserves_shutdown_reserve_in_offset_command_queue() {
+        let command_bytes = std::mem::size_of::<super::PersistCommand>().max(1);
+        let root = rocketmq_runtime::ResourceBudgetTree::new(
+            "client-offset-overload",
+            rocketmq_runtime::BudgetLimit::new(3, command_bytes * 3, rocketmq_runtime::FullPolicy::Reject)
+                .with_control_reserve(rocketmq_runtime::BudgetCapacity::new(1, command_bytes)),
+        )
+        .expect("root budget");
+        let budget = root
+            .root()
+            .child(
+                "persist-commands",
+                rocketmq_runtime::BudgetLimit::new(3, command_bytes * 3, rocketmq_runtime::FullPolicy::Reject)
+                    .with_control_reserve(rocketmq_runtime::BudgetCapacity::new(1, command_bytes))
+                    .with_rate(rocketmq_runtime::RateLimit::new(4, 4))
+                    .with_max_age(std::time::Duration::from_secs(30)),
+            )
+            .expect("queue budget");
+        let queue = rocketmq_runtime::BudgetedQueue::new(budget);
+
+        for _ in 0..2 {
+            let command = super::PersistCommand::PersistAll(None);
+            assert!(matches!(
+                queue.try_push_data(command, command_bytes),
+                rocketmq_runtime::QueuePushOutcome::Enqueued
+            ));
+        }
+        assert!(matches!(
+            queue.try_push_data(super::PersistCommand::PersistAll(None), command_bytes),
+            rocketmq_runtime::QueuePushOutcome::Rejected { .. }
+        ));
+        assert!(matches!(
+            queue.try_push_control(super::PersistCommand::Shutdown, command_bytes),
+            rocketmq_runtime::QueuePushOutcome::Enqueued
+        ));
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.depth, 3);
+        assert_eq!(snapshot.retained_bytes, command_bytes * 3);
+        assert_eq!(snapshot.rejected_count, 1);
+    }
+
+    #[tokio::test]
+    async fn local_file_offset_store_lifecycle_probe_reports_clean_shutdown() {
+        let probe = super::run_local_file_offset_store_lifecycle_probe(test_runtime()).await;
+
+        assert!(probe.healthy, "{probe:?}");
+        assert!(probe.persisted_offset_file, "{probe:?}");
+        assert_eq!(probe.task_count_after_shutdown, 0, "{probe:?}");
+        assert_eq!(probe.scheduled_overlaps, 0, "{probe:?}");
+        assert_eq!(probe.scheduled_failures, 0, "{probe:?}");
+    }
+}

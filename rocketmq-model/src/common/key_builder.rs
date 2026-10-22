@@ -1,0 +1,151 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::topic::RETRY_GROUP_TOPIC_PREFIX;
+
+use super::pop_retry_policy::PopRetryTopicVersion;
+
+pub const POP_ORDER_REVIVE_QUEUE: i32 = 999;
+pub const POP_RETRY_SEPARATOR_V1: char = '_';
+pub const POP_RETRY_SEPARATOR_V2: char = '+';
+pub const POP_RETRY_REGEX_SEPARATOR_V2: &str = "\\+";
+
+pub struct KeyBuilder;
+
+impl KeyBuilder {
+    pub fn build_pop_retry_topic(topic: &str, cid: &str, enable_retry_v2: bool) -> String {
+        let version = if enable_retry_v2 {
+            PopRetryTopicVersion::V2
+        } else {
+            PopRetryTopicVersion::V1
+        };
+        Self::build_pop_retry_topic_for_version(topic, cid, version)
+    }
+
+    pub fn build_pop_retry_topic_for_version(topic: &str, cid: &str, version: PopRetryTopicVersion) -> String {
+        match version {
+            PopRetryTopicVersion::V1 => Self::build_pop_retry_topic_v1(topic, cid),
+            PopRetryTopicVersion::V2 => Self::build_pop_retry_topic_v2(topic, cid),
+        }
+    }
+
+    pub fn build_pop_retry_topic_default(topic: &str, cid: &str) -> String {
+        format!("{RETRY_GROUP_TOPIC_PREFIX}{cid}{POP_RETRY_SEPARATOR_V1}{topic}")
+    }
+
+    pub fn build_pop_retry_topic_v2(topic: &str, cid: &str) -> String {
+        format!("{RETRY_GROUP_TOPIC_PREFIX}{cid}{POP_RETRY_SEPARATOR_V2}{topic}")
+    }
+
+    pub fn build_pop_retry_topic_v1(topic: &str, cid: &str) -> String {
+        format!("{RETRY_GROUP_TOPIC_PREFIX}{cid}{POP_RETRY_SEPARATOR_V1}{topic}")
+    }
+
+    pub fn parse_normal_topic(topic: &str, cid: &str) -> String {
+        if topic.starts_with(RETRY_GROUP_TOPIC_PREFIX) {
+            if topic.starts_with(&format!("{RETRY_GROUP_TOPIC_PREFIX}{cid}{POP_RETRY_SEPARATOR_V2}")) {
+                return topic[RETRY_GROUP_TOPIC_PREFIX.len() + cid.len() + 1..].to_string();
+            }
+            return topic[RETRY_GROUP_TOPIC_PREFIX.len() + cid.len() + 1..].to_string();
+        }
+        topic.to_string()
+    }
+
+    pub fn parse_normal_topic_default(retry_topic: &str) -> String {
+        if KeyBuilder::is_pop_retry_topic_v2(retry_topic) {
+            let result: Vec<&str> = retry_topic.split(POP_RETRY_SEPARATOR_V2).collect();
+            if result.len() == 2 {
+                return result[1].to_string();
+            }
+        }
+        retry_topic.to_string()
+    }
+
+    pub fn parse_group(retry_topic: &str) -> String {
+        if KeyBuilder::is_pop_retry_topic_v2(retry_topic) {
+            let result: Vec<&str> = retry_topic.split(POP_RETRY_SEPARATOR_V2).collect();
+            if result.len() == 2 {
+                return result[0][RETRY_GROUP_TOPIC_PREFIX.len()..].to_string();
+            }
+        }
+        retry_topic[RETRY_GROUP_TOPIC_PREFIX.len()..].to_string()
+    }
+
+    pub fn build_polling_key(topic: &str, cid: &str, queue_id: i32) -> String {
+        format!("{}{}{}{}{}", topic, "@", cid, "@", queue_id)
+    }
+
+    pub fn is_pop_retry_topic_v2(retry_topic: &str) -> bool {
+        retry_topic.starts_with(RETRY_GROUP_TOPIC_PREFIX) && retry_topic.contains(POP_RETRY_SEPARATOR_V2)
+    }
+
+    pub fn classify_pop_retry_topic(retry_topic: &str) -> Option<PopRetryTopicVersion> {
+        if Self::is_pop_retry_topic_v2(retry_topic) {
+            Some(PopRetryTopicVersion::V2)
+        } else if retry_topic.starts_with(RETRY_GROUP_TOPIC_PREFIX)
+            && retry_topic[RETRY_GROUP_TOPIC_PREFIX.len()..].contains(POP_RETRY_SEPARATOR_V1)
+        {
+            Some(PopRetryTopicVersion::V1)
+        } else {
+            None
+        }
+    }
+
+    pub fn parse_pop_retry_topic<'a>(retry_topic: &'a str, cid: &str) -> Option<(PopRetryTopicVersion, &'a str)> {
+        let prefix = format!("{RETRY_GROUP_TOPIC_PREFIX}{cid}");
+        let suffix = retry_topic.strip_prefix(&prefix)?;
+        if let Some(topic) = suffix.strip_prefix(POP_RETRY_SEPARATOR_V2) {
+            (!topic.is_empty()).then_some((PopRetryTopicVersion::V2, topic))
+        } else if let Some(topic) = suffix.strip_prefix(POP_RETRY_SEPARATOR_V1) {
+            (!topic.is_empty()).then_some((PopRetryTopicVersion::V1, topic))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KeyBuilder;
+
+    #[test]
+    fn pop_retry_v2_builder_round_trips() {
+        let retry = KeyBuilder::build_pop_retry_topic_v2("orders", "workers");
+        assert_eq!(retry, "%RETRY%workers+orders");
+        assert_eq!(KeyBuilder::parse_normal_topic_default(&retry), "orders");
+        assert_eq!(KeyBuilder::parse_group(&retry), "workers");
+    }
+
+    #[test]
+    fn literal_v2_topic_is_parsed() {
+        assert_eq!(
+            KeyBuilder::parse_normal_topic_default("%RETRY%workers+orders"),
+            "orders"
+        );
+        assert_eq!(KeyBuilder::parse_group("%RETRY%workers+orders"), "workers");
+    }
+
+    #[test]
+    fn non_v2_and_multiple_separator_fallbacks_are_preserved() {
+        for topic in ["orders", "%RETRY%workers_orders", "%RETRY%workers+orders+extra"] {
+            assert_eq!(KeyBuilder::parse_normal_topic_default(topic), topic);
+        }
+        assert_eq!(KeyBuilder::parse_group("%RETRY%workers"), "workers");
+        assert_eq!(KeyBuilder::parse_group("%RETRY%workers_orders"), "workers_orders");
+        assert_eq!(
+            KeyBuilder::parse_group("%RETRY%workers+orders+extra"),
+            "workers+orders+extra"
+        );
+    }
+}

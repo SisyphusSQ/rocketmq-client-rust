@@ -1,0 +1,825 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![deny(missing_docs)]
+
+//! Runtime-neutral security contracts.
+
+mod error;
+/// Layered ingress and detailed authorization contracts.
+pub mod layered_authorization;
+pub mod maintenance;
+/// Resource pattern types and operations.
+pub mod resource_pattern;
+/// Resource type types and operations.
+pub mod resource_type;
+pub mod secret_provider;
+pub mod secure_deployment;
+
+pub use layered_authorization::combine_layered_authorization;
+pub use layered_authorization::AuthorizationDecision;
+pub use layered_authorization::AuthorizationDenial;
+pub use layered_authorization::DetailedDecision;
+pub use layered_authorization::IngressDecision;
+pub use layered_authorization::IngressPolicy;
+pub use layered_authorization::LayerEvaluation;
+pub use layered_authorization::LayerFailureKind;
+pub use layered_authorization::LayerRequirement;
+pub use maintenance::MaintenanceAuthorizationContext;
+pub use maintenance::MaintenanceAuthorizationDenial;
+pub use maintenance::MaintenanceAuthorizationGrant;
+pub use maintenance::MaintenanceAuthorizer;
+pub use maintenance::MaintenanceCapability;
+pub use maintenance::MaintenancePolicy;
+pub use maintenance::MaintenancePrincipalBinding;
+pub use maintenance::MaintenanceRequestClass;
+pub use maintenance::MaintenanceResourceBudget;
+pub use maintenance::MaintenanceRole;
+pub use maintenance::MaintenanceRoleGrant;
+pub use maintenance::ValidatedMaintenancePolicy;
+pub use maintenance::MAINTENANCE_POLICY_SCHEMA_VERSION;
+pub use resource_pattern::ResourcePattern;
+pub use resource_type::ResourceType;
+
+pub use error::MaintenancePolicyRule;
+pub use error::SecurityContractViolation;
+pub use error::SecurityIdentifierRule;
+pub use error::SecurityOperation;
+pub use error::SecurityProviderError;
+pub use error::SecurityProviderFailure;
+
+pub use secret_provider::SecretAccess;
+pub use secret_provider::SecretMaterial;
+pub use secret_provider::SecretName;
+pub use secret_provider::SecretPersistence;
+pub use secret_provider::SecretProvider;
+pub use secret_provider::SecretProviderCapabilities;
+pub use secret_provider::SecretProviderId;
+pub use secret_provider::SecretVersion;
+pub use secret_provider::SecretVersioning;
+pub use secret_provider::VersionedSecret;
+pub use secure_deployment::validate_deployment_security;
+pub use secure_deployment::validate_security_bootstrap_from_env;
+pub use secure_deployment::BootstrapReadinessView;
+pub use secure_deployment::DeploymentOrigin;
+pub use secure_deployment::DeploymentSecurityConfigView;
+pub use secure_deployment::DeploymentSecurityFailure;
+pub use secure_deployment::DeploymentSecurityReport;
+pub use secure_deployment::SecurityBootstrap;
+pub use secure_deployment::SecurityBootstrapConfig;
+pub use secure_deployment::SecurityBootstrapMaterial;
+pub use secure_deployment::SecurityBootstrapOutcome;
+pub use secure_deployment::SecurityBootstrapProfile;
+pub use secure_deployment::SecurityMigrationStatus;
+pub use secure_deployment::SecurityProfileResolution;
+pub use secure_deployment::SecurityProfileSelection;
+pub use secure_deployment::ValidatedSecurityBootstrap;
+pub use secure_deployment::MOUNTED_FILES_SECRET_PROVIDER;
+pub use secure_deployment::SECURITY_ADMIN_IDENTITY_ENV;
+pub use secure_deployment::SECURITY_PROFILE_ENV;
+pub use secure_deployment::SECURITY_REQUEST_POLICY_ENV;
+pub use secure_deployment::SECURITY_SECRET_PROVIDER_ENV;
+pub use secure_deployment::SECURITY_TLS_CERT_ENV;
+pub use secure_deployment::SECURITY_TLS_KEY_ENV;
+pub use secure_deployment::SECURITY_TRUST_ANCHOR_ENV;
+
+use std::collections::HashMap;
+use std::fmt;
+use std::fs::File;
+use std::io::Read;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::str::FromStr;
+use std::time::SystemTime;
+
+use cheetah_string::CheetahString;
+
+/// Read-only peer metadata made available to security policies.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PeerInfo {
+    address: SocketAddr,
+    tls: bool,
+    certificate_subject: Option<CheetahString>,
+}
+
+impl PeerInfo {
+    /// Creates a new `PeerInfo`.
+    pub fn new(address: SocketAddr, tls: bool) -> Self {
+        Self {
+            address,
+            tls,
+            certificate_subject: None,
+        }
+    }
+
+    /// Sets certificate subject and returns the updated value.
+    pub fn with_certificate_subject(mut self, subject: impl Into<CheetahString>) -> Self {
+        self.certificate_subject = Some(subject.into());
+        self
+    }
+
+    /// Returns the address.
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Returns whether tls.
+    pub fn is_tls(&self) -> bool {
+        self.tls
+    }
+
+    /// Returns the certificate subject.
+    pub fn certificate_subject(&self) -> Option<&str> {
+        self.certificate_subject.as_deref()
+    }
+}
+
+impl fmt::Debug for PeerInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerInfo")
+            .field("address", &self.address)
+            .field("tls", &self.tls)
+            .field(
+                "certificate_subject",
+                &self.certificate_subject.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+/// Minimal borrowed projection of an inbound or outbound request.
+#[derive(Clone, Copy)]
+pub struct SecurityRequestView<'a> {
+    code: i32,
+    version: i32,
+    fields: &'a HashMap<CheetahString, CheetahString>,
+    body: Option<&'a [u8]>,
+    peer: Option<&'a PeerInfo>,
+}
+
+impl<'a> SecurityRequestView<'a> {
+    /// Creates a new `SecurityRequestView`.
+    pub fn new(
+        code: i32,
+        version: i32,
+        fields: &'a HashMap<CheetahString, CheetahString>,
+        body: Option<&'a [u8]>,
+        peer: Option<&'a PeerInfo>,
+    ) -> Self {
+        Self {
+            code,
+            version,
+            fields,
+            body,
+            peer,
+        }
+    }
+
+    /// Returns the code.
+    pub fn code(&self) -> i32 {
+        self.code
+    }
+
+    /// Returns the version.
+    pub fn version(&self) -> i32 {
+        self.version
+    }
+
+    /// Returns the fields.
+    pub fn fields(&self) -> &'a HashMap<CheetahString, CheetahString> {
+        self.fields
+    }
+
+    /// Returns the body.
+    pub fn body(&self) -> Option<&'a [u8]> {
+        self.body
+    }
+
+    /// Returns the peer.
+    pub fn peer(&self) -> Option<&'a PeerInfo> {
+        self.peer
+    }
+}
+
+impl fmt::Debug for SecurityRequestView<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecurityRequestView")
+            .field("code", &self.code)
+            .field("version", &self.version)
+            .field("field_count", &self.fields.len())
+            .field("body_len", &self.body.map(<[u8]>::len))
+            .field("peer", &self.peer)
+            .finish()
+    }
+}
+
+/// Authenticated identity without credential material.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Principal {
+    id: CheetahString,
+}
+
+impl Principal {
+    /// Creates a new `Principal`.
+    pub fn new(id: impl Into<CheetahString>) -> Self {
+        Self { id: id.into() }
+    }
+
+    /// Returns the id.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Protected resource category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResourceKind {
+    /// Represents the topic case.
+    Topic,
+    /// Represents the consumer group case.
+    ConsumerGroup,
+    /// Represents the cluster case.
+    Cluster,
+    /// Represents the broker case.
+    Broker,
+    /// Represents the other case.
+    Other,
+}
+
+/// Resource selected for a policy decision.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Resource {
+    kind: ResourceKind,
+    name: CheetahString,
+}
+
+impl Resource {
+    /// Creates a new `Resource`.
+    pub fn new(kind: ResourceKind, name: impl Into<CheetahString>) -> Self {
+        Self {
+            kind,
+            name: name.into(),
+        }
+    }
+
+    /// Creates the topic value.
+    pub fn topic(name: impl Into<CheetahString>) -> Self {
+        Self::new(ResourceKind::Topic, name)
+    }
+
+    /// Returns the kind.
+    pub fn kind(&self) -> ResourceKind {
+        self.kind
+    }
+
+    /// Returns the name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Security-relevant operation requested on a resource.
+///
+/// Values `0..=9` preserve the RocketMQ ACL wire codes. The semantic
+/// `Publish`, `Subscribe`, `Describe`, and `Manage` variants are policy-level
+/// operations and intentionally have distinct codes.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Action {
+    /// Represents the unknown case.
+    Unknown = 0,
+    /// Represents the all case.
+    All = 1,
+    /// Represents the any case.
+    Any = 2,
+    /// Represents the pub case.
+    Pub = 3,
+    /// Represents the sub case.
+    Sub = 4,
+    /// Represents the create case.
+    Create = 5,
+    /// Represents the update case.
+    Update = 6,
+    /// Represents the delete case.
+    Delete = 7,
+    /// Represents the get case.
+    Get = 8,
+    /// Represents the list case.
+    List = 9,
+    /// Represents the publish case.
+    Publish = 10,
+    /// Represents the subscribe case.
+    Subscribe = 11,
+    /// Represents the describe case.
+    Describe = 12,
+    /// Represents the manage case.
+    Manage = 13,
+}
+
+impl Action {
+    /// Returns the code.
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// Returns the name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::All => "All",
+            Self::Any => "Any",
+            Self::Pub => "Pub",
+            Self::Sub => "Sub",
+            Self::Create => "Create",
+            Self::Update => "Update",
+            Self::Delete => "Delete",
+            Self::Get => "Get",
+            Self::List => "List",
+            Self::Publish => "Publish",
+            Self::Subscribe => "Subscribe",
+            Self::Describe => "Describe",
+            Self::Manage => "Manage",
+        }
+    }
+
+    /// Returns by name.
+    pub fn get_by_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "unknown" => Some(Self::Unknown),
+            "all" => Some(Self::All),
+            "any" => Some(Self::Any),
+            "pub" => Some(Self::Pub),
+            "sub" => Some(Self::Sub),
+            "create" => Some(Self::Create),
+            "update" => Some(Self::Update),
+            "delete" => Some(Self::Delete),
+            "get" => Some(Self::Get),
+            "list" => Some(Self::List),
+            "publish" => Some(Self::Publish),
+            "subscribe" => Some(Self::Subscribe),
+            "describe" => Some(Self::Describe),
+            "manage" => Some(Self::Manage),
+            _ => None,
+        }
+    }
+}
+
+impl TryFrom<u8> for Action {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Unknown),
+            1 => Ok(Self::All),
+            2 => Ok(Self::Any),
+            3 => Ok(Self::Pub),
+            4 => Ok(Self::Sub),
+            5 => Ok(Self::Create),
+            6 => Ok(Self::Update),
+            7 => Ok(Self::Delete),
+            8 => Ok(Self::Get),
+            9 => Ok(Self::List),
+            10 => Ok(Self::Publish),
+            11 => Ok(Self::Subscribe),
+            12 => Ok(Self::Describe),
+            13 => Ok(Self::Manage),
+            _ => Err(()),
+        }
+    }
+}
+
+impl fmt::Display for Action {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+/// Complete security input before authentication has been required.
+pub struct RequestContext<'a> {
+    request: SecurityRequestView<'a>,
+    principal: Option<&'a Principal>,
+    resource: Resource,
+    action: Action,
+}
+
+impl<'a> RequestContext<'a> {
+    /// Creates a new `RequestContext`.
+    pub fn new(
+        request: SecurityRequestView<'a>,
+        principal: Option<&'a Principal>,
+        resource: Resource,
+        action: Action,
+    ) -> Self {
+        Self {
+            request,
+            principal,
+            resource,
+            action,
+        }
+    }
+
+    /// Returns the principal.
+    pub fn principal(&self) -> Option<&Principal> {
+        self.principal
+    }
+}
+
+/// Policy input for which the principal invariant has been established.
+#[derive(Clone, Copy)]
+pub struct AuthenticatedRequestContext<'a> {
+    request: SecurityRequestView<'a>,
+    principal: &'a Principal,
+    resource: &'a Resource,
+    action: Action,
+}
+
+impl<'a> AuthenticatedRequestContext<'a> {
+    /// Returns the request.
+    pub fn request(&self) -> SecurityRequestView<'a> {
+        self.request
+    }
+
+    /// Returns the principal.
+    pub fn principal(&self) -> &'a Principal {
+        self.principal
+    }
+
+    /// Returns the resource.
+    pub fn resource(&self) -> &'a Resource {
+        self.resource
+    }
+
+    /// Returns the action.
+    pub fn action(&self) -> Action {
+        self.action
+    }
+}
+
+/// Authorization policy that can only evaluate authenticated requests.
+pub trait RequestPolicy: Send + Sync {
+    /// Returns the final decision for an authenticated request.
+    fn evaluate_authenticated(&self, context: AuthenticatedRequestContext<'_>) -> AuthorizationDecision;
+}
+
+/// Applies the mandatory fail-closed identity gate before invoking a policy.
+///
+/// A missing principal resolves to [`AuthorizationDenial::SubjectUnknown`]
+/// without invoking the policy.
+pub fn evaluate_request(policy: &dyn RequestPolicy, context: &RequestContext<'_>) -> AuthorizationDecision {
+    let Some(principal) = context.principal else {
+        return AuthorizationDecision::Deny(AuthorizationDenial::SubjectUnknown);
+    };
+    policy.evaluate_authenticated(AuthenticatedRequestContext {
+        request: context.request,
+        principal,
+        resource: &context.resource,
+        action: context.action,
+    })
+}
+
+/// Redacted signature fields produced by an outbound signer.
+pub struct Signature {
+    fields: Vec<(CheetahString, Secret<CheetahString>)>,
+}
+
+impl Signature {
+    /// Creates a new `Signature`.
+    pub fn new(fields: Vec<(CheetahString, Secret<CheetahString>)>) -> Self {
+        Self { fields }
+    }
+
+    /// Returns the fields.
+    pub fn fields(&self) -> &[(CheetahString, Secret<CheetahString>)] {
+        &self.fields
+    }
+}
+
+impl fmt::Debug for Signature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Signature")
+            .field("field_count", &self.fields.len())
+            .finish()
+    }
+}
+
+/// Contract implemented by transport-specific outbound signers in `rocketmq-auth`.
+pub trait OutboundSigner: Send + Sync {
+    /// Signs an outbound security request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted [`SecurityProviderError`] when the signing provider
+    /// cannot produce a signature safely.
+    fn sign(&self, request: SecurityRequestView<'_>) -> Result<Signature, SecurityProviderError>;
+}
+
+/// Sensitive value whose debug representation is always redacted.
+pub struct Secret<T>(T);
+
+impl<T> Secret<T> {
+    /// Creates a new `Secret`.
+    pub fn new(value: T) -> Self {
+        Self(value)
+    }
+
+    /// Returns the expose secret.
+    pub fn expose_secret(&self) -> &T {
+        &self.0
+    }
+
+    /// Converts this value into inner.
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T> fmt::Debug for Secret<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+/// Deployment security profile selected by configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeploymentProfile {
+    /// Represents the development case.
+    Development,
+    /// Represents the compatibility case.
+    Compatibility,
+    /// Represents the secure case.
+    Secure,
+}
+
+impl FromStr for DeploymentProfile {
+    type Err = SecurityContractViolation;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "development" => Ok(Self::Development),
+            "compatibility" => Ok(Self::Compatibility),
+            "secure" => Ok(Self::Secure),
+            _ => Err(SecurityContractViolation::UnknownSecurityProfile),
+        }
+    }
+}
+
+/// Borrowed configuration input for a side-effect-free readiness check.
+#[derive(Debug, Clone, Copy)]
+pub struct SecurityConfigView<'a> {
+    profile: &'a str,
+    trust_anchor: Option<&'a Path>,
+    secret_file: Option<&'a Path>,
+    bootstrap_expires_at: Option<SystemTime>,
+    insecure_downgrade: bool,
+}
+
+impl<'a> SecurityConfigView<'a> {
+    /// Creates a new `SecurityConfigView`.
+    pub fn new(profile: &'a str) -> Self {
+        Self {
+            profile,
+            trust_anchor: None,
+            secret_file: None,
+            bootstrap_expires_at: None,
+            insecure_downgrade: false,
+        }
+    }
+
+    /// Sets trust anchor and returns the updated value.
+    pub fn with_trust_anchor(mut self, path: &'a Path) -> Self {
+        self.trust_anchor = Some(path);
+        self
+    }
+
+    /// Sets secret file and returns the updated value.
+    pub fn with_secret_file(mut self, path: &'a Path) -> Self {
+        self.secret_file = Some(path);
+        self
+    }
+
+    /// Sets bootstrap expiry and returns the updated value.
+    pub fn with_bootstrap_expiry(mut self, expires_at: SystemTime) -> Self {
+        self.bootstrap_expires_at = Some(expires_at);
+        self
+    }
+
+    /// Sets insecure downgrade and returns the updated value.
+    pub fn with_insecure_downgrade(mut self, enabled: bool) -> Self {
+        self.insecure_downgrade = enabled;
+        self
+    }
+}
+
+/// Stable reasons why a profile is not ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SecurityReadinessFailure {
+    /// Represents the unknown profile case.
+    UnknownProfile,
+    /// Represents the missing trust anchor case.
+    MissingTrustAnchor,
+    /// Represents the trust anchor unavailable case.
+    TrustAnchorUnavailable,
+    /// Represents the trust anchor not regular file case.
+    TrustAnchorNotRegularFile,
+    /// Represents the missing secret file case.
+    MissingSecretFile,
+    /// Represents the secret file unavailable case.
+    SecretFileUnavailable,
+    /// Represents the secret file not regular file case.
+    SecretFileNotRegularFile,
+    /// Represents the insecure secret file permissions case.
+    InsecureSecretFilePermissions,
+    /// Represents the missing bootstrap expiry case.
+    MissingBootstrapExpiry,
+    /// Represents the expired bootstrap case.
+    ExpiredBootstrap,
+    /// Represents the insecure downgrade case.
+    InsecureDowngrade,
+}
+
+/// Result of a side-effect-free security configuration dry run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityReadinessReport {
+    profile: Option<DeploymentProfile>,
+    failures: Vec<SecurityReadinessFailure>,
+}
+
+impl SecurityReadinessReport {
+    /// Returns whether ready.
+    pub fn is_ready(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// Returns the profile.
+    pub fn profile(&self) -> Option<DeploymentProfile> {
+        self.profile
+    }
+
+    /// Returns the failures.
+    pub fn failures(&self) -> &[SecurityReadinessFailure] {
+        &self.failures
+    }
+}
+
+/// Validates a configuration snapshot without reading file contents or writing external state.
+pub fn validate_security_config(view: SecurityConfigView<'_>, now: SystemTime) -> SecurityReadinessReport {
+    let Ok(profile) = DeploymentProfile::from_str(view.profile) else {
+        return SecurityReadinessReport {
+            profile: None,
+            failures: vec![SecurityReadinessFailure::UnknownProfile],
+        };
+    };
+    let mut failures = Vec::new();
+    if profile == DeploymentProfile::Secure {
+        match view.trust_anchor {
+            None => failures.push(SecurityReadinessFailure::MissingTrustAnchor),
+            Some(path) => inspect_readable_file(
+                path,
+                SecurityReadinessFailure::TrustAnchorUnavailable,
+                SecurityReadinessFailure::TrustAnchorNotRegularFile,
+                false,
+                &mut failures,
+            ),
+        }
+        match view.secret_file {
+            None => failures.push(SecurityReadinessFailure::MissingSecretFile),
+            Some(path) => inspect_readable_file(
+                path,
+                SecurityReadinessFailure::SecretFileUnavailable,
+                SecurityReadinessFailure::SecretFileNotRegularFile,
+                true,
+                &mut failures,
+            ),
+        }
+        match view.bootstrap_expires_at {
+            None => failures.push(SecurityReadinessFailure::MissingBootstrapExpiry),
+            Some(expiry) if expiry <= now => failures.push(SecurityReadinessFailure::ExpiredBootstrap),
+            Some(_) => {}
+        }
+        if view.insecure_downgrade {
+            failures.push(SecurityReadinessFailure::InsecureDowngrade);
+        }
+    }
+    SecurityReadinessReport {
+        profile: Some(profile),
+        failures,
+    }
+}
+
+fn inspect_readable_file(
+    path: &Path,
+    unavailable: SecurityReadinessFailure,
+    not_regular_file: SecurityReadinessFailure,
+    require_owner_only_permissions: bool,
+    failures: &mut Vec<SecurityReadinessFailure>,
+) {
+    let Ok(path_metadata) = path.metadata() else {
+        failures.push(unavailable);
+        return;
+    };
+    if !path_metadata.is_file() {
+        failures.push(not_regular_file);
+        return;
+    }
+    let Ok(file) = File::open(path) else {
+        failures.push(unavailable);
+        return;
+    };
+    let Ok(metadata) = file.metadata() else {
+        failures.push(unavailable);
+        return;
+    };
+    if !metadata.is_file() {
+        failures.push(not_regular_file);
+        return;
+    }
+    if require_owner_only_permissions && !platform_secret_file_permissions(&metadata).is_owner_only() {
+        failures.push(SecurityReadinessFailure::InsecureSecretFilePermissions);
+    }
+}
+
+/// Portable projection of secret-file permissions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecretFilePermissions {
+    /// Whether group access.
+    pub group_access: bool,
+    /// Whether other access.
+    pub other_access: bool,
+}
+
+impl SecretFilePermissions {
+    /// Returns whether owner only.
+    pub fn is_owner_only(self) -> bool {
+        !self.group_access && !self.other_access
+    }
+}
+
+/// Opens, permission-checks and reads a secret using the same file handle.
+///
+/// # Errors
+///
+/// Returns a redacted [`SecurityProviderError`] while retaining safe typed I/O
+/// sources. Insecure permissions are retained as a closed contract source.
+pub fn read_secret_file(path: &Path) -> Result<Secret<Vec<u8>>, SecurityProviderError> {
+    let mut file = File::open(path).map_err(|source| {
+        SecurityProviderError::caused_by(
+            SecurityProviderFailure::Unavailable,
+            SecurityOperation::ReadSecret,
+            source,
+        )
+    })?;
+    let metadata = file.metadata().map_err(|source| {
+        SecurityProviderError::caused_by(
+            SecurityProviderFailure::OperationFailed,
+            SecurityOperation::InspectSecret,
+            source,
+        )
+    })?;
+    if !platform_secret_file_permissions(&metadata).is_owner_only() {
+        return Err(SecurityProviderError::contract(
+            SecurityOperation::InspectSecret,
+            SecurityContractViolation::SecretStoragePermissionsInsecure,
+        ));
+    }
+    let mut value = Vec::new();
+    file.read_to_end(&mut value).map_err(|source| {
+        SecurityProviderError::caused_by(
+            SecurityProviderFailure::OperationFailed,
+            SecurityOperation::ReadSecret,
+            source,
+        )
+    })?;
+    Ok(Secret::new(value))
+}
+
+#[cfg(unix)]
+fn platform_secret_file_permissions(metadata: &std::fs::Metadata) -> SecretFilePermissions {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode();
+    SecretFilePermissions {
+        group_access: mode & 0o070 != 0,
+        other_access: mode & 0o007 != 0,
+    }
+}
+
+#[cfg(windows)]
+fn platform_secret_file_permissions(_metadata: &std::fs::Metadata) -> SecretFilePermissions {
+    // Windows ACL inspection is supplied by the deployment adapter. The portable contract stays
+    // fail-closed until that adapter provides an owner-only projection.
+    SecretFilePermissions {
+        group_access: true,
+        other_access: true,
+    }
+}

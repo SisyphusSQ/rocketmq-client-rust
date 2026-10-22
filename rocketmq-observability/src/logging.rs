@@ -1,0 +1,1174 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::num::NonZeroUsize;
+use std::time::Duration;
+
+use tracing_appender::non_blocking::ErrorCounter;
+use tracing_appender::non_blocking::NonBlockingBuilder;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::rolling::RollingFileAppender;
+use tracing_appender::rolling::Rotation;
+use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::reload;
+use tracing_subscriber::Layer;
+use tracing_subscriber::Registry;
+
+use rocketmq_runtime::BlockingDrainLease;
+use rocketmq_runtime::ChildServiceContext;
+use rocketmq_runtime::RuntimeResult;
+use rocketmq_runtime::ShutdownDeadline;
+use serde::Serialize;
+
+use crate::config::ConsoleLogConfig;
+use crate::config::FileLogConfig;
+use crate::config::LogFormat;
+use crate::config::LogRotation;
+use crate::config::SubscriberInstallPolicy;
+use crate::config::SubscriberInstallStatus;
+use crate::config::TelemetryBootstrapConfig;
+use crate::error::ObservabilityError;
+use crate::init::TelemetryProviderGuard;
+use crate::init::TelemetryProviderShutdownReport;
+use crate::LogFilterHandle;
+use crate::LogFilterInputs;
+use crate::LogFilterResolver;
+use crate::ResolvedLogFilter;
+use crate::TelemetryHandle;
+
+pub type BoxedRegistryLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
+
+#[derive(Default)]
+pub struct LoggingGuard {
+    worker_guards: Vec<WorkerGuard>,
+    dropped_log_counters: Vec<ErrorCounter>,
+}
+
+impl LoggingGuard {
+    pub fn noop() -> Self {
+        Self::new(Vec::new(), Vec::new())
+    }
+
+    pub(crate) fn new(worker_guards: Vec<WorkerGuard>, dropped_log_counters: Vec<ErrorCounter>) -> Self {
+        Self {
+            worker_guards,
+            dropped_log_counters,
+        }
+    }
+
+    pub(crate) fn append(&mut self, mut other: Self) {
+        self.worker_guards.append(&mut other.worker_guards);
+        self.dropped_log_counters.append(&mut other.dropped_log_counters);
+    }
+
+    pub fn dropped_log_lines(&self) -> usize {
+        self.dropped_log_counters.iter().map(ErrorCounter::dropped_lines).sum()
+    }
+
+    pub fn file_sink_count(&self) -> usize {
+        self.worker_guards.len()
+    }
+}
+
+pub struct FileLogLayer {
+    layer: BoxedRegistryLayer,
+    logging_guard: LoggingGuard,
+}
+
+impl FileLogLayer {
+    fn new(layer: BoxedRegistryLayer, logging_guard: LoggingGuard) -> Self {
+        Self { layer, logging_guard }
+    }
+
+    pub fn logging_guard(&self) -> &LoggingGuard {
+        &self.logging_guard
+    }
+
+    pub fn into_parts(self) -> (BoxedRegistryLayer, LoggingGuard) {
+        (self.layer, self.logging_guard)
+    }
+}
+
+pub fn build_env_filter(filter: &str) -> Result<EnvFilter, ObservabilityError> {
+    EnvFilter::try_new(filter).map_err(|error| ObservabilityError::invalid_log_filter(filter, error))
+}
+
+pub fn build_console_layer(config: &ConsoleLogConfig) -> Option<BoxedRegistryLayer> {
+    if !config.enabled {
+        return None;
+    }
+
+    let layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(config.ansi)
+        .with_target(config.target)
+        .with_thread_ids(config.thread_ids)
+        .with_thread_names(config.thread_names)
+        .with_line_number(config.line_number);
+
+    match config.format {
+        LogFormat::Compact => Some(Box::new(layer.compact())),
+        LogFormat::Pretty => Some(Box::new(layer.pretty())),
+        LogFormat::Json => Some(Box::new(layer.json())),
+    }
+}
+
+pub fn install_global(config: &TelemetryBootstrapConfig) -> Result<TelemetryRuntimeGuard, ObservabilityError> {
+    let resolved_filter = LogFilterResolver::resolve(LogFilterInputs {
+        config: Some(config.logging.filter.as_str()),
+        ..LogFilterInputs::default()
+    })?;
+    install_global_with_filter(config, resolved_filter)
+}
+
+/// Installs process telemetry with an explicit owner for runtime-backed exporters.
+pub async fn install_global_with_service_context(
+    config: &TelemetryBootstrapConfig,
+    service_context: &ChildServiceContext,
+) -> Result<TelemetryRuntimeGuard, ObservabilityError> {
+    let resolved_filter = LogFilterResolver::resolve(LogFilterInputs {
+        config: Some(config.logging.filter.as_str()),
+        ..LogFilterInputs::default()
+    })?;
+    install_global_with_filter_and_service_context(config, resolved_filter, service_context).await
+}
+
+pub fn install_global_with_filter(
+    config: &TelemetryBootstrapConfig,
+    resolved_filter: ResolvedLogFilter,
+) -> Result<TelemetryRuntimeGuard, ObservabilityError> {
+    install_global_with_filter_inner(config, resolved_filter)
+}
+
+/// Installs process telemetry with a resolved filter and an explicit task owner.
+pub async fn install_global_with_filter_and_service_context(
+    config: &TelemetryBootstrapConfig,
+    resolved_filter: ResolvedLogFilter,
+    service_context: &ChildServiceContext,
+) -> Result<TelemetryRuntimeGuard, ObservabilityError> {
+    init_log_tracer();
+
+    let mut telemetry_guard =
+        crate::init::init_telemetry_providers_with_service_context(&config.observability, service_context)?;
+    let telemetry_handle = telemetry_guard.handle();
+    let (layers, filter, logging_guard) =
+        match build_subscriber_layers(config, resolved_filter.filter(), &telemetry_guard) {
+            Ok(layers) => layers,
+            Err(error) => {
+                return Err(cleanup_failed_scoped_install(
+                    telemetry_guard,
+                    LoggingGuard::noop(),
+                    service_context,
+                    error,
+                )
+                .await);
+            }
+        };
+
+    let (subscriber_install_status, log_filter_handle, log_filter_metrics) = install_subscriber_layers(
+        layers,
+        filter,
+        resolved_filter.clone(),
+        config.logging.reload.enabled,
+        config.observability.service_name.as_str(),
+        telemetry_handle,
+    );
+    telemetry_guard.set_subscriber_install_status(subscriber_install_status);
+
+    if let Err(error) = enforce_bootstrap_subscriber_policy(config, subscriber_install_status) {
+        drop(log_filter_handle);
+        drop(log_filter_metrics);
+        return Err(cleanup_failed_scoped_install(telemetry_guard, logging_guard, service_context, error).await);
+    }
+
+    if subscriber_install_status.installed {
+        if let Some(metrics) = log_filter_metrics.as_ref() {
+            metrics.set_active(None, resolved_filter.source());
+        }
+    }
+
+    #[cfg(feature = "prometheus")]
+    if let Err(error) = telemetry_guard.start_prometheus_endpoint(&config.observability, service_context) {
+        drop(log_filter_handle);
+        drop(log_filter_metrics);
+        return Err(cleanup_failed_scoped_install(telemetry_guard, logging_guard, service_context, error).await);
+    }
+
+    Ok(TelemetryRuntimeGuard::new_with_log_filter_runtime(
+        telemetry_guard,
+        logging_guard,
+        log_filter_handle,
+        log_filter_metrics,
+    ))
+}
+
+fn install_global_with_filter_inner(
+    config: &TelemetryBootstrapConfig,
+    resolved_filter: ResolvedLogFilter,
+) -> Result<TelemetryRuntimeGuard, ObservabilityError> {
+    init_log_tracer();
+
+    let mut telemetry_guard = crate::init::init_telemetry_providers(&config.observability)?;
+    let telemetry_handle = telemetry_guard.handle();
+    let (layers, filter, logging_guard) =
+        match build_subscriber_layers(config, resolved_filter.filter(), &telemetry_guard) {
+            Ok(layers) => layers,
+            Err(error) => {
+                let _ = telemetry_guard.shutdown();
+                return Err(error);
+            }
+        };
+
+    let (subscriber_install_status, log_filter_handle, log_filter_metrics) = install_subscriber_layers(
+        layers,
+        filter,
+        resolved_filter.clone(),
+        config.logging.reload.enabled,
+        config.observability.service_name.as_str(),
+        telemetry_handle,
+    );
+    telemetry_guard.set_subscriber_install_status(subscriber_install_status);
+    telemetry_guard.mark_status_initialized();
+
+    if let Err(error) = enforce_bootstrap_subscriber_policy(config, subscriber_install_status) {
+        let _ = telemetry_guard.shutdown();
+        drop(logging_guard);
+        return Err(error);
+    }
+
+    if subscriber_install_status.installed {
+        if let Some(metrics) = log_filter_metrics.as_ref() {
+            metrics.set_active(None, resolved_filter.source());
+        }
+    }
+
+    Ok(TelemetryRuntimeGuard::new_with_log_filter_runtime(
+        telemetry_guard,
+        logging_guard,
+        log_filter_handle,
+        log_filter_metrics,
+    ))
+}
+
+async fn cleanup_failed_scoped_install(
+    telemetry_guard: TelemetryProviderGuard,
+    logging_guard: LoggingGuard,
+    service_context: &ChildServiceContext,
+    primary_error: ObservabilityError,
+) -> ObservabilityError {
+    let report = TelemetryRuntimeGuard::new(telemetry_guard, logging_guard)
+        .shutdown_with_service_context(
+            service_context,
+            std::time::Duration::from_millis(crate::exporter::outage::DEFAULT_SHUTDOWN_TIMEOUT_MILLIS),
+        )
+        .await;
+    if !report.is_healthy() {
+        tracing::warn!(
+            error = %primary_error,
+            report = %report.to_json(),
+            "scoped telemetry initialization failed and rollback was unhealthy"
+        );
+    }
+    primary_error
+}
+
+fn init_log_tracer() {
+    if let Err(error) = tracing_log::LogTracer::init() {
+        tracing::debug!(
+            target: "rocketmq_observability",
+            %error,
+            "log tracer was already initialized; keeping the existing log facade bridge"
+        );
+    }
+}
+
+fn build_subscriber_layers(
+    config: &TelemetryBootstrapConfig,
+    resolved_filter: &str,
+    _telemetry_guard: &TelemetryProviderGuard,
+) -> Result<(Vec<BoxedRegistryLayer>, Option<EnvFilter>, LoggingGuard), ObservabilityError> {
+    let mut layers = Vec::new();
+    let mut logging_guard = LoggingGuard::noop();
+
+    if config.logging.enabled {
+        if let Some(console_layer) = build_console_layer(&config.logging.console) {
+            layers.push(console_layer);
+        }
+
+        if let Some(file_layer) = build_file_layer(&config.logging.file)? {
+            let (layer, file_logging_guard) = file_layer.into_parts();
+            layers.push(layer);
+            logging_guard.append(file_logging_guard);
+        }
+    }
+
+    #[cfg(feature = "otel-traces")]
+    if let Some(tracer_provider) = _telemetry_guard.tracer_provider() {
+        layers.push(Box::new(crate::trace::build_tracing_layer(
+            &config.observability,
+            tracer_provider,
+        )));
+    }
+
+    #[cfg(feature = "otel-logs")]
+    if let Some(logger_provider) = _telemetry_guard.logger_provider() {
+        layers.push(Box::new(crate::logs::bridge::build_logs_layer(logger_provider)));
+    }
+
+    let filter = if layers.is_empty() {
+        None
+    } else {
+        Some(build_env_filter(resolved_filter)?)
+    };
+    Ok((layers, filter, logging_guard))
+}
+
+fn compose_subscriber_layers(
+    layers: Vec<BoxedRegistryLayer>,
+    filter: Option<EnvFilter>,
+) -> impl tracing::Subscriber + Send + Sync + 'static {
+    tracing_subscriber::registry().with(layers).with(filter)
+}
+
+fn install_subscriber_layers(
+    layers: Vec<BoxedRegistryLayer>,
+    filter: Option<EnvFilter>,
+    resolved_filter: ResolvedLogFilter,
+    reload_enabled: bool,
+    service_name: &str,
+    telemetry: TelemetryHandle,
+) -> (
+    SubscriberInstallStatus,
+    Option<LogFilterHandle>,
+    Option<crate::metrics::log_filter::LogFilterMetrics>,
+) {
+    if layers.is_empty() && filter.is_none() {
+        return (SubscriberInstallStatus::default(), None, None);
+    }
+
+    let metrics = crate::metrics::log_filter::LogFilterMetrics::new(telemetry, service_name);
+    if reload_enabled {
+        if let Some(filter) = filter {
+            let (filter_layer, reload_handle) = reload::Layer::new(filter);
+            let result =
+                tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layers).with(filter_layer));
+            let status = SubscriberInstallStatus::attempted(result.is_ok());
+            let handle = status.installed.then(|| {
+                LogFilterHandle::new(resolved_filter, metrics.clone(), move |filter| {
+                    reload_handle
+                        .reload(filter)
+                        .map_err(|error| ObservabilityError::logging_init(format!("log filter reload failed: {error}")))
+                })
+            });
+            let retained_metrics = status.installed.then_some(metrics);
+            return (status, handle, retained_metrics);
+        }
+    }
+
+    let result = tracing::subscriber::set_global_default(compose_subscriber_layers(layers, filter));
+    let status = SubscriberInstallStatus::attempted(result.is_ok());
+    let retained_metrics = status.installed.then_some(metrics);
+    (status, None, retained_metrics)
+}
+
+fn enforce_bootstrap_subscriber_policy(
+    config: &TelemetryBootstrapConfig,
+    status: SubscriberInstallStatus,
+) -> Result<(), ObservabilityError> {
+    if !status.attempted || status.installed {
+        return Ok(());
+    }
+
+    match config.observability.subscriber_install_policy {
+        SubscriberInstallPolicy::Required => Err(ObservabilityError::subscriber_install_failed(
+            status.attempted,
+            status.installed,
+        )),
+        SubscriberInstallPolicy::BestEffort => {
+            tracing::warn!(
+                target: "rocketmq_observability",
+                attempted = status.attempted,
+                installed = status.installed,
+                "tracing subscriber was already initialized; unified logging and OpenTelemetry layers were not installed"
+            );
+            Ok(())
+        }
+    }
+}
+
+pub fn build_file_layer(config: &FileLogConfig) -> Result<Option<FileLogLayer>, ObservabilityError> {
+    if !config.enabled {
+        return Ok(None);
+    }
+
+    if config.directory.trim().is_empty() {
+        return Err(ObservabilityError::logging_init("file log directory must not be empty"));
+    }
+
+    if config.file_name_prefix.trim().is_empty() {
+        return Err(ObservabilityError::logging_init(
+            "file log name prefix must not be empty",
+        ));
+    }
+
+    let appender = build_rolling_file_appender(config)?;
+    let (writer, worker_guard) = NonBlockingBuilder::default()
+        .buffered_lines_limit(config.non_blocking.buffered_lines_limit)
+        .lossy(config.non_blocking.lossy)
+        .finish(appender);
+    let error_counter = writer.error_counter();
+
+    let layer = tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_line_number(true);
+
+    let layer = match config.format {
+        LogFormat::Compact => Box::new(layer.compact()) as BoxedRegistryLayer,
+        LogFormat::Pretty => Box::new(layer.pretty()) as BoxedRegistryLayer,
+        LogFormat::Json => Box::new(layer.json()) as BoxedRegistryLayer,
+    };
+
+    Ok(Some(FileLogLayer::new(
+        layer,
+        LoggingGuard::new(vec![worker_guard], vec![error_counter]),
+    )))
+}
+
+fn build_rolling_file_appender(config: &FileLogConfig) -> Result<RollingFileAppender, ObservabilityError> {
+    RollingFileAppender::builder()
+        .rotation(to_tracing_rotation(config.rotation))
+        .filename_prefix(config.file_name_prefix.as_str())
+        .build(config.directory.as_str())
+        .map_err(ObservabilityError::logging_init)
+}
+
+fn to_tracing_rotation(rotation: LogRotation) -> Rotation {
+    match rotation {
+        LogRotation::Never => Rotation::NEVER,
+        LogRotation::Hourly => Rotation::HOURLY,
+        LogRotation::Daily => Rotation::DAILY,
+    }
+}
+
+#[must_use = "telemetry providers and logging workers must be shut down explicitly"]
+pub struct TelemetryRuntimeGuard {
+    telemetry_guard: TelemetryProviderGuard,
+    handle: TelemetryHandle,
+    logging_guard: LoggingGuard,
+    log_filter_handle: Option<LogFilterHandle>,
+    log_filter_metrics: Option<crate::metrics::log_filter::LogFilterMetrics>,
+}
+
+impl std::fmt::Debug for TelemetryRuntimeGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TelemetryRuntimeGuard")
+            .field("telemetry_state", &self.handle.state())
+            .field("subscriber_install_status", &self.subscriber_install_status())
+            .field("file_sink_count", &self.logging_guard.file_sink_count())
+            .field("dropped_log_lines", &self.logging_guard.dropped_log_lines())
+            .field("log_filter_metrics_active", &self.log_filter_metrics.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TelemetryShutdownReport {
+    pub subscriber_installed: bool,
+    pub file_log_enabled: bool,
+    pub dropped_log_lines: usize,
+    pub logs_shutdown_ok: bool,
+    pub traces_shutdown_ok: bool,
+    pub metrics_shutdown_ok: bool,
+    pub logs_shutdown_error: Option<String>,
+    pub traces_shutdown_error: Option<String>,
+    pub metrics_shutdown_error: Option<String>,
+}
+
+impl TelemetryShutdownReport {
+    fn new(
+        subscriber_install_status: SubscriberInstallStatus,
+        file_log_enabled: bool,
+        dropped_log_lines: usize,
+        provider_report: TelemetryProviderShutdownReport,
+    ) -> Self {
+        Self {
+            subscriber_installed: subscriber_install_status.installed,
+            file_log_enabled,
+            dropped_log_lines,
+            logs_shutdown_ok: provider_report.logs_shutdown_ok,
+            traces_shutdown_ok: provider_report.traces_shutdown_ok,
+            metrics_shutdown_ok: provider_report.metrics_shutdown_ok,
+            logs_shutdown_error: provider_report.logs_shutdown_error,
+            traces_shutdown_error: provider_report.traces_shutdown_error,
+            metrics_shutdown_error: provider_report.metrics_shutdown_error,
+        }
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.logs_shutdown_ok && self.traces_shutdown_ok && self.metrics_shutdown_ok
+    }
+
+    pub fn into_result(self) -> Result<Self, ObservabilityError> {
+        if let Some(error) = self.logs_shutdown_error.as_ref() {
+            return Err(ObservabilityError::logs_shutdown(error));
+        }
+        if let Some(error) = self.traces_shutdown_error.as_ref() {
+            return Err(ObservabilityError::traces_shutdown(error));
+        }
+        if let Some(error) = self.metrics_shutdown_error.as_ref() {
+            return Err(ObservabilityError::metrics_shutdown(error));
+        }
+        Ok(self)
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_else(|error| format!("{{\"serialization_error\":\"{error}\"}}"))
+    }
+}
+
+/// The blocking authority that runs the final provider flush.
+///
+/// A service context is used while its scope still admits work; a drain lease reserved
+/// from that scope carries the same allowance into owner finalization.
+enum TelemetryFlushAuthority<'a> {
+    ServiceContext(&'a ChildServiceContext),
+    Drain(BlockingDrainLease),
+}
+
+impl TelemetryFlushAuthority<'_> {
+    async fn flush<F>(
+        self,
+        name: &'static str,
+        deadline: ShutdownDeadline,
+        operation: F,
+    ) -> RuntimeResult<TelemetryShutdownReport>
+    where
+        F: FnOnce() -> TelemetryShutdownReport + Send + 'static,
+    {
+        match self {
+            Self::ServiceContext(service_context) => {
+                service_context
+                    .metadata_io()
+                    .spawn_io_until(name, deadline, operation)
+                    .await
+            }
+            Self::Drain(lease) => lease.spawn_io_until(name, deadline, operation).await,
+        }
+    }
+}
+
+/// A reservation made before the owner knows its shutdown deadline only has to outlive the
+/// process: the deadline the scope installs when it stops becomes the effective bound.
+const UNKNOWN_SHUTDOWN_DEADLINE_HORIZON: Duration = Duration::from_secs(u32::MAX as u64);
+
+/// Reserves one blocking submission for a final telemetry flush owned by `service_context`.
+///
+/// Owner finalization reaches telemetry after the owning service task group has been shut
+/// down, and that closed scope refuses ordinary submissions. Reserving the allowance while
+/// the scope is still open keeps the last flush admissible, bounded by `deadline` or by the
+/// shutdown deadline the scope installs later, whichever is earlier. An owner that reserves
+/// before its shutdown deadline exists, because its flush runs after the service scope has
+/// already closed, passes `None`.
+///
+/// The caller falls back to [`TelemetryRuntimeGuard::shutdown_with_service_context`] and
+/// reports that outcome when the allowance cannot be reserved.
+#[must_use]
+pub fn reserve_telemetry_flush_lease(
+    service_context: &ChildServiceContext,
+    deadline: Option<ShutdownDeadline>,
+) -> Option<BlockingDrainLease> {
+    let deadline = deadline.unwrap_or_else(|| ShutdownDeadline::after(UNKNOWN_SHUTDOWN_DEADLINE_HORIZON));
+    match service_context
+        .metadata_io()
+        .try_drain_lease(deadline, NonZeroUsize::MIN)
+    {
+        Ok(lease) => Some(lease),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "final telemetry flush could not reserve its blocking allowance"
+            );
+            None
+        }
+    }
+}
+
+impl TelemetryRuntimeGuard {
+    pub(crate) fn new(telemetry_guard: TelemetryProviderGuard, logging_guard: LoggingGuard) -> Self {
+        let handle = telemetry_guard.handle();
+        Self {
+            telemetry_guard,
+            handle,
+            logging_guard,
+            log_filter_handle: None,
+            log_filter_metrics: None,
+        }
+    }
+
+    fn new_with_log_filter_runtime(
+        telemetry_guard: TelemetryProviderGuard,
+        logging_guard: LoggingGuard,
+        log_filter_handle: Option<LogFilterHandle>,
+        log_filter_metrics: Option<crate::metrics::log_filter::LogFilterMetrics>,
+    ) -> Self {
+        let handle = telemetry_guard.handle();
+        Self {
+            telemetry_guard,
+            handle,
+            logging_guard,
+            log_filter_handle,
+            log_filter_metrics,
+        }
+    }
+
+    pub fn noop() -> Self {
+        Self::new(TelemetryProviderGuard::noop(), LoggingGuard::noop())
+    }
+
+    /// Returns the cloneable business telemetry capability owned by this runtime.
+    #[must_use]
+    pub fn handle(&self) -> TelemetryHandle {
+        self.handle.clone()
+    }
+
+    pub fn logging_guard(&self) -> &LoggingGuard {
+        &self.logging_guard
+    }
+
+    pub fn log_filter_handle(&self) -> Option<LogFilterHandle> {
+        self.log_filter_handle.clone()
+    }
+
+    pub fn subscriber_install_status(&self) -> SubscriberInstallStatus {
+        self.telemetry_guard.subscriber_install_status()
+    }
+
+    pub fn status_handle(&self) -> crate::ObservabilityStatusHandle {
+        self.telemetry_guard.status_handle()
+    }
+
+    pub fn dropped_log_lines(&self) -> usize {
+        self.logging_guard.dropped_log_lines()
+    }
+
+    #[cfg(feature = "prometheus")]
+    pub fn prometheus_local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.telemetry_guard.prometheus_local_addr()
+    }
+
+    #[cfg(feature = "prometheus")]
+    #[doc(hidden)]
+    pub fn prometheus_task_count(&self) -> usize {
+        self.telemetry_guard.prometheus_task_count()
+    }
+
+    pub fn shutdown(self) -> TelemetryShutdownReport {
+        self.shutdown_with_timeout(std::time::Duration::from_millis(
+            crate::exporter::outage::DEFAULT_SHUTDOWN_TIMEOUT_MILLIS,
+        ))
+    }
+
+    /// Flushes logging and telemetry providers without exceeding one shared timeout budget.
+    pub fn shutdown_with_timeout(mut self, timeout: std::time::Duration) -> TelemetryShutdownReport {
+        self.handle.begin_closing();
+        let subscriber_install_status = self.telemetry_guard.subscriber_install_status();
+        let file_log_enabled = self.logging_guard.file_sink_count() > 0;
+        let dropped_log_lines = self.logging_guard.dropped_log_lines();
+        if dropped_log_lines > 0 {
+            tracing::warn!(
+                dropped_log_lines,
+                "telemetry logging guard reported dropped log lines before shutdown"
+            );
+        }
+
+        // Drop local file logging guards before shutting down OpenTelemetry providers so
+        // non-blocking file writers are flushed and joined under explicit runtime ownership.
+        let logging_guard = std::mem::replace(&mut self.logging_guard, LoggingGuard::noop());
+        drop(logging_guard);
+        let telemetry_guard = std::mem::replace(&mut self.telemetry_guard, TelemetryProviderGuard::noop());
+        let provider_report = telemetry_guard.shutdown_with_report_timeout(timeout);
+        let provider_shutdown_healthy = provider_report.is_healthy();
+        let report = TelemetryShutdownReport::new(
+            subscriber_install_status,
+            file_log_enabled,
+            dropped_log_lines,
+            provider_report,
+        );
+        if !provider_shutdown_healthy {
+            tracing::warn!(
+                report = %report.to_json(),
+                "telemetry provider shutdown report is unhealthy"
+            );
+        }
+        report
+    }
+
+    /// Gracefully joins runtime-backed exporters and runs blocking provider flushes on the
+    /// service's owned blocking executor within one shared timeout budget.
+    pub async fn shutdown_with_service_context(
+        self,
+        service_context: &ChildServiceContext,
+        timeout: std::time::Duration,
+    ) -> TelemetryShutdownReport {
+        self.shutdown_with_flush_authority(TelemetryFlushAuthority::ServiceContext(service_context), timeout)
+            .await
+    }
+
+    /// Runs the same flush as [`Self::shutdown_with_service_context`] on a drain lease
+    /// reserved from the owning scope while that scope was still open.
+    ///
+    /// Owner finalization reaches telemetry after the owning task group has already been
+    /// shut down, and the closed scope then refuses ordinary submissions. The lease carries
+    /// the reserved allowance past that point without reopening the scope.
+    pub async fn shutdown_with_drain_lease(
+        self,
+        lease: BlockingDrainLease,
+        timeout: std::time::Duration,
+    ) -> TelemetryShutdownReport {
+        self.shutdown_with_flush_authority(TelemetryFlushAuthority::Drain(lease), timeout)
+            .await
+    }
+
+    async fn shutdown_with_flush_authority(
+        self,
+        authority: TelemetryFlushAuthority<'_>,
+        timeout: std::time::Duration,
+    ) -> TelemetryShutdownReport {
+        #[cfg(feature = "prometheus")]
+        let mut telemetry_runtime = self;
+        #[cfg(not(feature = "prometheus"))]
+        let telemetry_runtime = self;
+
+        telemetry_runtime.handle.begin_closing();
+        let deadline = ShutdownDeadline::after(timeout);
+        let subscriber_install_status = telemetry_runtime.telemetry_guard.subscriber_install_status();
+        let file_log_enabled = telemetry_runtime.logging_guard.file_sink_count() > 0;
+        let dropped_log_lines = telemetry_runtime.logging_guard.dropped_log_lines();
+        let surviving_handle = telemetry_runtime.handle.clone();
+
+        #[cfg(feature = "prometheus")]
+        let prometheus_shutdown_error = if let Some(prometheus_http) =
+            telemetry_runtime.telemetry_guard.take_prometheus_http()
+        {
+            let report = prometheus_http.shutdown_gracefully(deadline.remaining()).await;
+            (!report.is_healthy()).then(|| format!("Prometheus endpoint shutdown was unhealthy: {}", report.to_json()))
+        } else {
+            None
+        };
+
+        let shutdown_result = authority
+            .flush("observability.provider-shutdown", deadline, move || {
+                telemetry_runtime.shutdown_with_timeout(deadline.remaining())
+            })
+            .await;
+
+        let report = match shutdown_result {
+            Ok(report) => report,
+            Err(error) => {
+                surviving_handle.mark_closed();
+                let mut provider_report = TelemetryProviderShutdownReport::default();
+                provider_report
+                    .record_runtime_shutdown_error(format!("owned blocking provider shutdown failed: {error}"));
+                TelemetryShutdownReport::new(
+                    subscriber_install_status,
+                    file_log_enabled,
+                    dropped_log_lines,
+                    provider_report,
+                )
+            }
+        };
+        #[cfg(feature = "prometheus")]
+        let mut report = report;
+
+        #[cfg(feature = "prometheus")]
+        if let Some(error) = prometheus_shutdown_error {
+            report.metrics_shutdown_ok = false;
+            report.metrics_shutdown_error = Some(match report.metrics_shutdown_error.take() {
+                Some(existing) => format!("{existing}; {error}"),
+                None => error,
+            });
+        }
+
+        report
+    }
+}
+
+impl Drop for TelemetryRuntimeGuard {
+    fn drop(&mut self) {
+        // Do not block or spawn during unwinding/implicit drop. Provider flushing and reports are
+        // available only through explicit shutdown.
+        self.handle.begin_closing();
+        self.handle.mark_closed();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ObservabilityConfig;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone)]
+    struct RecordingLayer {
+        levels: Arc<Mutex<Vec<tracing::Level>>>,
+    }
+
+    impl Layer<Registry> for RecordingLayer {
+        fn on_event(&self, event: &tracing::Event<'_>, _context: tracing_subscriber::layer::Context<'_, Registry>) {
+            self.levels
+                .lock()
+                .expect("recorded levels lock should remain available")
+                .push(*event.metadata().level());
+        }
+    }
+
+    #[test]
+    fn noop_logging_guard_reports_zero_dropped_lines() {
+        let guard = LoggingGuard::noop();
+
+        assert_eq!(guard.file_sink_count(), 0);
+        assert_eq!(guard.dropped_log_lines(), 0);
+    }
+
+    #[test]
+    fn dropping_runtime_guard_closes_surviving_handle_clones() {
+        let config = ObservabilityConfig {
+            enabled: true,
+            ..ObservabilityConfig::default()
+        };
+        let telemetry_guard =
+            crate::init::init_telemetry_providers(&config).expect("telemetry provider guard should initialize");
+        let runtime = TelemetryRuntimeGuard::new(telemetry_guard, LoggingGuard::noop());
+        let handle = runtime.handle();
+
+        assert_eq!(handle.state(), crate::TelemetryState::Active);
+        drop(runtime);
+
+        assert_eq!(handle.state(), crate::TelemetryState::Closed);
+    }
+
+    #[test]
+    fn logging_guard_tracks_worker_guards_without_static_storage() {
+        let (writer, worker_guard) = tracing_appender::non_blocking(std::io::sink());
+        let error_counter = writer.error_counter();
+        let guard = LoggingGuard::new(vec![worker_guard], vec![error_counter]);
+
+        assert_eq!(guard.file_sink_count(), 1);
+        assert_eq!(guard.dropped_log_lines(), 0);
+    }
+
+    #[test]
+    fn env_filter_accepts_target_directives() {
+        let filter =
+            build_env_filter("rocketmq_store=debug,rocketmq_transport=warn").expect("target directives should parse");
+
+        assert!(filter.to_string().contains("rocketmq_store=debug"));
+    }
+
+    #[test]
+    fn global_info_filter_suppresses_debug_events_inside_info_spans() {
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let layers = vec![Box::new(RecordingLayer {
+            levels: Arc::clone(&levels),
+        }) as BoxedRegistryLayer];
+        let filter = Some(build_env_filter("info").expect("info filter should parse"));
+        let subscriber = compose_subscriber_layers(layers, filter);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("info_filter_regression");
+            let _guard = span.enter();
+            tracing::debug!("debug event should be filtered");
+            tracing::info!("info event should be recorded");
+        });
+
+        assert_eq!(
+            *levels.lock().expect("recorded levels lock should remain available"),
+            vec![tracing::Level::INFO]
+        );
+    }
+
+    #[test]
+    fn invalid_env_filter_returns_typed_error() {
+        let error = build_env_filter("rocketmq_store==debug").expect_err("invalid filter should fail");
+
+        assert_eq!(error.code(), rocketmq_error::OBSERVABILITY_LOG_FILTER_INVALID.code());
+    }
+
+    #[test]
+    fn disabled_console_config_builds_no_layer() {
+        let config = ConsoleLogConfig {
+            enabled: false,
+            ..ConsoleLogConfig::default()
+        };
+
+        assert!(build_console_layer(&config).is_none());
+    }
+
+    #[test]
+    fn console_layer_builder_supports_all_formats() {
+        for format in [LogFormat::Compact, LogFormat::Pretty, LogFormat::Json] {
+            let config = ConsoleLogConfig {
+                format,
+                ..ConsoleLogConfig::default()
+            };
+
+            assert!(build_console_layer(&config).is_some());
+        }
+    }
+
+    #[test]
+    fn disabled_file_config_builds_no_layer_or_directory() {
+        let directory = unique_temp_log_dir("disabled_file_config_builds_no_layer_or_directory");
+        let config = FileLogConfig {
+            enabled: false,
+            directory: directory.to_string_lossy().into_owned(),
+            ..FileLogConfig::default()
+        };
+
+        let layer = build_file_layer(&config).expect("disabled file sink should not fail");
+
+        assert!(layer.is_none());
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn file_layer_creates_missing_directory_and_tracks_guard() {
+        let directory = unique_temp_log_dir("file_layer_creates_missing_directory_and_tracks_guard");
+        let config = FileLogConfig {
+            enabled: true,
+            directory: directory.to_string_lossy().into_owned(),
+            file_name_prefix: "rocketmq-test.log".to_string(),
+            rotation: LogRotation::Never,
+            ..FileLogConfig::default()
+        };
+
+        let layer = build_file_layer(&config)
+            .expect("file sink should build")
+            .expect("enabled file sink should return a layer");
+
+        assert!(directory.exists());
+        assert_eq!(layer.logging_guard().file_sink_count(), 1);
+        assert_eq!(layer.logging_guard().dropped_log_lines(), 0);
+        assert!(directory.join("rocketmq-test.log").exists());
+
+        drop(layer);
+        cleanup_temp_log_dir(directory);
+    }
+
+    #[test]
+    fn file_layer_supports_rotation_variants() {
+        for rotation in [LogRotation::Never, LogRotation::Hourly, LogRotation::Daily] {
+            let directory = unique_temp_log_dir("file_layer_supports_rotation_variants");
+            let config = FileLogConfig {
+                enabled: true,
+                directory: directory.to_string_lossy().into_owned(),
+                file_name_prefix: "rocketmq-rotation.log".to_string(),
+                rotation,
+                ..FileLogConfig::default()
+            };
+
+            let layer = build_file_layer(&config)
+                .expect("file sink should build")
+                .expect("enabled file sink should return a layer");
+
+            assert_eq!(layer.logging_guard().file_sink_count(), 1);
+            assert!(
+                fs::read_dir(&directory)
+                    .expect("log directory should be readable")
+                    .next()
+                    .is_some(),
+                "rotation {rotation:?} should create a log file"
+            );
+
+            drop(layer);
+            cleanup_temp_log_dir(directory);
+        }
+    }
+
+    #[test]
+    fn file_layer_writes_without_ansi_escape_codes() {
+        let directory = unique_temp_log_dir("file_layer_writes_without_ansi_escape_codes");
+        let config = FileLogConfig {
+            enabled: true,
+            directory: directory.to_string_lossy().into_owned(),
+            file_name_prefix: "ansi-free.log".to_string(),
+            rotation: LogRotation::Never,
+            format: LogFormat::Compact,
+            ..FileLogConfig::default()
+        };
+
+        let layer = build_file_layer(&config)
+            .expect("file sink should build")
+            .expect("enabled file sink should return a layer");
+        let (layer, logging_guard) = layer.into_parts();
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "rocketmq_observability::logging::tests", "file sink event");
+        });
+        drop(logging_guard);
+
+        let contents =
+            fs::read_to_string(directory.join("ansi-free.log")).expect("file sink output should be readable");
+        assert!(contents.contains("file sink event"));
+        assert!(!contents.contains('\u{1b}'));
+
+        cleanup_temp_log_dir(directory);
+    }
+
+    #[test]
+    fn invalid_file_layer_config_returns_typed_error() {
+        let config = FileLogConfig {
+            enabled: true,
+            directory: String::new(),
+            ..FileLogConfig::default()
+        };
+
+        let error = match build_file_layer(&config) {
+            Ok(_) => panic!("empty directory should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.operation(),
+            crate::error::ObservabilityOperation::InitializeSubscriber
+        );
+    }
+
+    #[test]
+    fn noop_runtime_guard_exposes_zero_logging_and_subscriber_status() {
+        let guard = TelemetryRuntimeGuard::noop();
+
+        assert_eq!(guard.dropped_log_lines(), 0);
+        assert_eq!(
+            guard.subscriber_install_status(),
+            SubscriberInstallStatus {
+                attempted: false,
+                installed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn noop_runtime_guard_shutdown_succeeds() {
+        let report = TelemetryRuntimeGuard::noop().shutdown();
+
+        assert!(report.is_healthy());
+        assert_eq!(report.dropped_log_lines, 0);
+        assert!(!report.file_log_enabled);
+        assert!(!report.subscriber_installed);
+        report
+            .into_result()
+            .expect("noop runtime guard shutdown should succeed");
+    }
+
+    #[test]
+    fn noop_runtime_guard_honors_caller_shutdown_budget() {
+        let report = TelemetryRuntimeGuard::noop().shutdown_with_timeout(std::time::Duration::ZERO);
+
+        assert!(report.is_healthy());
+    }
+
+    #[test]
+    fn runtime_shutdown_report_preserves_provider_failure() {
+        let report = TelemetryShutdownReport {
+            subscriber_installed: true,
+            file_log_enabled: true,
+            dropped_log_lines: 3,
+            logs_shutdown_ok: false,
+            traces_shutdown_ok: true,
+            metrics_shutdown_ok: true,
+            logs_shutdown_error: Some("logger provider failed".to_string()),
+            traces_shutdown_error: None,
+            metrics_shutdown_error: None,
+        };
+
+        assert!(!report.is_healthy());
+        let error = report.into_result().expect_err("log shutdown should fail");
+        assert_eq!(error.operation(), crate::error::ObservabilityOperation::ShutdownLogs);
+    }
+
+    #[tokio::test]
+    async fn final_flush_remains_owned_after_its_observation_deadline() {
+        use std::sync::{Arc, Condvar, Mutex};
+        let context = rocketmq_runtime::RuntimeContext::from_current("flush-deadline");
+        let service = context.service_context("telemetry");
+        let deadline = ShutdownDeadline::after(Duration::from_millis(100));
+        let lease = reserve_telemetry_flush_lease(&service, Some(deadline)).unwrap();
+        assert!(service.task_group().shutdown_until(deadline).await.is_healthy());
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        struct Release(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0 .0.lock().unwrap() = true;
+                self.0 .1.notify_all();
+            }
+        }
+        let release = Release(gate.clone());
+        let (started, wait_started) = tokio::sync::oneshot::channel();
+        let flush = TelemetryFlushAuthority::Drain(lease).flush("blocked-final-flush", deadline, move || {
+            let _ = started.send(());
+            let mut open = gate.0.lock().unwrap();
+            while !*open {
+                open = gate.1.wait(open).unwrap();
+            }
+            TelemetryRuntimeGuard::noop().shutdown()
+        });
+        let (result, started) = tokio::join!(flush, wait_started);
+        started.unwrap();
+        assert!(result.is_err());
+        assert_eq!(service.metadata_io().blocking_still_running(), 1);
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while service.metadata_io().blocking_still_running() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    fn unique_temp_log_dir(test_name: &str) -> PathBuf {
+        let id = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rocketmq-observability-{test_name}-{}-{id}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn cleanup_temp_log_dir(directory: PathBuf) {
+        if directory.exists() {
+            fs::remove_dir_all(&directory).expect("temporary log directory should be removable");
+        }
+    }
+}

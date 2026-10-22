@@ -1,0 +1,4283 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Custom fork: Java 4.6.1 network lifecycle and preserved physical request failures.
+
+use super::request_builder::*;
+use super::response_decoder::*;
+use super::*;
+use rocketmq_error::fields;
+use rocketmq_error::Error;
+use rocketmq_error::ErrorContext;
+use rocketmq_model::topic::TopicConfig;
+#[cfg(feature = "admin-mutation")]
+use rocketmq_protocol::protocol::subscription::subscription_group_config::SubscriptionGroupConfig;
+use rocketmq_transport::api::OutboundRequestContractReason;
+use rocketmq_transport::api::OutboundRequestRejectionReason;
+use rocketmq_transport::api::OutboundRequestStage;
+use serde::de::DeserializeOwned;
+
+#[cfg(feature = "admin-full")]
+mod compatibility;
+#[cfg(feature = "admin-read")]
+mod controller_rollout;
+mod diagnostics;
+mod metadata;
+mod resources;
+use resources::{acl_version_header, resource_body, resource_properties};
+#[cfg(feature = "admin-mutation")]
+mod supervised_mutation;
+#[cfg(feature = "admin-mutation")]
+mod supervised_mutation_decode;
+mod versioned_config;
+
+// Custom: class registration goes directly to the selected FilterServer, never through Broker VIP.
+impl MQClientAPIImpl {
+    pub async fn register_message_filter_class(
+        &self,
+        address: &CheetahString,
+        consumer_group: CheetahString,
+        topic: CheetahString,
+        class_name: CheetahString,
+        class_crc: i32,
+        source: &[u8],
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let mut request = self.create_remoting_command(RequestCode::RegisterMessageFilterClass);
+        request.add_ext_field("consumerGroup", consumer_group);
+        request.add_ext_field("topic", topic);
+        request.add_ext_field("className", class_name);
+        request.add_ext_field("classCRC", class_crc.to_string());
+        request = request.set_body(source.to_vec());
+        self.resource_response("registerMessageFilterClass", Some(address), request, timeout_millis)
+            .await?;
+        Ok(())
+    }
+}
+
+// Custom fork: a physical view is exactly one complete commit-log record.
+fn decode_view_message_body(mut body: bytes::Bytes) -> ClientResult<MessageExt> {
+    let mut messages =
+        MessageDecoder::decode_batch_checked(&mut body, true, true, |_| true).map_err(ClientError::from)?;
+    if messages.len() != 1 {
+        return Err(ClientError::response_process_failed(
+            "viewMessage",
+            "response must contain exactly one complete message",
+        ));
+    }
+    messages
+        .pop()
+        .ok_or_else(|| ClientError::response_process_failed("viewMessage", "message missing"))
+}
+
+// Custom fork: legacy MQClientException alone classifies as a client argument
+// error. A Broker rejection keeps its code/category plus the legacy typed cause.
+fn admin_broker_response_error(operation: &str, response: &RemotingCommand, address: &str) -> ClientError {
+    ClientError::broker_operation_source(
+        operation,
+        response.code(),
+        Some(address),
+        crate::MQClientException::new_with_code(
+            response.code(),
+            response.remark().map_or_else(String::new, ToString::to_string),
+        ),
+    )
+    .with_request_stage(OutboundRequestStage::ResponseReceived)
+}
+
+fn admin_request_error(operation: &'static str, input: RetryInput) -> ClientError {
+    match input {
+        RetryInput::Transport(error) => ClientError::from_transport(error),
+        RetryInput::Rejected(rejection) => match rejection.reason() {
+            OutboundRequestRejectionReason::DeadlineExpired => {
+                let mut context = ErrorContext::new().with_text(fields::OPERATION_DIAGNOSTIC, operation);
+                if let Some(timeout_millis) = rejection.timeout_millis() {
+                    context = context.with_u64(fields::TIMEOUT_MS, timeout_millis);
+                }
+                ClientError::from_shared(Arc::new(
+                    Error::new(&rocketmq_error::CORE_OPERATION_TIMED_OUT).with_context(context),
+                ))
+            }
+            OutboundRequestRejectionReason::ClientStopping => ClientError::not_started(),
+            OutboundRequestRejectionReason::QueueSaturated => ClientError::from_shared(Arc::new(Error::new(
+                &rocketmq_error::TRANSPORT_ADMISSION_QUEUE_SATURATED,
+            ))),
+            OutboundRequestRejectionReason::Cancelled
+            | OutboundRequestRejectionReason::SessionClosed
+            | OutboundRequestRejectionReason::EndpointUnavailable => {
+                let phase = match rejection.reason() {
+                    OutboundRequestRejectionReason::SessionClosed => "closed",
+                    _ => admin_request_stage_phase(rejection.stage()),
+                };
+                let mut context = ErrorContext::new().with_text(fields::PHASE, phase);
+                if rejection.remote_addr_present() {
+                    context = context.with_secret_presence(fields::REMOTE_ADDR_PRESENT);
+                }
+                ClientError::from_shared(Arc::new(
+                    Error::new(&rocketmq_error::TRANSPORT_CONNECTION_FAILED).with_context(context),
+                ))
+            }
+        }
+        .with_request_stage(rejection.stage()),
+        RetryInput::Contract(contract) => match contract.reason() {
+            OutboundRequestContractReason::NameServerEndpointMissing => {
+                let mut context = ErrorContext::new().with_text(fields::PHASE, "connect");
+                if contract.remote_addr_present() {
+                    context = context.with_secret_presence(fields::REMOTE_ADDR_PRESENT);
+                }
+                ClientError::from_shared(Arc::new(
+                    Error::new(&rocketmq_error::TRANSPORT_CONNECTION_FAILED).with_context(context),
+                ))
+            }
+        },
+        RetryInput::Response { terminal_error, .. } | RetryInput::BusinessError(terminal_error) => terminal_error,
+        // Admin request attempts cannot construct producer-only send status or route-policy inputs.
+        RetryInput::SendStatus(_) | RetryInput::RouteUnavailable => {
+            unreachable!("admin request returned an unrelated retry input")
+        }
+    }
+}
+
+const fn admin_request_stage_phase(stage: OutboundRequestStage) -> &'static str {
+    match stage {
+        OutboundRequestStage::BeforeWrite => "before_write",
+        OutboundRequestStage::Writing => "writing",
+        OutboundRequestStage::AwaitingResponse => "awaiting_response",
+        OutboundRequestStage::ResponseReceived => "response_received",
+    }
+}
+
+fn decode_admin_json<T: DeserializeOwned>(bytes: &[u8]) -> ClientResult<T> {
+    serde_json::from_slice(bytes).map_err(|source| {
+        let context = ErrorContext::new()
+            .with_text(fields::OPERATION_DIAGNOSTIC, "deserialize")
+            .with_text(fields::FORMAT, "JSON")
+            .with_secret_presence(fields::SOURCE_PRESENT);
+        ClientError::from_error(
+            Error::caused_by(&rocketmq_error::CORE_SERIALIZATION_FAILED, source).with_context(context),
+        )
+    })
+}
+
+pub struct AdminClient<'a> {
+    api: &'a MQClientAPIImpl,
+}
+
+impl AdminClient<'_> {
+    pub async fn broker_cluster_info(&self, timeout_millis: u64) -> ClientResult<ClusterInfo> {
+        self.api.get_broker_cluster_info(timeout_millis).await
+    }
+}
+
+impl MQClientAPIImpl {
+    #[must_use]
+    pub fn admin_client(&self) -> AdminClient<'_> {
+        AdminClient { api: self }
+    }
+}
+
+impl MQClientAPIImpl {
+    pub(crate) async fn get_kvconfig_value(
+        &self,
+        namespace: CheetahString,
+        key: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<Option<CheetahString>> {
+        let request =
+            self.create_request_command(RequestCode::GetKvConfig, GetKVConfigRequestHeader::new(namespace, key));
+        let response = self
+            .resource_response("getKVConfigValue", None, request, timeout_millis)
+            .await?;
+        // Custom: Java's nullable value also permits an entirely absent extFields map.
+        Ok(response.ext_fields().and_then(|fields| fields.get("value")).cloned())
+    }
+
+    pub(crate) async fn get_kv_config_value(
+        &self,
+        namespace: CheetahString,
+        key: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<Option<CheetahString>> {
+        self.get_kvconfig_value(namespace, key, timeout_millis).await
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn delete_kvconfig_value(
+        &self,
+        namespace: CheetahString,
+        key: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request = self.create_request_command(
+            RequestCode::DeleteKvConfig,
+            DeleteKVConfigRequestHeader::new(namespace, key),
+        );
+        self.resource_write_nodes(
+            "delete_kvconfig_value",
+            self.remoting_client.get_name_server_address_list(),
+            request,
+            timeout_millis,
+        )
+        .await
+        .into_result()
+        .map(|_| ())
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn delete_kv_config_value(
+        &self,
+        namespace: CheetahString,
+        key: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        self.delete_kvconfig_value(namespace, key, timeout_millis).await
+    }
+
+    pub(crate) async fn get_kvlist_by_namespace(
+        &self,
+        namespace: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<rocketmq_protocol::protocol::body::kv_table::KVTable> {
+        let request_header = GetKVListByNamespaceRequestHeader::new(namespace);
+        let request = self.create_request_command(RequestCode::GetKvlistByNamespace, request_header);
+
+        let outcome = self.remoting_client.invoke_request(None, request, timeout_millis).await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_kvlist_by_namespace",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_kvlist_by_namespace",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            if let Some(body) = response.get_body() {
+                return rocketmq_protocol::protocol::body::kv_table::KVTable::decode(body.as_ref())
+                    .map_err(ClientError::from);
+            }
+        }
+
+        if response.code() == 0 {
+            return Err(ClientError::response_process_failed(
+                "get_kvlist_by_namespace",
+                "successful response has no body",
+            ));
+        }
+        Err(admin_broker_response_error(
+            "get_kvlist_by_namespace",
+            &response,
+            "NameServer",
+        ))
+    }
+
+    pub(crate) async fn get_kv_list_by_namespace(
+        &self,
+        namespace: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<rocketmq_protocol::protocol::body::kv_table::KVTable> {
+        self.get_kvlist_by_namespace(namespace, timeout_millis).await
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn put_kvconfig_value(
+        &self,
+        namespace: CheetahString,
+        key: CheetahString,
+        value: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request = self.create_request_command(
+            RequestCode::PutKvConfig,
+            PutKVConfigRequestHeader::new(namespace, key, value),
+        );
+        self.resource_write_nodes(
+            "put_kvconfig_value",
+            self.remoting_client.get_name_server_address_list(),
+            request,
+            timeout_millis,
+        )
+        .await
+        .into_result()
+        .map(|_| ())
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn put_kv_config_value(
+        &self,
+        namespace: CheetahString,
+        key: CheetahString,
+        value: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        self.put_kvconfig_value(namespace, key, value, timeout_millis).await
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn create_user(
+        &self,
+        broker_address: CheetahString,
+        user_info: &UserInfo,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let mut request_header = CreateUserRequestHeader::default();
+        let username = user_info
+            .username
+            .clone()
+            .ok_or_else(|| mq_client_err!(-1, "username is required".to_string()))?;
+        request_header.set_username(username);
+        let mut request = self.create_request_command(RequestCode::AuthCreateUser, request_header);
+        request = request.set_body(user_info.encode()?);
+
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_address), request.clone(), timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error("create_user", RetryInput::Rejected(rejection)));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("create_user", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        let mut err_response = None;
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => {}
+            _ => err_response = Some(response),
+        }
+
+        if let Some(err_response) = err_response {
+            return Err(mq_client_err!(
+                err_response.code(),
+                err_response.remark().map_or("".to_string(), |s| s.to_string())
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn update_user(
+        &self,
+        broker_address: CheetahString,
+        user_info: &UserInfo,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let mut request_header = UpdateUserRequestHeader::default();
+        let username = user_info
+            .username
+            .clone()
+            .ok_or_else(|| mq_client_err!(-1, "username is required".to_string()))?;
+        request_header.set_username(username);
+        let mut request = self.create_request_command(RequestCode::AuthUpdateUser, request_header);
+        request = request.set_body(user_info.encode()?);
+
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_address), request.clone(), timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error("update_user", RetryInput::Rejected(rejection)));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("update_user", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        let mut err_response = None;
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => {}
+            _ => err_response = Some(response),
+        }
+
+        if let Some(err_response) = err_response {
+            return Err(mq_client_err!(
+                err_response.code(),
+                err_response.remark().map_or("".to_string(), |s| s.to_string())
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn create_acl(
+        &self,
+        broker_address: CheetahString,
+        acl_info: &AclInfo,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let subject = acl_info
+            .subject
+            .clone()
+            .ok_or_else(|| mq_client_err!(-1, "ACL subject is required".to_string()))?;
+        let request_header = CreateAclRequestHeader { subject };
+        let request = self
+            .create_request_command(RequestCode::AuthCreateAcl, request_header)
+            .set_body(acl_info.encode()?);
+
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_address), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error("create_acl", RetryInput::Rejected(rejection)));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("create_acl", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or("".to_string(), |s| s.to_string())
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn update_acl(
+        &self,
+        broker_address: CheetahString,
+        acl_info: &AclInfo,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let subject = acl_info
+            .subject
+            .clone()
+            .ok_or_else(|| mq_client_err!(-1, "ACL subject is required".to_string()))?;
+        let request_header = UpdateAclRequestHeader { subject };
+        let request = self
+            .create_request_command(RequestCode::AuthUpdateAcl, request_header)
+            .set_body(acl_info.encode()?);
+
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_address), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error("update_acl", RetryInput::Rejected(rejection)));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("update_acl", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or("".to_string(), |s| s.to_string())
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn create_and_update_plain_access_config(
+        &self,
+        broker_address: CheetahString,
+        plain_access_config: &PlainAccessConfig,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request = create_and_update_plain_access_config_request(&self.command_factory, plain_access_config)?;
+        let address = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, broker_address.as_str());
+        self.resource_response(
+            "create_and_update_plain_access_config",
+            Some(&address),
+            request,
+            timeout_millis,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn delete_plain_access_config(
+        &self,
+        broker_address: CheetahString,
+        access_key: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request = delete_plain_access_config_request(&self.command_factory, &access_key);
+        let address = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, broker_address.as_str());
+        self.resource_response("delete_plain_access_config", Some(&address), request, timeout_millis)
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn update_global_white_addrs_config(
+        &self,
+        broker_address: CheetahString,
+        global_white_addrs: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request = self.create_request_command(
+            RequestCode::UpdateGlobalWhiteAddrsConfig,
+            UpdateGlobalWhiteAddrsConfigRequestHeader { global_white_addrs },
+        );
+        let address = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, broker_address.as_str());
+        self.resource_response(
+            "update_global_white_addrs_config",
+            Some(&address),
+            request,
+            timeout_millis,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(crate) async fn get_broker_cluster_acl_version_info(
+        &self,
+        broker_address: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<ClusterAclVersionInfo> {
+        let request = self.create_remoting_command(RequestCode::GetBrokerClusterAclInfo);
+        let address = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, broker_address.as_str());
+        let response = self
+            .resource_response("getBrokerClusterAclInfo", Some(&address), request, timeout_millis)
+            .await?;
+        acl_version_header(&response)
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn delete_acl(
+        &self,
+        broker_address: CheetahString,
+        subject: CheetahString,
+        resource: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let resource_option = if resource.is_empty() { None } else { Some(resource) };
+        let request_header = DeleteAclRequestHeader::new(subject, resource_option);
+        self.delete_acl_request(broker_address, request_header, timeout_millis)
+            .await
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn delete_acl_entry(
+        &self,
+        broker_address: CheetahString,
+        subject: CheetahString,
+        policy_type: CheetahString,
+        resource: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let header = acl_entry_delete_header(subject, policy_type, resource)?;
+        self.delete_acl_request(broker_address, header, timeout_millis).await
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    async fn delete_acl_request(
+        &self,
+        broker_address: CheetahString,
+        request_header: DeleteAclRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request = self.create_request_command(RequestCode::AuthDeleteAcl, request_header);
+
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_address), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error("delete_acl", RetryInput::Rejected(rejection)));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("delete_acl", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or("".to_string(), |s| s.to_string())
+            )),
+        }
+    }
+
+    pub(crate) async fn list_acl(
+        &self,
+        broker_address: CheetahString,
+        subject_filter: CheetahString,
+        resource_filter: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<Vec<AclInfo>> {
+        let request_header = ListAclRequestHeader {
+            subject_filter,
+            resource_filter,
+        };
+        let request = self.create_request_command(RequestCode::AuthListAcl, request_header);
+
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_address), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error("list_acl", RetryInput::Rejected(rejection)));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("list_acl", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => {
+                if let Some(body) = response.get_body() {
+                    Vec::<AclInfo>::decode(body.as_ref()).map_err(ClientError::from)
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or("".to_string(), |s| s.to_string())
+            )),
+        }
+    }
+
+    pub(crate) async fn get_acl(
+        &self,
+        broker_address: CheetahString,
+        subject: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<AclInfo> {
+        let request = get_acl_request(&self.command_factory, subject);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_address), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error("get_acl", RetryInput::Rejected(rejection)));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("get_acl", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => {
+                let body = response
+                    .get_body()
+                    .ok_or_else(|| mq_client_err!("get_acl response body is empty".to_string()))?;
+                AclInfo::decode(body.as_ref()).map_err(ClientError::from)
+            }
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or("".to_string(), |s| s.to_string())
+            )),
+        }
+    }
+
+    pub(crate) async fn get_user(
+        &self,
+        broker_address: CheetahString,
+        username: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<Option<UserInfo>> {
+        let request_header = GetUserRequestHeader {
+            username: username.clone(),
+        };
+        let request = self.create_request_command(RequestCode::AuthGetUser, request_header);
+
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_address), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error("get_user", RetryInput::Rejected(rejection)));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("get_user", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => {
+                let _body = response.get_body();
+                if let Some(body) = response.get_body() {
+                    let user_info = UserInfo::decode(body)?;
+                    Ok(Some(user_info))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map(|s| s.to_string()).unwrap_or_default()
+            )),
+        }
+    }
+
+    pub(crate) async fn list_users(
+        &self,
+        broker_address: CheetahString,
+        filter: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<Vec<UserInfo>> {
+        let request_header = ListUsersRequestHeader { filter };
+        let request = self.create_request_command(RequestCode::AuthListUsers, request_header);
+
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_address), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error("list_users", RetryInput::Rejected(rejection)));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("list_users", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => {
+                if let Some(body) = response.get_body() {
+                    Vec::<UserInfo>::decode(body.as_ref()).map_err(ClientError::from)
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or("".to_string(), |s| s.to_string())
+            )),
+        }
+    }
+
+    pub(crate) async fn list_user(
+        &self,
+        broker_address: CheetahString,
+        filter: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<Vec<UserInfo>> {
+        self.list_users(broker_address, filter, timeout_millis).await
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn delete_user(
+        &self,
+        broker_address: CheetahString,
+        username: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let mut request_header = DeleteUserRequestHeader::default();
+        request_header.set_username(username);
+        let request = self.create_request_command(RequestCode::AuthDeleteUser, request_header);
+
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_address), request.clone(), timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error("delete_user", RetryInput::Rejected(rejection)));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("delete_user", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        let mut err_response = None;
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => {}
+            _ => err_response = Some(response),
+        }
+
+        if let Some(err_response) = err_response {
+            return Err(mq_client_err!(
+                err_response.code(),
+                err_response.remark().map_or("".to_string(), |s| s.to_string())
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn update_name_server_config(
+        &self,
+        properties: HashMap<CheetahString, CheetahString>,
+        special_name_servers: Option<Vec<CheetahString>>,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let body = mix_all::properties_to_string(&properties);
+        if body.is_empty() {
+            return Ok(());
+        }
+        let addresses = special_name_servers
+            .filter(|addresses| !addresses.is_empty())
+            .unwrap_or_else(|| self.get_name_server_address_list());
+        let request = self
+            .create_remoting_command(RequestCode::UpdateNamesrvConfig)
+            .set_body(body.to_string());
+        self.resource_write_nodes("updateNameServerConfig", addresses, request, timeout_millis)
+            .await
+            .into_result()
+            .map(|_| ())
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn add_write_perm_of_broker(
+        &self,
+        namesrv_addr: CheetahString,
+        broker_name: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<i32> {
+        let request_header = AddWritePermOfBrokerRequestHeader::new(broker_name);
+        let request = self.create_request_command(RequestCode::AddWritePermOfBroker, request_header);
+
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&namesrv_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "add_write_perm_of_broker",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "add_write_perm_of_broker",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            let request_header = response.decode_command_custom_header_fast::<AddWritePermOfBrokerResponseHeader>()?;
+            return Ok(request_header.get_add_topic_count());
+        }
+        Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or("".to_string(), |s| s.to_string())
+        ))
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn wipe_write_perm_of_broker(
+        &self,
+        namesrv_addr: CheetahString,
+        broker_name: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<i32> {
+        let request_header = WipeWritePermOfBrokerRequestHeader::new(broker_name);
+        let request = self.create_request_command(RequestCode::WipeWritePermOfBroker, request_header);
+
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&namesrv_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "wipe_write_perm_of_broker",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "wipe_write_perm_of_broker",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            let request_header = response.decode_command_custom_header_fast::<WipeWritePermOfBrokerResponseHeader>()?;
+            return Ok(request_header.get_wipe_topic_count());
+        }
+        Err(admin_broker_response_error(
+            "wipe_write_perm_of_broker",
+            &response,
+            namesrv_addr.as_str(),
+        ))
+    }
+
+    pub(crate) async fn get_broker_cluster_info(&self, timeout_millis: u64) -> ClientResult<ClusterInfo> {
+        let request = self.create_request_command(RequestCode::GetBrokerClusterInfo, EmptyHeader {});
+        let outcome = self.remoting_client.invoke_request(None, request, timeout_millis).await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_broker_cluster_info",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_broker_cluster_info",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            if let Some(body) = response.get_body() {
+                let cluster = ClusterInfo::decode(body.as_ref()).map_err(ClientError::from)?;
+                if cluster.broker_addr_table.is_none() || cluster.cluster_addr_table.is_none() {
+                    return Err(ClientError::response_process_source(
+                        "getBrokerClusterInfo",
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "brokerAddrTable/clusterAddrTable missing or null",
+                        ),
+                    ));
+                }
+                return Ok(cluster);
+            }
+        }
+        if response.code() == 0 {
+            return Err(ClientError::response_process_failed(
+                "get_broker_cluster_info",
+                "successful response has no body",
+            ));
+        }
+        Err(admin_broker_response_error(
+            "get_broker_cluster_info",
+            &response,
+            "NameServer",
+        ))
+    }
+
+    pub(crate) async fn get_broker_runtime_info(
+        &self,
+        addr: &CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<rocketmq_protocol::protocol::body::kv_table::KVTable> {
+        // Custom: exact 4.6.1 fields, no newer optional headers.
+        let request = self.create_remoting_command(RequestCode::GetBrokerRuntimeInfo);
+
+        let response = self
+            .diagnostic_broker_response("get_broker_runtime_info", addr, request, timeout_millis)
+            .await?;
+        resource_body(&response, "get_broker_runtime_info")
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn sync_broker_member_group(
+        &self,
+        cluster_name: &CheetahString,
+        broker_name: &CheetahString,
+        is_compatible_with_old_name_srv: bool,
+    ) -> ClientResult<Option<BrokerMemberGroup>> {
+        if is_compatible_with_old_name_srv {
+            self.get_broker_member_group_compatible(cluster_name, broker_name).await
+        } else {
+            self.get_broker_member_group(cluster_name, broker_name).await
+        }
+    }
+
+    pub(super) async fn get_broker_member_group(
+        &self,
+        cluster_name: &CheetahString,
+        broker_name: &CheetahString,
+    ) -> ClientResult<Option<BrokerMemberGroup>> {
+        let request_header = GetBrokerMemberGroupRequestHeader::new(cluster_name.clone(), broker_name.clone());
+        let request = self.create_request_command(RequestCode::GetBrokerMemberGroup, request_header);
+        let outcome = self.remoting_client.invoke_request(None, request, 3000).await;
+        let mut response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_broker_member_group",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_broker_member_group",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            if let Some(body) = response.take_body() {
+                let response_body = GetBrokerMemberGroupResponseBody::decode(body.as_ref())?;
+                return Ok(Some(
+                    response_body
+                        .broker_member_group
+                        .unwrap_or_else(|| empty_broker_member_group(cluster_name, broker_name)),
+                ));
+            }
+        }
+        Ok(Some(empty_broker_member_group(cluster_name, broker_name)))
+    }
+
+    pub(super) async fn get_broker_member_group_compatible(
+        &self,
+        cluster_name: &CheetahString,
+        broker_name: &CheetahString,
+    ) -> ClientResult<Option<BrokerMemberGroup>> {
+        let request_header = GetRouteInfoRequestHeader {
+            topic: CheetahString::from_string(format!(
+                "{}{}",
+                TopicValidator::SYNC_BROKER_MEMBER_GROUP_PREFIX,
+                broker_name
+            )),
+            ..Default::default()
+        };
+        let request = self.create_request_command(RequestCode::GetRouteinfoByTopic, request_header);
+        let outcome = self.remoting_client.invoke_request(None, request, 3000).await;
+        let mut response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_broker_member_group_compatible",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_broker_member_group_compatible",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            if let Some(body) = response.take_body() {
+                let topic_route_data = TopicRouteData::decode(body.as_ref())?;
+                return Ok(Some(broker_member_group_from_route_data(
+                    cluster_name,
+                    broker_name,
+                    &topic_route_data,
+                )));
+            }
+        }
+        Ok(Some(empty_broker_member_group(cluster_name, broker_name)))
+    }
+
+    pub(crate) async fn get_broker_lite_info(
+        &self,
+        addr: &CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<GetBrokerLiteInfoResponseBody> {
+        let request = self.create_request_command(RequestCode::GetBrokerLiteInfo, EmptyHeader {});
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_broker_lite_info",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_broker_lite_info",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            if let Some(body) = response.get_body() {
+                return GetBrokerLiteInfoResponseBody::decode(body.as_ref()).map_err(ClientError::from);
+            }
+        }
+        Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or("".to_string(), |s| s.to_string())
+        ))
+    }
+
+    pub(crate) async fn check_rocksdb_cq_write_progress(
+        &self,
+        addr: &CheetahString,
+        topic: CheetahString,
+        check_store_time: i64,
+        timeout_millis: u64,
+    ) -> ClientResult<CheckRocksdbCqWriteResult> {
+        let request_header = CheckRocksdbCqWriteProgressRequestHeader {
+            topic,
+            check_store_time,
+            rpc: None,
+        };
+        let request = self.create_request_command(RequestCode::CheckRocksdbCqWriteProgress, request_header);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "check_rocksdb_cq_write_progress",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "check_rocksdb_cq_write_progress",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            if let Some(body) = response.get_body() {
+                let result: CheckRocksdbCqWriteResult = serde_json::from_slice(body.as_ref()).map_err(|e| {
+                    mq_client_err!(-1, format!("Failed to deserialize CheckRocksdbCqWriteResult: {}", e))
+                })?;
+                return Ok(result);
+            }
+        }
+        Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or("".to_string(), |s| s.to_string())
+        ))
+    }
+
+    pub(crate) async fn query_consume_queue(
+        &self,
+        addr: &CheetahString,
+        topic: CheetahString,
+        queue_id: i32,
+        index: i64,
+        count: i32,
+        consumer_group: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<QueryConsumeQueueResponseBody> {
+        // Custom: exact 4.6.1 fields, no newer optional headers.
+        let mut request = self.create_remoting_command(RequestCode::QueryConsumeQueue);
+        request.add_ext_field("topic", topic);
+        request.add_ext_field("queueId", queue_id.to_string());
+        request.add_ext_field("index", index.to_string());
+        request.add_ext_field("count", count.to_string());
+        request.add_ext_field("consumerGroup", consumer_group);
+        let response = self
+            .diagnostic_broker_response("query_consume_queue", addr, request, timeout_millis)
+            .await?;
+        resource_body(&response, "query_consume_queue")
+    }
+
+    pub(crate) async fn get_lite_group_info(
+        &self,
+        addr: &CheetahString,
+        group: CheetahString,
+        lite_topic: CheetahString,
+        top_k: i32,
+        timeout_millis: u64,
+    ) -> ClientResult<GetLiteGroupInfoResponseBody> {
+        let request_header = GetLiteGroupInfoRequestHeader {
+            group,
+            lite_topic,
+            top_k,
+            rpc: None,
+        };
+        let request = self.create_request_command(RequestCode::GetLiteGroupInfo, request_header);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_lite_group_info",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_lite_group_info",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            if let Some(body) = response.get_body() {
+                return GetLiteGroupInfoResponseBody::decode(body.as_ref()).map_err(ClientError::from);
+            }
+        }
+        Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or("".to_string(), |s| s.to_string())
+        ))
+    }
+
+    pub(crate) async fn get_lite_client_info(
+        &self,
+        addr: &CheetahString,
+        parent_topic: CheetahString,
+        group: CheetahString,
+        client_id: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<GetLiteClientInfoResponseBody> {
+        let request_header = GetLiteClientInfoRequestHeader {
+            parent_topic: Some(parent_topic),
+            group: Some(group),
+            client_id: Some(client_id),
+            max_count: 1000,
+        };
+        let request = self.create_request_command(RequestCode::GetLiteClientInfo, request_header);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_lite_client_info",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_lite_client_info",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            if let Some(body) = response.get_body() {
+                return GetLiteClientInfoResponseBody::decode(body.as_ref()).map_err(ClientError::from);
+            }
+        }
+        Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or("".to_string(), |s| s.to_string())
+        ))
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn trigger_lite_dispatch(
+        &self,
+        addr: &CheetahString,
+        group: CheetahString,
+        client_id: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request_header = TriggerLiteDispatchRequestHeader {
+            group,
+            client_id: if client_id.is_empty() { None } else { Some(client_id) },
+        };
+        let request = self.create_request_command(RequestCode::TriggerLiteDispatch, request_header);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "trigger_lite_dispatch",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "trigger_lite_dispatch",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or("".to_string(), |s| s.to_string())
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn sync_lite_subscription(
+        &self,
+        broker_addr: &CheetahString,
+        lite_subscription_dto: LiteSubscriptionDTO,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request = lite_subscription_ctl_request(&self.command_factory, lite_subscription_dto)?;
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "sync_lite_subscription",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "sync_lite_subscription",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(client_broker_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string()),
+                broker_addr
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub async fn sync_lite_subscription_async(
+        &self,
+        broker_addr: &CheetahString,
+        lite_subscription_dto: LiteSubscriptionDTO,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        self.sync_lite_subscription(broker_addr, lite_subscription_dto, timeout_millis)
+            .await
+    }
+
+    pub(crate) async fn get_lite_topic_info(
+        &self,
+        addr: &CheetahString,
+        parent_topic: &CheetahString,
+        lite_topic: &CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<GetLiteTopicInfoResponseBody> {
+        let request_header = GetLiteTopicInfoRequestHeader {
+            parent_topic: parent_topic.clone(),
+            lite_topic: lite_topic.clone(),
+        };
+        let request = self.create_request_command(RequestCode::GetLiteTopicInfo, request_header);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_lite_topic_info",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_lite_topic_info",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            if let Some(body) = response.get_body() {
+                return GetLiteTopicInfoResponseBody::decode(body.as_ref()).map_err(ClientError::from);
+            }
+        }
+        Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or("".to_string(), |s| s.to_string())
+        ))
+    }
+    pub(crate) async fn get_parent_topic_info(
+        &self,
+        addr: &CheetahString,
+        topic: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<GetParentTopicInfoResponseBody> {
+        let request_header = GetParentTopicInfoRequestHeader { topic, rpc: None };
+        let request = self.create_request_command(RequestCode::GetParentTopicInfo, request_header);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_parent_topic_info",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_parent_topic_info",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            if let Some(body) = response.get_body() {
+                return GetParentTopicInfoResponseBody::decode(body.as_ref()).map_err(ClientError::from);
+            }
+        }
+        Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or("".to_string(), |s| s.to_string())
+        ))
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub async fn delete_subscription_group(
+        &self,
+        addr: &CheetahString,
+        group_name: CheetahString,
+        clean_offset: bool,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        if clean_offset {
+            return Err(ClientError::illegal_argument(
+                "cleanOffset is not a Java 4.6.1 subscription-group operation",
+            ));
+        }
+        let mut request = self.create_remoting_command(RequestCode::DeleteSubscriptionGroup);
+        request.add_ext_field("groupName", group_name);
+        let address = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        self.resource_response("deleteSubscriptionGroup", Some(&address), request, timeout_millis)
+            .await
+            .map(|_| ())
+    }
+
+    /// Deletes multiple subscription groups with one broker request.
+    #[cfg(feature = "admin-mutation")]
+    pub async fn delete_subscription_group_list(
+        &self,
+        addr: &CheetahString,
+        group_name_list: Vec<CheetahString>,
+        clean_offset: bool,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request = delete_subscription_group_list_request(&self.command_factory, group_name_list, clean_offset)?;
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "delete_subscription_group_list",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "delete_subscription_group_list",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string())
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub async fn reset_master_flush_offset(
+        &self,
+        broker_addr: &CheetahString,
+        master_flush_offset: i64,
+    ) -> ClientResult<()> {
+        let request_header = ResetMasterFlushOffsetHeader {
+            master_flush_offset: Some(master_flush_offset),
+        };
+
+        let request = self.create_request_command(RequestCode::ResetMasterFlushOffset, request_header);
+
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(broker_addr), request, 3000)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "reset_master_flush_offset",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "reset_master_flush_offset",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            return Ok(());
+        }
+
+        Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or("".to_string(), |s| s.to_string())
+        ))
+    }
+
+    pub(super) async fn get_topic_list_from_name_server_by_code(
+        &self,
+        request_code: RequestCode,
+        timeout_millis: u64,
+    ) -> ClientResult<TopicList> {
+        let request = self.create_remoting_command(request_code);
+        let response = self
+            .resource_response("getTopicList", None, request, timeout_millis)
+            .await?;
+        resource_body(&response, "getTopicList")
+    }
+
+    pub(crate) async fn get_topic_list_from_name_server(&self, timeout_millis: u64) -> ClientResult<TopicList> {
+        self.get_topic_list_from_name_server_by_code(RequestCode::GetAllTopicListFromNameserver, timeout_millis)
+            .await
+    }
+
+    pub(crate) async fn get_all_topic_list_from_name_server(&self, timeout_millis: u64) -> ClientResult<TopicList> {
+        self.get_topic_list_from_name_server(timeout_millis).await
+    }
+
+    pub(crate) async fn get_system_topic_list(&self, timeout_millis: u64) -> ClientResult<TopicList> {
+        let mut topic_list = self
+            .get_topic_list_from_name_server_by_code(RequestCode::GetSystemTopicListFromNs, timeout_millis)
+            .await?;
+        merge_system_topic_list_from_broker(self, &mut topic_list, timeout_millis).await?;
+        Ok(topic_list)
+    }
+
+    pub(crate) async fn get_unit_topic_list(
+        &self,
+        contain_retry: bool,
+        timeout_millis: u64,
+    ) -> ClientResult<TopicList> {
+        let mut topic_list = self
+            .get_topic_list_from_name_server_by_code(RequestCode::GetUnitTopicList, timeout_millis)
+            .await?;
+        filter_retry_topics_like_java(&mut topic_list, contain_retry);
+        Ok(topic_list)
+    }
+
+    pub(crate) async fn get_has_unit_sub_topic_list(
+        &self,
+        contain_retry: bool,
+        timeout_millis: u64,
+    ) -> ClientResult<TopicList> {
+        let mut topic_list = self
+            .get_topic_list_from_name_server_by_code(RequestCode::GetHasUnitSubTopicList, timeout_millis)
+            .await?;
+        filter_retry_topics_like_java(&mut topic_list, contain_retry);
+        Ok(topic_list)
+    }
+
+    pub(crate) async fn get_has_unit_sub_un_unit_topic_list(
+        &self,
+        contain_retry: bool,
+        timeout_millis: u64,
+    ) -> ClientResult<TopicList> {
+        let mut topic_list = self
+            .get_topic_list_from_name_server_by_code(RequestCode::GetHasUnitSubUnunitTopicList, timeout_millis)
+            .await?;
+        filter_retry_topics_like_java(&mut topic_list, contain_retry);
+        Ok(topic_list)
+    }
+
+    pub(crate) async fn get_topics_by_cluster(
+        &self,
+        cluster: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<rocketmq_protocol::protocol::body::topic::topic_list::TopicList> {
+        let request_header = GetTopicsByClusterRequestHeader::new(cluster);
+        let request = self.create_request_command(RequestCode::GetTopicsByCluster, request_header);
+        let outcome = self.remoting_client.invoke_request(None, request, timeout_millis).await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_topics_by_cluster",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_topics_by_cluster",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            if let Some(body) = response.get_body() {
+                return rocketmq_protocol::protocol::body::topic::topic_list::TopicList::decode(body.as_ref())
+                    .map_err(ClientError::from);
+            }
+        }
+        if response.code() == 0 {
+            return Err(ClientError::response_process_failed(
+                "getTopicsByCluster",
+                "successful response has no body",
+            ));
+        }
+        Err(admin_broker_response_error(
+            "getTopicsByCluster",
+            &response,
+            "NameServer",
+        ))
+    }
+
+    pub(crate) async fn get_cluster_list(
+        &self,
+        topic: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<HashSet<CheetahString>> {
+        let topic_route_data = self
+            .get_topic_route_info_from_name_server(&topic, timeout_millis)
+            .await?
+            .ok_or_else(|| mq_client_err!(format!("Topic route not found for: {topic}")))?;
+        let cluster_info = self.get_broker_cluster_info(timeout_millis).await?;
+        Ok(cluster_names_for_topic_route(&cluster_info, &topic_route_data))
+    }
+
+    pub(crate) async fn get_system_topic_list_from_broker(
+        &self,
+        addr: &CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<rocketmq_protocol::protocol::body::topic::topic_list::TopicList> {
+        let request = self.create_request_command(RequestCode::GetSystemTopicListFromBroker, EmptyHeader {});
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_system_topic_list_from_broker",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_system_topic_list_from_broker",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            if let Some(body) = response.get_body() {
+                return rocketmq_protocol::protocol::body::topic::topic_list::TopicList::decode(body.as_ref())
+                    .map_err(ClientError::from);
+            }
+        }
+        Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or("".to_string(), |s| s.to_string())
+        ))
+    }
+
+    pub(crate) async fn get_consume_stats(
+        &self,
+        addr: &CheetahString,
+        request_header: rocketmq_protocol::protocol::header::get_consume_stats_request_header::GetConsumeStatsRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<rocketmq_protocol::protocol::admin::consume_stats::ConsumeStats> {
+        // Custom: exact 4.6.1 fields, no newer optional headers.
+        let mut request = self.create_remoting_command(RequestCode::GetConsumeStats);
+        request.add_ext_field("consumerGroup", request_header.consumer_group);
+        if !request_header.topic.is_empty() {
+            request.add_ext_field("topic", request_header.topic);
+        }
+        let response = self
+            .diagnostic_broker_response("get_consume_stats", addr, request, timeout_millis)
+            .await?;
+        let body = diagnostics::diagnostic_response_body(&response, "get_consume_stats")?;
+        rocketmq_protocol::protocol::admin::consume_stats::ConsumeStats::decode_strict(body).map_err(|error| {
+            ClientError::response_process_source("get_consume_stats", error)
+                .with_request_stage(OutboundRequestStage::ResponseReceived)
+        })
+    }
+
+    pub(crate) async fn query_consume_time_span(
+        &self,
+        addr: &CheetahString,
+        request_header: QueryConsumeTimeSpanRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<Vec<rocketmq_protocol::protocol::body::queue_time_span::QueueTimeSpan>> {
+        let mut request = self.create_remoting_command(RequestCode::QueryConsumeTimeSpan);
+        request.add_ext_field("topic", request_header.topic);
+        request.add_ext_field("group", request_header.group);
+        let response = self
+            .diagnostic_broker_response("queryConsumeTimeSpan", addr, request, timeout_millis)
+            .await?;
+        let body: QueryConsumeTimeSpanBody = resource_body(&response, "queryConsumeTimeSpan")?;
+        Ok(body.consume_time_span_set)
+    }
+
+    pub(crate) async fn get_topic_stats_info(
+        &self,
+        addr: &CheetahString,
+        request_header: GetTopicStatsInfoRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<rocketmq_protocol::protocol::admin::topic_stats_table::TopicStatsTable> {
+        // Custom: exact 4.6.1 fields, no newer optional headers.
+        let mut request = self.create_remoting_command(RequestCode::GetTopicStatsInfo);
+        request.add_ext_field("topic", request_header.topic);
+        let response = self
+            .diagnostic_broker_response("get_topic_stats_info", addr, request, timeout_millis)
+            .await?;
+        let body = diagnostics::diagnostic_response_body(&response, "get_topic_stats_info")?;
+        rocketmq_protocol::protocol::admin::topic_stats_table::TopicStatsTable::decode(body).map_err(|error| {
+            ClientError::response_process_source("get_topic_stats_info", error)
+                .with_request_stage(OutboundRequestStage::ResponseReceived)
+        })
+    }
+
+    pub(crate) async fn get_topic_config(
+        &self,
+        addr: &CheetahString,
+        request_header: GetTopicConfigRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<TopicConfigAndQueueMapping> {
+        // Custom: fixed 4.6.1 has no single-topic request. Read its real bulk configuration and select.
+        let mut wrapper = self.get_all_topic_config(addr, timeout_millis).await?;
+        let topic = wrapper
+            .topic_config_table_mut()
+            .and_then(|table| table.remove(&request_header.topic))
+            .ok_or_else(|| {
+                ClientError::broker_operation_failed_at(
+                    "getTopicConfig",
+                    ResponseCode::TopicNotExist as i32,
+                    "topic absent from bulk configuration",
+                    Some(addr),
+                )
+            })?;
+        Ok(TopicConfigAndQueueMapping::new(topic, None))
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn create_static_topic(
+        &self,
+        addr: &CheetahString,
+        default_topic: CheetahString,
+        topic_config: TopicConfig,
+        mapping_detail: TopicQueueMappingDetail,
+        force: bool,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let topic = topic_config
+            .topic_name
+            .clone()
+            .filter(|topic| !topic.is_empty())
+            .ok_or_else(|| crate::ClientError::illegal_argument("Topic name is required"))?;
+        let read_queue_nums = i32::try_from(topic_config.read_queue_nums)
+            .map_err(|_| crate::ClientError::illegal_argument("readQueueNums exceeds Java int range"))?;
+        let write_queue_nums = i32::try_from(topic_config.write_queue_nums)
+            .map_err(|_| crate::ClientError::illegal_argument("writeQueueNums exceeds Java int range"))?;
+        let perm = i32::try_from(topic_config.perm)
+            .map_err(|_| crate::ClientError::illegal_argument("perm exceeds Java int range"))?;
+        let topic_sys_flag = i32::try_from(topic_config.topic_sys_flag)
+            .map_err(|_| crate::ClientError::illegal_argument("topicSysFlag exceeds Java int range"))?;
+
+        let request_header = CreateTopicRequestHeader {
+            topic,
+            default_topic,
+            read_queue_nums,
+            write_queue_nums,
+            perm,
+            topic_filter_type: CheetahString::from_static_str(topic_config.topic_filter_type.as_str()),
+            topic_sys_flag: Some(topic_sys_flag),
+            order: topic_config.order,
+            attributes: None,
+            force: Some(force),
+            topic_request_header: None,
+        };
+        let request = self
+            .create_request_command(RequestCode::UpdateAndCreateStaticTopic, request_header)
+            .set_body(mapping_detail.encode()?);
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "create_static_topic",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "create_static_topic",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            return Ok(());
+        }
+
+        Err(client_broker_err!(
+            response.code(),
+            response.remark().map_or("".to_string(), |s| s.to_string()),
+            addr
+        ))
+    }
+
+    pub(crate) async fn query_topic_consume_by_who(
+        &self,
+        addr: &CheetahString,
+        request_header: rocketmq_protocol::protocol::header::query_topic_consume_by_who_request_header::QueryTopicConsumeByWhoRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<rocketmq_protocol::protocol::body::group_list::GroupList> {
+        // Custom: exact 4.6.1 fields, no newer optional headers.
+        let mut request = self.create_remoting_command(RequestCode::QueryTopicConsumeByWho);
+        request.add_ext_field("topic", request_header.topic);
+        let response = self
+            .diagnostic_broker_response("query_topic_consume_by_who", addr, request, timeout_millis)
+            .await?;
+        resource_body(&response, "query_topic_consume_by_who")
+    }
+
+    pub(crate) async fn query_topics_by_consumer(
+        &self,
+        addr: &CheetahString,
+        request_header: QueryTopicsByConsumerRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<rocketmq_protocol::protocol::body::topic::topic_list::TopicList> {
+        let request = self.create_request_command(RequestCode::QueryTopicsByConsumer, request_header);
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "query_topics_by_consumer",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "query_topics_by_consumer",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            if let Some(body) = response.get_body() {
+                return rocketmq_protocol::protocol::body::topic::topic_list::TopicList::decode(body.as_ref())
+                    .map_err(ClientError::from);
+            }
+        }
+        Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or("".to_string(), |s| s.to_string())
+        ))
+    }
+
+    pub(crate) async fn query_subscription_by_consumer(
+        &self,
+        addr: &CheetahString,
+        request_header: QuerySubscriptionByConsumerRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<SubscriptionData> {
+        let request = self.create_request_command(RequestCode::QuerySubscriptionByConsumer, request_header);
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "query_subscription_by_consumer",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "query_subscription_by_consumer",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            let body = response
+                .get_body()
+                .ok_or_else(|| mq_client_err!("query_subscription_by_consumer response body is empty".to_string()))?;
+            let response_body: QuerySubscriptionResponseBody = decode_admin_json(body.as_ref())?;
+            return response_body.subscription_data.ok_or_else(|| {
+                mq_client_err!("query_subscription_by_consumer response subscriptionData is empty".to_string())
+            });
+        }
+        Err(client_broker_err!(
+            response.code(),
+            response.remark().map_or("".to_string(), |s| s.to_string()),
+            addr
+        ))
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(super) async fn invoke_broker_success_request(
+        &self,
+        addr: &CheetahString,
+        request_code: RequestCode,
+        timeout_millis: u64,
+    ) -> ClientResult<bool> {
+        let request = self.create_remoting_command(request_code);
+        self.diagnostic_broker_response("brokerCleanup", addr, request, timeout_millis)
+            .await?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn clean_expired_consume_queue(
+        &self,
+        addr: &CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<bool> {
+        self.invoke_broker_success_request(addr, RequestCode::CleanExpiredConsumequeue, timeout_millis)
+            .await
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn delete_expired_commit_log(
+        &self,
+        addr: &CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<bool> {
+        self.invoke_broker_success_request(addr, RequestCode::DeleteExpiredCommitlog, timeout_millis)
+            .await
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn clean_unused_topic(&self, addr: &CheetahString, timeout_millis: u64) -> ClientResult<bool> {
+        self.invoke_broker_success_request(addr, RequestCode::CleanUnusedTopic, timeout_millis)
+            .await
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn clean_unused_topic_by_addr(
+        &self,
+        addr: &CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<bool> {
+        self.clean_unused_topic(addr, timeout_millis).await
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn create_topic(
+        &self,
+        addr: &CheetahString,
+        default_topic: CheetahString,
+        topic_config: &TopicConfig,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request_header = create_topic_request_header_like_java(default_topic, topic_config)?;
+        self.update_or_create_topic(addr, request_header, timeout_millis).await
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn create_topic_list(
+        &self,
+        address: &CheetahString,
+        topic_config_list: Vec<TopicConfig>,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request = create_topic_list_request(&self.command_factory, topic_config_list)?;
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, address.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "create_topic_list",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("create_topic_list", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string())
+            )),
+        }
+    }
+
+    pub(crate) async fn update_or_create_topic(
+        &self,
+        addr: &CheetahString,
+        request_header: CreateTopicRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        self.update_or_create_topic_once(
+            addr,
+            request_header,
+            RequestDeadline::from_timeout_millis(timeout_millis),
+        )
+        .await
+        .map_err(|input| admin_request_error("update_or_create_topic", input))
+    }
+
+    pub(crate) async fn update_or_create_topic_once(
+        &self,
+        addr: &CheetahString,
+        request_header: CreateTopicRequestHeader,
+        deadline: RequestDeadline,
+    ) -> Result<(), RetryInput> {
+        let request = self.create_request_command(RequestCode::UpdateAndCreateTopic, request_header);
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request_with_deadline(Some(&broker_addr), request, deadline)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => return Err(RetryInput::Rejected(rejection)),
+            Ok(OutboundRequestOutcome::Contract(contract)) => return Err(RetryInput::Contract(contract)),
+            Err(error) => return Err(RetryInput::Transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            Ok(())
+        } else {
+            let code = response.code();
+            Err(RetryInput::Response {
+                code,
+                retry_after: None,
+                terminal_error: admin_broker_response_error("createTopic", &response, addr),
+            })
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn create_subscription_group_list(
+        &self,
+        address: &CheetahString,
+        configs: Vec<SubscriptionGroupConfig>,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request = create_subscription_group_list_request(&self.command_factory, configs)?;
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, address.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "create_subscription_group_list",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "create_subscription_group_list",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string())
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn delete_topic_in_broker(
+        &self,
+        addr: &CheetahString,
+        request_header: DeleteTopicRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request = self.create_request_command(RequestCode::DeleteTopicInBroker, request_header);
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "delete_topic_in_broker",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "delete_topic_in_broker",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            return Ok(());
+        }
+        Err(admin_broker_response_error(
+            "delete_topic_in_broker",
+            &response,
+            addr.as_str(),
+        ))
+    }
+
+    /// Deletes multiple topics with one broker request.
+    #[cfg(feature = "admin-mutation")]
+    pub async fn delete_topic_in_broker_list(
+        &self,
+        addr: &CheetahString,
+        topic_list: Vec<CheetahString>,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request = delete_topic_list_request(&self.command_factory, topic_list)?;
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "delete_topic_in_broker_list",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "delete_topic_in_broker_list",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string())
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn delete_topic_in_name_server(
+        &self,
+        addr: &CheetahString,
+        cluster_name: Option<CheetahString>,
+        topic: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        self.delete_topic_in_nameserver(
+            addr,
+            DeleteTopicFromNamesrvRequestHeader::new(topic, cluster_name),
+            timeout_millis,
+        )
+        .await
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn delete_topic_in_nameserver(
+        &self,
+        addr: &CheetahString,
+        request_header: DeleteTopicFromNamesrvRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request = self.create_request_command(RequestCode::DeleteTopicInNamesrv, request_header);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "delete_topic_in_nameserver",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "delete_topic_in_nameserver",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            return Ok(());
+        }
+        Err(admin_broker_response_error(
+            "delete_topic_in_nameserver",
+            &response,
+            addr.as_str(),
+        ))
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn invoke_broker_to_reset_offset(
+        &self,
+        addr: &CheetahString,
+        request_header: ResetOffsetRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<HashMap<MessageQueue, i64>> {
+        // Custom: legacy API wrapper; canonical signed/isC path has no queueId/offset5x fields.
+        self.invoke_broker_to_reset_offset_461(
+            addr,
+            request_header.topic,
+            request_header.group,
+            request_header.timestamp,
+            request_header.is_force,
+            false,
+            timeout_millis,
+        )
+        .await
+    }
+
+    pub(crate) async fn query_correction_offset(
+        &self,
+        addr: &CheetahString,
+        topic: CheetahString,
+        group: CheetahString,
+        filter_groups: Option<Vec<CheetahString>>,
+        timeout_millis: u64,
+    ) -> ClientResult<HashMap<i32, i64>> {
+        let request = query_correction_offset_request(&self.command_factory, topic, group, filter_groups);
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "query_correction_offset",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "query_correction_offset",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            if let Some(body) = response.get_body() {
+                return QueryCorrectionOffsetBody::decode(body.as_ref())
+                    .map(|body| body.correction_offsets)
+                    .map_err(ClientError::from);
+            }
+        }
+        Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or("".to_string(), |s| s.to_string())
+        ))
+    }
+
+    pub(crate) async fn view_broker_stats_data(
+        &self,
+        addr: &CheetahString,
+        request_header: rocketmq_protocol::protocol::header::view_broker_stats_data_request_header::ViewBrokerStatsDataRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<rocketmq_protocol::protocol::subscription::broker_stats_data::BrokerStatsData> {
+        // Custom: exact 4.6.1 fields, no newer optional headers.
+        let mut request = self.create_remoting_command(RequestCode::ViewBrokerStatsData);
+        request.add_ext_field("statsName", request_header.stats_name);
+        request.add_ext_field("statsKey", request_header.stats_key);
+        let response = self
+            .diagnostic_broker_response("view_broker_stats_data", addr, request, timeout_millis)
+            .await?;
+        resource_body(&response, "view_broker_stats_data")
+    }
+
+    pub(crate) async fn fetch_consume_stats_in_broker(
+        &self,
+        addr: &CheetahString,
+        request_header: rocketmq_protocol::protocol::header::get_consume_stats_in_broker_header::GetConsumeStatsInBrokerHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<rocketmq_protocol::protocol::admin::consume_stats_list::ConsumeStatsList> {
+        // Custom: exact 4.6.1 fields, no newer optional headers.
+        let mut request = self.create_remoting_command(RequestCode::GetBrokerConsumeStats);
+        request.add_ext_field("isOrder", request_header.is_order.to_string());
+        let response = self
+            .diagnostic_broker_response("fetch_consume_stats_in_broker", addr, request, timeout_millis)
+            .await?;
+        let body = diagnostics::diagnostic_response_body(&response, "fetch_consume_stats_in_broker")?;
+        rocketmq_protocol::protocol::admin::consume_stats_list::ConsumeStatsList::decode(body).map_err(|error| {
+            ClientError::response_process_source("fetch_consume_stats_in_broker", error)
+                .with_request_stage(OutboundRequestStage::ResponseReceived)
+        })
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn clone_group_offset(
+        &self,
+        addr: &CheetahString,
+        src_group: CheetahString,
+        dest_group: CheetahString,
+        topic: CheetahString,
+        is_offline: bool,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let mut request = self.create_remoting_command(RequestCode::CloneGroupOffset);
+        request.add_ext_field("srcGroup", src_group);
+        request.add_ext_field("destGroup", dest_group);
+        request.add_ext_field("topic", topic);
+        request.add_ext_field("offline", is_offline.to_string());
+        self.diagnostic_broker_response("cloneGroupOffset", addr, request, timeout_millis)
+            .await?;
+        Ok(())
+    }
+}
+
+impl MQClientAPIImpl {
+    #[cfg(feature = "admin-read")]
+    pub(crate) async fn get_proxy_drain_state(
+        &self,
+        addr: &CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<ProxyDrainStateResponseBody> {
+        let request = self.create_remoting_command(RequestCode::GetProxyDrainState);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_proxy_drain_state",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_proxy_drain_state",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        decode_proxy_drain_response(response, "get_proxy_drain_state")
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn begin_proxy_drain(
+        &self,
+        addr: &CheetahString,
+        operation_id: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<ProxyDrainStateResponseBody> {
+        self.proxy_drain_operation(addr, RequestCode::BeginProxyDrain, operation_id, timeout_millis)
+            .await
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn cancel_proxy_drain(
+        &self,
+        addr: &CheetahString,
+        operation_id: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<ProxyDrainStateResponseBody> {
+        self.proxy_drain_operation(addr, RequestCode::CancelProxyDrain, operation_id, timeout_millis)
+            .await
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    async fn proxy_drain_operation(
+        &self,
+        addr: &CheetahString,
+        request_code: RequestCode,
+        operation_id: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<ProxyDrainStateResponseBody> {
+        if operation_id.trim().is_empty() {
+            return Err(ClientError::illegal_argument(
+                "Proxy drain operation id must not be empty",
+            ));
+        }
+        let body = ProxyDrainOperationRequestBody {
+            schema_version: PROXY_DRAIN_SCHEMA_VERSION.to_owned(),
+            operation_id: operation_id.to_string(),
+        }
+        .encode()?;
+        let request = self.create_request(request_code, body);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "proxy_drain_operation",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "proxy_drain_operation",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        decode_proxy_drain_response(response, "proxy_drain_operation")
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn update_broker_config(
+        &self,
+        addr: &CheetahString,
+        properties: HashMap<CheetahString, CheetahString>,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let validator_input = properties
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect::<HashMap<String, String>>();
+        crate::base::validators::Validators::check_broker_config(&validator_input)?;
+
+        let body = mix_all::properties_to_string(&properties);
+        if body.is_empty() {
+            return Ok(());
+        }
+
+        let request = self
+            .create_remoting_command(RequestCode::UpdateBrokerConfig)
+            .set_body(body.to_string());
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "update_broker_config",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "update_broker_config",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(admin_broker_response_error(
+                "update_broker_config",
+                &response,
+                addr.as_str(),
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub async fn add_broker(
+        &self,
+        addr: &CheetahString,
+        broker_config_path: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request_header = AddBrokerRequestHeader {
+            config_path: Some(broker_config_path),
+        };
+        let request = self.create_request_command(RequestCode::AddBroker, request_header);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error("add_broker", RetryInput::Rejected(rejection)));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("add_broker", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string())
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub async fn remove_broker(
+        &self,
+        addr: &CheetahString,
+        cluster_name: CheetahString,
+        broker_name: CheetahString,
+        broker_id: u64,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request_header = RemoveBrokerRequestHeader {
+            broker_name,
+            broker_cluster_name: cluster_name,
+            broker_id,
+        };
+        let request = self.create_request_command(RequestCode::RemoveBroker, request_header);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error("remove_broker", RetryInput::Rejected(rejection)));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("remove_broker", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string())
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn notify_min_broker_id_changed(
+        &self,
+        broker_addr: &CheetahString,
+        request_header: NotifyMinBrokerIdChangeRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let request = self.create_request_command(RequestCode::NotifyMinBrokerIdChange, request_header);
+        self.remoting_client
+            .invoke_request_oneway(broker_addr, request, timeout_millis)
+            .await
+            .map_err(ClientError::from)
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub async fn export_rocksdb_config_to_json(
+        &self,
+        broker_addr: CheetahString,
+        config_types: Vec<CheetahString>,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let mut config_type = config_types
+            .into_iter()
+            .map(|config_type| config_type.as_str().trim().to_string())
+            .filter(|config_type| !config_type.is_empty())
+            .collect::<Vec<_>>()
+            .join(";");
+        if !config_type.is_empty() {
+            config_type.push(';');
+        }
+
+        let request_header = ExportRocksdbConfigToJsonRequestHeader {
+            config_type: CheetahString::from(config_type),
+        };
+        let request = self.create_request_command(RequestCode::ExportRocksdbConfigToJson, request_header);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "export_rocksdb_config_to_json",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "export_rocksdb_config_to_json",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string())
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub async fn export_rocks_db_config_to_json(
+        &self,
+        broker_addr: CheetahString,
+        config_types: Vec<CheetahString>,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        self.export_rocksdb_config_to_json(broker_addr, config_types, timeout_millis)
+            .await
+    }
+
+    pub(crate) async fn get_all_consumer_offset_json(
+        &self,
+        broker_addr: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<CheetahString> {
+        let request = get_all_consumer_offset_request(&self.command_factory);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_all_consumer_offset_json",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_all_consumer_offset_json",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        consumer_offset_json_from_response(&response)
+    }
+
+    pub(crate) async fn get_broker_config(
+        &self,
+        addr: &CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<HashMap<CheetahString, CheetahString>> {
+        self.get_broker_config_snapshot(addr, timeout_millis)
+            .await
+            .map(|snapshot| snapshot.properties)
+    }
+
+    pub async fn get_name_server_config(
+        &self,
+        name_servers: Option<Vec<CheetahString>>,
+        timeout_millis: Duration,
+    ) -> ClientResult<Option<HashMap<CheetahString, HashMap<CheetahString, CheetahString>>>> {
+        let addresses = name_servers
+            .filter(|addresses| !addresses.is_empty())
+            .unwrap_or_else(|| self.get_name_server_address_list());
+        if addresses.is_empty() {
+            return Ok(None);
+        }
+        let timeout = duration_millis_to_u64("getNameServerConfig", timeout_millis)?;
+        let request = self.create_remoting_command(RequestCode::GetNamesrvConfig);
+        let mut report = crate::admin::AdminNodeReport {
+            nodes: Vec::new(),
+            not_attempted: Vec::new(),
+        };
+        let mut addresses = addresses.into_iter();
+        while let Some(address) = addresses.next() {
+            let result = match self
+                .resource_response("getNameServerConfig", Some(&address), request.clone(), timeout)
+                .await
+            {
+                Ok(response) => resource_properties(&response, "getNameServerConfig"),
+                Err(error) => Err(error),
+            };
+            let stop = result.is_err();
+            report.nodes.push(crate::admin::AdminNodeResult { address, result });
+            if stop {
+                report.not_attempted.extend(addresses);
+                break;
+            }
+        }
+        report.into_result().map(|nodes| Some(nodes.into_iter().collect()))
+    }
+
+    pub async fn probe_name_server(&self, name_server: &CheetahString, timeout_millis: Duration) -> ClientResult<()> {
+        let request = self.create_request_command(
+            RequestCode::GetNamesrvConfig,
+            GetNamesrvConfigRequestHeader::for_probe(),
+        );
+        let timeout_millis = duration_millis_to_u64("probeNameServer", timeout_millis)?;
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(name_server), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "probe_name_server",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("probe_name_server", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or("".to_string(), |s| s.to_string())
+            )),
+        }
+    }
+
+    pub async fn get_controller_metadata(
+        &self,
+        controller_address: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<GetMetaDataResponseHeader> {
+        let request = self.create_remoting_command(RequestCode::ControllerGetMetadataInfo);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&controller_address), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_controller_metadata",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_controller_metadata",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => response
+                .decode_command_custom_header_fast::<GetMetaDataResponseHeader>()
+                .map_err(|source| ClientError::response_process_source("decode GetMetaDataResponseHeader", source)),
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or("".to_string(), |s| s.to_string())
+            )),
+        }
+    }
+
+    pub async fn get_controller_meta_data(
+        &self,
+        controller_address: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<GetMetaDataResponseHeader> {
+        self.get_controller_metadata(controller_address, timeout_millis).await
+    }
+
+    pub async fn get_in_sync_state_data(
+        &self,
+        controller_address: CheetahString,
+        brokers: Vec<CheetahString>,
+        timeout_millis: u64,
+    ) -> ClientResult<BrokerReplicasInfo> {
+        let controller_meta_data = self.get_controller_metadata(controller_address, timeout_millis).await?;
+        let leader_address = controller_leader_address(controller_meta_data)?;
+
+        self.get_in_sync_state_data_at(leader_address, brokers, timeout_millis)
+            .await
+    }
+
+    /// Queries sync-state data at exactly the supplied Controller endpoint.
+    ///
+    /// Unlike [`Self::get_in_sync_state_data`], this method performs no metadata
+    /// lookup and never follows a Controller-advertised leader address.
+    pub async fn get_in_sync_state_data_at(
+        &self,
+        controller_address: CheetahString,
+        brokers: Vec<CheetahString>,
+        timeout_millis: u64,
+    ) -> ClientResult<BrokerReplicasInfo> {
+        let request = self.create_remoting_command(RequestCode::ControllerGetSyncStateData);
+        let body =
+            serde_json::to_vec(&brokers).map_err(|source| ClientError::internal("serialize broker names", source))?;
+        let request = request.set_body(body);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&controller_address), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_in_sync_state_data_at",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_in_sync_state_data_at",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => {
+                if let Some(body) = response.body() {
+                    serde_json::from_slice(body)
+                        .map_err(|source| ClientError::response_process_source("decode BrokerReplicasInfo", source))
+                } else {
+                    Err(mq_client_err!(
+                        "get_in_sync_state_data response body is empty".to_string()
+                    ))
+                }
+            }
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or("".to_string(), |s| s.to_string())
+            )),
+        }
+    }
+
+    pub async fn get_broker_epoch_cache(
+        &self,
+        broker_addr: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<EpochEntryCache> {
+        let request = self.create_remoting_command(RequestCode::GetBrokerEpochCache);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_broker_epoch_cache",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_broker_epoch_cache",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => {
+                if let Some(body) = response.body() {
+                    match EpochEntryCache::decode(body) {
+                        Ok(value) => Ok(value),
+                        Err(e) => Err(mq_client_err!(format!("decode EpochEntryCache failed: {}", e))),
+                    }
+                } else {
+                    Err(mq_client_err!(
+                        "get_broker_epoch_cache response body is empty".to_string()
+                    ))
+                }
+            }
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or("".to_string(), |s| s.to_string())
+            )),
+        }
+    }
+
+    pub async fn get_broker_ha_status(
+        &self,
+        broker_addr: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<HARuntimeInfo> {
+        let request = self.create_remoting_command(RequestCode::GetBrokerHaStatus);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_broker_ha_status",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_broker_ha_status",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => {
+                if let Some(body) = response.body() {
+                    serde_json::from_slice(body)
+                        .map_err(|source| ClientError::response_process_source("decode HARuntimeInfo", source))
+                } else {
+                    Err(mq_client_err!("get_broker_ha_status response body is empty".to_string()))
+                }
+            }
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or("".to_string(), |s| s.to_string())
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub async fn update_and_get_group_forbidden(
+        &self,
+        broker_addr: &CheetahString,
+        request_header: UpdateGroupForbiddenRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<GroupForbidden> {
+        let request = self.create_request_command(RequestCode::UpdateAndGetGroupForbidden, request_header);
+        let broker_addr_vip = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, broker_addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr_vip), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "update_and_get_group_forbidden",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "update_and_get_group_forbidden",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => {
+                let Some(body) = response.body() else {
+                    return Err(mq_client_err!(
+                        "update_and_get_group_forbidden response body is empty".to_string()
+                    ));
+                };
+                SerdeJsonUtils::from_json_slice(body.as_ref())
+                    .map_err(|source| ClientError::response_process_source("decode GroupForbidden", source))
+            }
+            _ => Err(client_broker_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string()),
+                broker_addr
+            )),
+        }
+    }
+
+    pub async fn get_controller_config(
+        &self,
+        controller_address: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<HashMap<CheetahString, CheetahString>> {
+        let request = self.create_remoting_command(RequestCode::GetControllerConfig);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&controller_address), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_controller_config",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_controller_config",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => {
+                let body = response
+                    .body()
+                    .ok_or_else(|| mq_client_err!("Controller config response body is empty".to_string()))?;
+                controller_config_from_response_body(body)
+            }
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or("".to_string(), |s| s.to_string())
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub async fn update_controller_config(
+        &self,
+        properties: HashMap<CheetahString, CheetahString>,
+        controllers: Vec<CheetahString>,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let body = mix_all::properties_to_string(&properties);
+        if body.is_empty() || controllers.is_empty() {
+            return Ok(());
+        }
+
+        let request = self
+            .create_remoting_command(RequestCode::UpdateControllerConfig)
+            .set_body(body.to_string());
+        let mut err_response = None;
+        for controller_addr in controllers {
+            let outcome = self
+                .remoting_client
+                .invoke_request(Some(&controller_addr), request.clone(), timeout_millis)
+                .await;
+            let response = match outcome {
+                Ok(OutboundRequestOutcome::Response(response)) => response,
+                Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                    return Err(admin_request_error(
+                        "update_controller_config",
+                        RetryInput::Rejected(rejection),
+                    ));
+                }
+                Ok(OutboundRequestOutcome::Contract(contract)) => {
+                    return Err(admin_request_error(
+                        "update_controller_config",
+                        RetryInput::Contract(contract),
+                    ));
+                }
+                Err(error) => return Err(ClientError::from_transport(error)),
+            };
+            match ResponseCode::from(response.code()) {
+                ResponseCode::Success => {}
+                _ => err_response = Some(response),
+            }
+        }
+
+        if let Some(err_response) = err_response {
+            return Err(mq_client_err!(
+                err_response.code(),
+                err_response
+                    .remark()
+                    .map_or_else(String::new, |remark| remark.to_string())
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub async fn elect_master(
+        &self,
+        controller_addr: CheetahString,
+        cluster_name: CheetahString,
+        broker_name: CheetahString,
+        broker_id: Option<u64>,
+        timeout_millis: u64,
+    ) -> ClientResult<(ElectMasterResponseHeader, BrokerMemberGroup)> {
+        let controller_meta_data = self.get_controller_metadata(controller_addr, timeout_millis).await?;
+        let leader_address = controller_leader_address(controller_meta_data)?;
+        let designate_elect = broker_id.is_some();
+        let broker_id = match broker_id {
+            Some(broker_id) => i64::try_from(broker_id).map_err(ClientError::illegal_argument_source)?,
+            None => -1,
+        };
+        let request_header = ElectMasterRequestHeader::new(
+            cluster_name,
+            broker_name,
+            broker_id,
+            designate_elect,
+            rocketmq_runtime::common::time_utils::current_millis(),
+        );
+        let request = self.create_request_command(RequestCode::ControllerElectMaster, request_header);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&leader_address), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error("elect_master", RetryInput::Rejected(rejection)));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("elect_master", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => {
+                let response_header = response
+                    .decode_command_custom_header_fast::<ElectMasterResponseHeader>()
+                    .map_err(|source| {
+                        ClientError::response_process_source("decode ElectMasterResponseHeader", source)
+                    })?;
+                let broker_member_group = response
+                    .body()
+                    .ok_or_else(|| mq_client_err!("elect_master response body is empty".to_string()))
+                    .and_then(|body| {
+                        serde_json::from_slice::<BrokerMemberGroup>(body)
+                            .map_err(|source| ClientError::response_process_source("decode BrokerMemberGroup", source))
+                    })?;
+                Ok((response_header, broker_member_group))
+            }
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string())
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub async fn clean_controller_broker_data(
+        &self,
+        controller_addr: CheetahString,
+        cluster_name: CheetahString,
+        broker_name: CheetahString,
+        broker_controller_ids_to_clean: Option<CheetahString>,
+        clean_living_broker: bool,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let controller_meta_data = self.get_controller_metadata(controller_addr, timeout_millis).await?;
+        let leader_address = controller_leader_address(controller_meta_data)?;
+        let request_header = CleanBrokerDataRequestHeader {
+            cluster_name: if cluster_name.is_empty() {
+                None
+            } else {
+                Some(cluster_name)
+            },
+            broker_name,
+            broker_controller_ids_to_clean,
+            clean_living_broker,
+            ..Default::default()
+        };
+        let request = self.create_request_command(RequestCode::CleanBrokerData, request_header);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&leader_address), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "clean_controller_broker_data",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "clean_controller_broker_data",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string())
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub async fn update_cold_data_flow_ctr_group_config(
+        &self,
+        broker_addr: CheetahString,
+        properties: HashMap<CheetahString, CheetahString>,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let body = mix_all::properties_to_string(&properties);
+        if body.is_empty() {
+            return Ok(());
+        }
+
+        let request = self.create_remoting_command(RequestCode::UpdateColdDataFlowCtrConfig);
+        let request = request.set_body(body.to_string());
+        let broker_addr =
+            mix_all::broker_vip_channel(self.client_config.is_vip_channel_enabled(), broker_addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(broker_addr).as_ref(), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "update_cold_data_flow_ctr_group_config",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "update_cold_data_flow_ctr_group_config",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map(|s| s.to_string()).unwrap_or_default()
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub async fn remove_cold_data_flow_ctr_group_config(
+        &self,
+        broker_addr: CheetahString,
+        consumer_group: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        if consumer_group.is_empty() {
+            return Ok(());
+        }
+
+        let request = self
+            .create_request_command(RequestCode::RemoveColdDataFlowCtrConfig, EmptyHeader {})
+            .set_body(consumer_group.to_string());
+        let broker_addr_vip =
+            mix_all::broker_vip_channel(self.client_config.is_vip_channel_enabled(), broker_addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr_vip), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "remove_cold_data_flow_ctr_group_config",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "remove_cold_data_flow_ctr_group_config",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(()),
+            _ => Err(client_broker_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string()),
+                &broker_addr
+            )),
+        }
+    }
+
+    pub async fn get_cold_data_flow_ctr_info(
+        &self,
+        broker_addr: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<CheetahString> {
+        let request = self.create_request_command(RequestCode::GetColdDataFlowCtrInfo, EmptyHeader {});
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_cold_data_flow_ctr_info",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_cold_data_flow_ctr_info",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(response
+                .body()
+                .filter(|body| !body.is_empty())
+                .map(|body| CheetahString::from_string(String::from_utf8_lossy(body.as_ref()).into_owned()))
+                .unwrap_or_default()),
+            _ => Err(client_broker_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string()),
+                &broker_addr
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub async fn set_commit_log_read_ahead_mode(
+        &self,
+        broker_addr: CheetahString,
+        mode: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<CheetahString> {
+        let mut request = self.create_request_command(RequestCode::SetCommitlogReadMode, EmptyHeader {});
+        request.ensure_ext_fields_initialized();
+        request.add_ext_field(file_readahead_mode::READ_AHEAD_MODE, mode);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "set_commit_log_read_ahead_mode",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "set_commit_log_read_ahead_mode",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => Ok(response.remark().cloned().unwrap_or_default()),
+            _ => Err(client_broker_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string()),
+                &broker_addr
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub async fn export_pop_record(&self, broker_addr: CheetahString, timeout_millis: u64) -> ClientResult<()> {
+        let request = self.create_request_command(RequestCode::PopRollback, EmptyHeader {});
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "export_pop_record",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("export_pop_record", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            return Ok(());
+        }
+
+        Err(client_broker_err!(
+            response.code(),
+            response.remark().map_or_else(String::new, |remark| remark.to_string()),
+            &broker_addr
+        ))
+    }
+
+    pub(crate) async fn get_all_subscription_group(
+        &self,
+        addr: &CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<rocketmq_protocol::protocol::body::subscription_group_wrapper::SubscriptionGroupWrapper> {
+        self.get_all_subscription_group_config(addr, timeout_millis).await
+    }
+
+    pub(crate) async fn get_subscription_group_config(
+        &self,
+        addr: &CheetahString,
+        group: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<rocketmq_protocol::protocol::subscription::subscription_group_config::SubscriptionGroupConfig>
+    {
+        let mut wrapper = self.get_all_subscription_group_config(addr, timeout_millis).await?;
+        wrapper.subscription_group_table.remove(&group).ok_or_else(|| {
+            ClientError::broker_operation_failed_at(
+                "getSubscriptionGroupConfig",
+                ResponseCode::SubscriptionGroupNotExist as i32,
+                "group absent from bulk configuration",
+                Some(addr),
+            )
+        })
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn create_subscription_group(
+        &self,
+        addr: &CheetahString,
+        config: &rocketmq_protocol::protocol::subscription::subscription_group_config::SubscriptionGroupConfig,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        if config.has_newer_settings() {
+            return Err(ClientError::illegal_argument(
+                "subscription settings require a newer Broker than fixed Java 4.6.1",
+            ));
+        }
+        if config.broker_id() > i64::MAX as u64 || config.which_broker_when_consume_slowly() > i64::MAX as u64 {
+            return Err(ClientError::illegal_argument(
+                "subscription Broker IDs exceed Java signed long range",
+            ));
+        }
+        let body = serde_json::to_vec(&config.java_4_6_1_value())
+            .map_err(|error| ClientError::response_process_source("encode SubscriptionGroupConfig", error))?;
+        let request = self
+            .create_remoting_command(RequestCode::UpdateAndCreateSubscriptionGroup)
+            .set_body(body);
+        let address = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        self.resource_response("createSubscriptionGroup", Some(&address), request, timeout_millis)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn get_consumer_running_info(
+        &self,
+        addr: &CheetahString,
+        consumer_group: CheetahString,
+        client_id: CheetahString,
+        jstack: bool,
+        timeout_millis: u64,
+    ) -> ClientResult<rocketmq_protocol::protocol::body::consumer_running_info::ConsumerRunningInfo> {
+        let mut request = self.create_remoting_command(RequestCode::GetConsumerRunningInfo);
+        request.add_ext_field("consumerGroup", consumer_group);
+        request.add_ext_field("clientId", client_id);
+        request.add_ext_field("jstackEnable", jstack.to_string());
+        let response = self
+            .diagnostic_broker_response("getConsumerRunningInfo", addr, request, timeout_millis)
+            .await?;
+        let body = diagnostics::diagnostic_response_body(&response, "getConsumerRunningInfo")?;
+        rocketmq_protocol::protocol::body::consumer_running_info::ConsumerRunningInfo::decode(body).map_err(|error| {
+            ClientError::response_process_source("getConsumerRunningInfo", error)
+                .with_request_stage(OutboundRequestStage::ResponseReceived)
+        })
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn consume_message_directly(
+        &self,
+        client_addr: &CheetahString,
+        request_header: ConsumeMessageDirectlyResultRequestHeader,
+        message: &MessageExt,
+        timeout_millis: u64,
+    ) -> ClientResult<rocketmq_protocol::protocol::body::consume_message_directly_result::ConsumeMessageDirectlyResult>
+    {
+        // Custom: the Broker loads the physical message; Java sends no message body or 5x fields.
+        let _ = message;
+        let mut request = self.create_remoting_command(RequestCode::ConsumeMessageDirectly);
+        request.add_ext_field("consumerGroup", request_header.consumer_group);
+        if let Some(value) = request_header.client_id {
+            request.add_ext_field("clientId", value);
+        }
+        if let Some(value) = request_header.msg_id {
+            request.add_ext_field("msgId", value);
+        }
+        let response = self
+            .diagnostic_broker_response("consumeMessageDirectly", client_addr, request, timeout_millis)
+            .await?;
+        resource_body(&response, "consumeMessageDirectly")
+    }
+
+    pub async fn view_message(
+        &self,
+        addr: &CheetahString,
+        request_header: ViewMessageRequestHeader,
+        timeout_millis: u64,
+    ) -> ClientResult<MessageExt> {
+        let request = self.create_request_command(RequestCode::ViewMessageById, request_header);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error("view_message", RetryInput::Rejected(rejection)));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error("view_message", RetryInput::Contract(contract)));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => {
+                if let Some(body) = response.get_body() {
+                    decode_view_message_body(body.clone())
+                } else {
+                    Err(mq_client_err!("view_message response body is empty".to_string()))
+                }
+            }
+            _ => Err(admin_broker_response_error("viewMessage", &response, addr)),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn resume_check_half_message(
+        &self,
+        addr: &CheetahString,
+        topic: CheetahString,
+        msg_id: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<bool> {
+        let _ = topic; // Custom: no topic field exists in the fixed Java request.
+        let mut request = self.create_remoting_command(RequestCode::ResumeCheckHalfMessage);
+        request.add_ext_field("msgId", msg_id);
+        self.diagnostic_broker_response("resumeCheckHalfMessage", addr, request, timeout_millis)
+            .await?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn switch_timer_engine(
+        &self,
+        broker_addr: &CheetahString,
+        engine_type: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let mut request = self.create_request_command(RequestCode::SwitchTimerEngine, EmptyHeader {});
+        request.ensure_ext_fields_initialized();
+        request.add_ext_field(MessageConst::TIMER_ENGINE_TYPE, engine_type);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "switch_timer_engine",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "switch_timer_engine",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            return Ok(());
+        }
+
+        Err(client_broker_err!(
+            response.code(),
+            response.remark().map_or("".to_string(), |s| s.to_string()),
+            broker_addr
+        ))
+    }
+
+    pub(super) fn build_queue_offset_sorted_map(
+        topic: &str,
+        msg_found_list: &[MessageExt],
+    ) -> ClientResult<HashMap<String, Vec<i64>>> {
+        let mut sort_map: HashMap<String, Vec<i64>> = HashMap::with_capacity(16);
+        for message_ext in msg_found_list {
+            let key: String;
+            let dispatch = message_ext
+                .property(&CheetahString::from_static_str(
+                    MessageConst::PROPERTY_INNER_MULTI_DISPATCH,
+                ))
+                .unwrap_or_default();
+            if mix_all::is_lmq(Some(topic)) && message_ext.reconsume_times() == 0 && !dispatch.is_empty() {
+                // process LMQ
+                let queues: Vec<&str> = dispatch.split_str(mix_all::MULTI_DISPATCH_QUEUE_SPLITTER).collect();
+                let data = message_ext
+                    .property(&CheetahString::from_static_str(
+                        MessageConst::PROPERTY_INNER_MULTI_QUEUE_OFFSET,
+                    ))
+                    .unwrap_or_default();
+                let queue_offsets: Vec<&str> = data.split_str(mix_all::MULTI_DISPATCH_QUEUE_SPLITTER).collect();
+                // LMQ topic has only 1 queue, which queue id is 0
+                key = ExtraInfoUtil::get_start_offset_info_map_key(topic, mix_all::LMQ_QUEUE_ID as i64);
+                let Some(position) = queues.iter().position(|&q| q == topic) else {
+                    warn!(
+                        "LMQ dispatch queue does not contain topic={}, dispatch={}",
+                        topic, dispatch
+                    );
+                    continue;
+                };
+                let Some(offset_value) = queue_offsets.get(position) else {
+                    warn!(
+                        "LMQ queue offset is missing for topic={}, dispatch={}, offsets={}",
+                        topic, dispatch, data
+                    );
+                    continue;
+                };
+                let Ok(offset) = offset_value.parse::<i64>() else {
+                    warn!(
+                        "LMQ queue offset is invalid for topic={}, offset={}",
+                        topic, offset_value
+                    );
+                    continue;
+                };
+                sort_map
+                    .entry(key)
+                    .or_insert_with(|| Vec::with_capacity(4))
+                    .push(offset);
+                continue;
+            }
+            // Value of POP_CK is used to determine whether it is a pop retry,
+            // cause topic could be rewritten by broker.
+            key = ExtraInfoUtil::get_start_offset_info_map_key_with_pop_ck(
+                message_ext.topic(),
+                message_ext
+                    .property(&CheetahString::from_static_str(MessageConst::PROPERTY_POP_CK))
+                    .clone()
+                    .as_ref()
+                    .map(|item| item.as_str()),
+                message_ext.queue_id() as i64,
+            )?;
+            sort_map
+                .entry(key)
+                .or_insert_with(|| Vec::with_capacity(4))
+                .push(message_ext.queue_offset());
+        }
+        Ok(sort_map)
+    }
+}
+
+#[cfg(any(feature = "admin-read", feature = "admin-mutation"))]
+fn decode_proxy_drain_response(
+    response: RemotingCommand,
+    operation: &'static str,
+) -> ClientResult<ProxyDrainStateResponseBody> {
+    if ResponseCode::from(response.code()) != ResponseCode::Success {
+        return Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or_else(String::new, |remark| remark.to_string())
+        ));
+    }
+    let body = response
+        .body()
+        .ok_or_else(|| ClientError::response_process_failed(operation, "Proxy drain response body is missing"))?;
+    let state = ProxyDrainStateResponseBody::decode(body.as_ref())
+        .map_err(|error| ClientError::response_process_source(operation, error))?;
+    if state.schema_version != PROXY_DRAIN_SCHEMA_VERSION {
+        return Err(ClientError::response_process_failed(
+            operation,
+            format!(
+                "unsupported Proxy drain schema '{}'; expected '{PROXY_DRAIN_SCHEMA_VERSION}'",
+                state.schema_version
+            ),
+        ));
+    }
+    Ok(state)
+}
+
+pub(super) fn pop_msg_queue_offset_for_index(
+    queue_id_key: &str,
+    queue_offset: i64,
+    sort_map: &HashMap<String, Vec<i64>>,
+    msg_offset_info: &HashMap<String, Vec<i64>>,
+) -> Option<i64> {
+    let index = sort_map
+        .get(queue_id_key)?
+        .iter()
+        .position(|&offset| offset == queue_offset)?;
+    msg_offset_info
+        .get(queue_id_key)
+        .and_then(|offsets| offsets.get(index))
+        .copied()
+}
+
+pub(super) fn empty_broker_member_group(
+    cluster_name: &CheetahString,
+    broker_name: &CheetahString,
+) -> BrokerMemberGroup {
+    BrokerMemberGroup::new(cluster_name.clone(), broker_name.clone())
+}
+
+pub(super) fn broker_member_group_from_route_data(
+    cluster_name: &CheetahString,
+    broker_name: &CheetahString,
+    topic_route_data: &TopicRouteData,
+) -> BrokerMemberGroup {
+    let mut broker_member_group = empty_broker_member_group(cluster_name, broker_name);
+    if let Some(broker_data) = topic_route_data
+        .broker_datas
+        .iter()
+        .find(|broker_data| broker_data.cluster() == cluster_name.as_str() && broker_data.broker_name() == broker_name)
+    {
+        broker_member_group
+            .broker_addrs
+            .extend(broker_data.broker_addrs().clone());
+    }
+    broker_member_group
+}
+
+pub(super) fn cluster_names_for_topic_route(
+    cluster_info: &ClusterInfo,
+    topic_route_data: &TopicRouteData,
+) -> HashSet<CheetahString> {
+    let mut cluster_names = HashSet::new();
+    let Some(cluster_addr_table) = cluster_info.cluster_addr_table.as_ref() else {
+        return cluster_names;
+    };
+
+    for broker_data in &topic_route_data.broker_datas {
+        cluster_names.extend(
+            cluster_addr_table
+                .iter()
+                .filter(|(_, broker_names)| broker_names.contains(broker_data.broker_name()))
+                .map(|(cluster_name, _)| cluster_name.clone()),
+        );
+    }
+
+    cluster_names
+}
+
+pub(super) fn encode_topic_attributes_like_java(
+    attributes: &HashMap<CheetahString, CheetahString>,
+) -> Option<CheetahString> {
+    if attributes.is_empty() {
+        return None;
+    }
+
+    let encoded = AttributeParser::parse_to_string(
+        &attributes
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect::<HashMap<String, String>>(),
+    );
+    if encoded.is_empty() {
+        None
+    } else {
+        Some(CheetahString::from_string(encoded))
+    }
+}
+
+pub(super) fn topic_config_u32_to_java_i32(_field_name: &'static str, value: u32) -> ClientResult<i32> {
+    i32::try_from(value).map_err(ClientError::illegal_argument_source)
+}
+
+pub(super) fn create_topic_request_header_like_java(
+    default_topic: CheetahString,
+    topic_config: &TopicConfig,
+) -> ClientResult<CreateTopicRequestHeader> {
+    Validators::check_topic_config(topic_config)?;
+    let topic = topic_config
+        .topic_name
+        .clone()
+        .ok_or_else(|| mq_client_err!("topicConfig.topicName is required".to_string()))?;
+
+    Ok(CreateTopicRequestHeader {
+        topic,
+        default_topic,
+        read_queue_nums: topic_config_u32_to_java_i32("readQueueNums", topic_config.read_queue_nums)?,
+        write_queue_nums: topic_config_u32_to_java_i32("writeQueueNums", topic_config.write_queue_nums)?,
+        perm: topic_config_u32_to_java_i32("perm", topic_config.perm)?,
+        topic_filter_type: CheetahString::from_static_str(topic_config.topic_filter_type.as_str()),
+        topic_sys_flag: Some(topic_config_u32_to_java_i32(
+            "topicSysFlag",
+            topic_config.topic_sys_flag,
+        )?),
+        order: topic_config.order,
+        attributes: encode_topic_attributes_like_java(&topic_config.attributes),
+        force: None,
+        topic_request_header: None,
+    })
+}
+
+pub(super) fn query_correction_offset_request(
+    command_factory: &RemotingCommandFactory,
+    topic: CheetahString,
+    group: CheetahString,
+    filter_groups: Option<Vec<CheetahString>>,
+) -> RemotingCommand {
+    let filter_groups = filter_groups.map(|groups| {
+        CheetahString::from_string(
+            groups
+                .into_iter()
+                .map(|group| group.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    });
+    let request_header = QueryCorrectionOffsetHeader {
+        filter_groups,
+        compare_group: group,
+        topic,
+        topic_request_header: None,
+    };
+    command_factory.create_request_command(RequestCode::QueryCorrectionOffset, request_header)
+}
+
+pub(super) fn split_lite_dispatch_value(value: &str) -> Vec<&str> {
+    value
+        .split(mix_all::MULTI_DISPATCH_QUEUE_SPLITTER)
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+pub(super) fn parse_lite_order_count_info_like_java(
+    order_count_info: Option<&CheetahString>,
+    msg_count: usize,
+) -> Option<Vec<i32>> {
+    let order_count_info = order_count_info?.as_str();
+    if order_count_info.trim().is_empty() {
+        return None;
+    }
+    let infos = order_count_info.split(';').collect::<Vec<_>>();
+    if infos.len() != msg_count {
+        return None;
+    }
+    Some(infos.into_iter().map(parse_lite_order_count_like_java).collect())
+}
+
+pub(super) fn parse_lite_order_count_like_java(info: &str) -> i32 {
+    if info.trim().is_empty() {
+        return 0;
+    }
+    if !info.contains(MessageConst::KEY_SEPARATOR) {
+        return info.parse::<i32>().unwrap_or_default();
+    }
+    let split = info.split(MessageConst::KEY_SEPARATOR).collect::<Vec<_>>();
+    if split.len() != 3 {
+        return 0;
+    }
+    split[2].parse::<i32>().unwrap_or_default()
+}
+
+pub(super) fn filter_retry_topics_like_java(topic_list: &mut TopicList, contain_retry: bool) {
+    if contain_retry {
+        return;
+    }
+    topic_list
+        .topic_list
+        .retain(|topic| !topic.as_str().starts_with(mix_all::RETRY_GROUP_TOPIC_PREFIX));
+}
+
+pub(super) fn controller_leader_address(header: GetMetaDataResponseHeader) -> ClientResult<CheetahString> {
+    header
+        .controller_leader_address
+        .ok_or_else(|| mq_client_err!("Controller leader address is not available".to_string()))
+}
+
+pub(super) fn controller_config_from_response_body(body: &[u8]) -> ClientResult<HashMap<CheetahString, CheetahString>> {
+    let body_str = String::from_utf8_lossy(body);
+    mix_all::string_to_properties(body_str.as_ref())
+        .ok_or_else(|| mq_client_err!("Failed to parse controller config response body".to_string()))
+}
+
+pub(super) fn should_fetch_system_topic_list_from_broker(topic_list: &TopicList) -> bool {
+    !topic_list.topic_list.is_empty()
+        && topic_list
+            .broker_addr
+            .as_ref()
+            .is_some_and(|broker_addr| !broker_addr.as_str().trim().is_empty())
+}
+
+pub(super) fn append_system_topic_list_from_broker_like_java(topic_list: &mut TopicList, broker_topic_list: TopicList) {
+    if !broker_topic_list.topic_list.is_empty() {
+        topic_list.topic_list.extend(broker_topic_list.topic_list);
+    }
+}
+
+pub(super) async fn merge_system_topic_list_from_broker(
+    api: &MQClientAPIImpl,
+    topic_list: &mut TopicList,
+    timeout_millis: u64,
+) -> ClientResult<()> {
+    if !should_fetch_system_topic_list_from_broker(topic_list) {
+        return Ok(());
+    }
+    let Some(broker_addr) = topic_list.broker_addr.clone() else {
+        return Ok(());
+    };
+    let broker_topic_list = api
+        .get_system_topic_list_from_broker(&broker_addr, timeout_millis)
+        .await?;
+    append_system_topic_list_from_broker_like_java(topic_list, broker_topic_list);
+    Ok(())
+}
+
+pub(super) fn admin_message_matches_query(
+    topic: &CheetahString,
+    key: &CheetahString,
+    msg: &MessageExt,
+    unique_key_flag: bool,
+) -> bool {
+    if msg.topic().as_str() != topic.as_str() {
+        return false;
+    }
+
+    if unique_key_flag {
+        if let Some(uniq_id) = MessageClientIDSetter::get_uniq_id(msg) {
+            if uniq_id.as_str() == key.as_str() {
+                return true;
+            }
+        }
+        return msg.msg_id.as_str() == key.as_str();
+    }
+
+    let Some(keys) = MessageTrait::get_keys(msg) else {
+        return false;
+    };
+
+    keys.split_str(MessageConst::KEY_SEPARATOR)
+        .any(|candidate| candidate == key.as_str())
+}
+
+impl MQClientAPIImpl {
+    pub(super) async fn invoke_admin_request(
+        &self,
+        address: &str,
+        request: RemotingCommand,
+        timeout_millis: u64,
+    ) -> Result<OutboundRequestOutcome, rocketmq_transport::api::TransportError> {
+        let address = CheetahString::from_slice(address);
+        self.remoting_client
+            .invoke_request(Some(&address), request, timeout_millis)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod retry_executor_tests {
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use rocketmq_protocol::RemotingCommand;
+    use rocketmq_runtime::RuntimeContext;
+    use rocketmq_runtime::ShutdownDeadline;
+    use rocketmq_transport::api::AdmissionController;
+    use rocketmq_transport::api::AdmissionLimits;
+    use rocketmq_transport::test_support::SessionProcessor;
+    use rocketmq_transport::test_support::SessionTransportServer;
+    use rocketmq_transport::test_support::SessionTransportServerConfig;
+
+    use super::*;
+    use crate::base::client_config::ClientConfig;
+    use crate::factory::mq_client_instance::MQClientInstance;
+
+    #[derive(Default)]
+    struct KvProcessor {
+        responses: Mutex<VecDeque<RemotingCommand>>,
+        requests: AtomicUsize,
+    }
+
+    impl KvProcessor {
+        fn push(&self, response: RemotingCommand) {
+            self.responses.lock().expect("KV response queue").push_back(response);
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    impl SessionProcessor for KvProcessor {
+        fn process(
+            &self,
+            request: RemotingCommand,
+        ) -> Pin<Box<dyn Future<Output = Result<RemotingCommand, rocketmq_error::SharedError>> + Send + '_>> {
+            Box::pin(async move {
+                if request.code() != RequestCode::GetKvConfig.to_i32() {
+                    return Err(
+                        ClientError::illegal_argument(format!("unexpected request code {}", request.code())).into(),
+                    );
+                }
+                self.requests.fetch_add(1, Ordering::SeqCst);
+                let response = self
+                    .responses
+                    .lock()
+                    .expect("KV response queue")
+                    .pop_front()
+                    .ok_or_else(|| ClientError::illegal_argument("unexpected KV request"))?;
+                Ok(response.set_opaque(request.opaque()))
+            })
+        }
+    }
+
+    async fn bind_kv_server(
+        runtime: &RuntimeContext,
+        scope: &'static str,
+        processor: Arc<KvProcessor>,
+    ) -> Arc<SessionTransportServer> {
+        let admission = Arc::new(AdmissionController::new(AdmissionLimits::default()));
+        let server = SessionTransportServer::bind(
+            runtime.service_context(scope),
+            SessionTransportServerConfig::loopback(),
+            processor as Arc<dyn SessionProcessor>,
+            admission,
+        )
+        .await
+        .expect("bind KV server");
+        server.start().expect("start KV server");
+        server
+    }
+
+    #[tokio::test]
+    async fn kv_executor_single_attempt_and_not_found_remains_server_error() {
+        let server_runtime = RuntimeContext::from_current("kv-single-attempt-test");
+        let first = Arc::new(KvProcessor::default());
+        let second = Arc::new(KvProcessor::default());
+        let first_server = bind_kv_server(&server_runtime, "kv-first", Arc::clone(&first)).await;
+        let second_server = bind_kv_server(&server_runtime, "kv-second", Arc::clone(&second)).await;
+        let client_runtime = crate::runtime::test_client_runtime("kv-single-attempt-test");
+        let client_instance = MQClientInstance::new_arc(
+            ClientConfig::default(),
+            0,
+            "kv-single-client",
+            None,
+            client_runtime.component("instance"),
+            client_runtime.telemetry_handle().clone(),
+            client_runtime.pool().request_future_holder(),
+        );
+        let api = client_instance.get_mq_client_api_impl().unwrap();
+        let first_addr = CheetahString::from_string(first_server.local_addr().to_string());
+        let second_addr = CheetahString::from_string(second_server.local_addr().to_string());
+        api.update_name_server_targets_sync(vec![first_addr.clone(), second_addr]);
+        for processor in [&first, &second] {
+            processor.push(RemotingCommand::create_response_command_with_code(
+                ResponseCode::SystemError,
+            ));
+        }
+        api.start().await.unwrap();
+        let error = api
+            .get_kvconfig_value("namespace".into(), "key".into(), 2000)
+            .await
+            .unwrap_err();
+        assert_eq!(error.broker_response_code(), Some(1));
+        assert_eq!(first.request_count() + second.request_count(), 1);
+        for processor in [&first, &second] {
+            processor.responses.lock().unwrap().clear();
+        }
+        api.update_name_server_targets_sync(vec![first_addr]);
+        first.push(RemotingCommand::create_response_command_with_code(
+            ResponseCode::QueryNotFound,
+        ));
+        let missing = api
+            .get_kvconfig_value("namespace".into(), "missing".into(), 2000)
+            .await
+            .unwrap_err();
+        assert_eq!(missing.broker_response_code(), Some(22));
+        first.push(RemotingCommand::create_success_response_command());
+        assert_eq!(
+            api.get_kvconfig_value("namespace".into(), "null".into(), 2000)
+                .await
+                .unwrap(),
+            None
+        );
+        let mut empty = RemotingCommand::create_success_response_command();
+        empty.add_ext_field("value", "");
+        first.push(empty);
+        assert_eq!(
+            api.get_kvconfig_value("namespace".into(), "empty".into(), 2000)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("")
+        );
+        client_instance.shutdown().await;
+        client_runtime
+            .shutdown()
+            .await
+            .assert_no_task_leak()
+            .expect("client runtime tasks drained");
+        for server in [first_server, second_server] {
+            server
+                .shutdown_until(ShutdownDeadline::after(Duration::from_secs(5)))
+                .await
+                .assert_no_task_leak()
+                .expect("KV server tasks drained");
+        }
+        server_runtime
+            .shutdown_tasks(Duration::from_secs(5))
+            .await
+            .assert_no_task_leak()
+            .expect("KV runtime tasks drained");
+    }
+}
+
+#[cfg(test)]
+mod json_error_boundary_tests {
+    use std::error::Error as StdError;
+
+    #[test]
+    fn admin_json_decode_preserves_source_and_public_boundary() {
+        let error = super::decode_admin_json::<serde_json::Value>(b"invalid").unwrap_err();
+
+        assert_eq!(error.to_string(), "core.serialization.failed: Serialization failed");
+        assert_eq!(error.descriptor().public_message(), "Serialization failed");
+
+        let canonical = StdError::source(&error).expect("canonical error source");
+        assert!(canonical.downcast_ref::<rocketmq_error::Error>().is_some());
+        assert!(error.source_ref::<serde_json::Error>().is_some());
+
+        assert!(error.is(&rocketmq_error::CORE_SERIALIZATION_FAILED));
+    }
+
+    #[cfg(any(feature = "admin-read", feature = "admin-mutation"))]
+    #[test]
+    fn proxy_drain_decode_preserves_source() {
+        let response = rocketmq_protocol::RemotingCommand::create_success_response_command().set_body("invalid");
+
+        let error =
+            super::decode_proxy_drain_response(response, "proxy_drain_test").expect_err("invalid body must fail");
+
+        assert!(error.is(&rocketmq_error::PROTOCOL_RESPONSE_FAILED));
+        assert!(error.source_ref::<rocketmq_error::Error>().is_some());
+    }
+}
+
+#[cfg(feature = "admin-mutation")]
+fn acl_entry_delete_header(
+    subject: CheetahString,
+    policy_type: CheetahString,
+    resource: CheetahString,
+) -> ClientResult<DeleteAclRequestHeader> {
+    if subject.trim().is_empty()
+        || resource.trim().is_empty()
+        || !(policy_type.eq_ignore_ascii_case("Custom") || policy_type.eq_ignore_ascii_case("Default"))
+    {
+        return Err(ClientError::illegal_argument(
+            "ACL entry deletion requires subject, resource and Custom or Default policy type",
+        ));
+    }
+    Ok(DeleteAclRequestHeader::with_policy_type(
+        subject,
+        Some(policy_type),
+        Some(resource),
+    ))
+}
+#[cfg(all(test, feature = "admin-mutation"))]
+mod acl_policy_entry_tests {
+    use super::*;
+    #[test]
+    fn acl_policy_entry_delete_preserves_type_and_never_expands_empty_resource() {
+        let header = acl_entry_delete_header("User:alice".into(), "Default".into(), "Topic:orders".into()).unwrap();
+        assert_eq!(header.policy_type.as_deref(), Some("Default"));
+        assert_eq!(header.resource.as_deref(), Some("Topic:orders"));
+        assert!(acl_entry_delete_header("User:alice".into(), "Default".into(), "".into()).is_err());
+        assert!(acl_entry_delete_header("User:alice".into(), "invalid".into(), "Topic:orders".into()).is_err());
+        let legacy = DeleteAclRequestHeader::new("User:alice".into(), None);
+        assert!(legacy.policy_type.is_none());
+        assert!(legacy.resource.is_none());
+    }
+}

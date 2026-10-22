@@ -1,0 +1,890 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::Weak;
+use std::time::Duration;
+
+use arc_swap::ArcSwap;
+use cheetah_string::CheetahString;
+use dashmap::DashMap;
+use rocketmq_model::common::constant::consume_init_mode::ConsumeInitMode;
+use rocketmq_model::common::consumer::consume_from_where::ConsumeFromWhere;
+use rocketmq_model::common::message::message_queue::MessageQueue;
+use rocketmq_model::common::mix_all;
+use rocketmq_protocol::code::response_code::ResponseCode;
+use rocketmq_protocol::protocol::body::unlock_batch_request_body::UnlockBatchRequestBody;
+use rocketmq_protocol::protocol::heartbeat::consume_type::ConsumeType;
+use rocketmq_protocol::protocol::heartbeat::message_model::MessageModel;
+use rocketmq_protocol::protocol::heartbeat::subscription_data::SubscriptionData;
+use rocketmq_runtime::common::time_utils::current_millis;
+use std::sync::LazyLock;
+use tokio::sync::RwLock;
+use tracing::error;
+use tracing::info;
+use tracing::warn;
+
+use crate::base::client_config::ClientConfig;
+use crate::consumer::allocate_message_queue_strategy::AllocateMessageQueueStrategy;
+use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
+use crate::consumer::consumer_impl::pop_process_queue::PopProcessQueue;
+use crate::consumer::consumer_impl::pop_request::PopRequest;
+use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+use crate::consumer::consumer_impl::pull_request::PullRequest;
+use crate::consumer::consumer_impl::re_balance::rebalance_impl::RebalanceImpl;
+use crate::consumer::consumer_impl::re_balance::Rebalance;
+use crate::consumer::default_mq_push_consumer::ConsumerConfig;
+use crate::consumer::store::read_offset_type::ReadOffsetType;
+use crate::factory::mq_client_instance::MQClientInstance;
+
+static UNLOCK_DELAY_TIME_MILLS: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("rocketmq.client.unlockDelayTimeMills")
+        .unwrap_or_else(|_| "20000".into())
+        .parse::<u64>()
+        .unwrap_or(20000)
+});
+
+pub struct RebalancePushImpl {
+    client_config: ArcSwap<ClientConfig>,
+    pub(crate) consumer_config: ArcSwap<ConsumerConfig>,
+    pub(crate) rebalance_impl_inner: RebalanceImpl<RebalancePushImpl>,
+    default_mqpush_consumer_impl: OnceLock<Weak<DefaultMQPushConsumerImpl>>,
+}
+
+impl RebalancePushImpl {
+    pub fn new(client_config: ClientConfig, consumer_config: ConsumerConfig) -> Self {
+        RebalancePushImpl {
+            client_config: ArcSwap::from_pointee(client_config),
+            consumer_config: ArcSwap::from_pointee(consumer_config),
+            rebalance_impl_inner: RebalanceImpl::new(None, None, None, None),
+            default_mqpush_consumer_impl: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn replace_consumer_config(&self, consumer_config: ConsumerConfig) {
+        self.consumer_config.store(Arc::new(consumer_config));
+    }
+
+    pub(crate) fn set_use_tls(&self, use_tls: bool) {
+        self.client_config.rcu(|current| {
+            let mut next = (**current).clone();
+            next.set_use_tls(use_tls);
+            Arc::new(next)
+        });
+    }
+
+    pub(crate) fn client_config_snapshot(&self) -> Arc<ClientConfig> {
+        self.client_config.load_full()
+    }
+
+    fn update_consumer_config(&self, update: impl Fn(&mut ConsumerConfig)) {
+        self.consumer_config.rcu(|current| {
+            let mut next = (**current).clone();
+            update(&mut next);
+            Arc::new(next)
+        });
+    }
+}
+
+impl RebalancePushImpl {
+    pub fn get_subscription_inner(&self) -> Arc<DashMap<CheetahString, SubscriptionData>> {
+        self.rebalance_impl_inner.subscription_inner.clone()
+    }
+
+    pub fn set_default_mqpush_consumer_impl(&self, default_mqpush_consumer_impl: Weak<DefaultMQPushConsumerImpl>) {
+        let _ = self.default_mqpush_consumer_impl.set(default_mqpush_consumer_impl);
+    }
+
+    pub fn set_consumer_group(&self, consumer_group: CheetahString) {
+        self.rebalance_impl_inner.set_consumer_group(consumer_group);
+    }
+
+    pub fn set_message_model(&self, message_model: MessageModel) {
+        self.rebalance_impl_inner.set_message_model(message_model);
+    }
+
+    pub fn set_allocate_message_queue_strategy(
+        &self,
+        allocate_message_queue_strategy: Arc<dyn AllocateMessageQueueStrategy>,
+    ) {
+        self.rebalance_impl_inner
+            .set_allocate_message_queue_strategy(allocate_message_queue_strategy);
+    }
+
+    pub fn set_mq_client_factory(&self, client_instance: Arc<MQClientInstance>) {
+        self.rebalance_impl_inner.set_mq_client_factory(client_instance);
+    }
+
+    #[inline]
+    pub fn put_subscription_data(&self, topic: CheetahString, subscription_data: SubscriptionData) {
+        self.rebalance_impl_inner
+            .subscription_inner
+            .insert(topic, subscription_data);
+    }
+
+    pub fn set_rebalance_impl(&self, rebalance_impl: Weak<RebalancePushImpl>) {
+        let _ = self.rebalance_impl_inner.sub_rebalance_impl.set(rebalance_impl);
+    }
+
+    async fn try_remove_order_message_queue(&self, mq: &MessageQueue, pq: &ProcessQueue) -> bool {
+        let Some(default_mqpush_consumer_impl) = self.default_mqpush_consumer_impl.get().and_then(Weak::upgrade) else {
+            error!("DefaultMQPushConsumerImpl not initialized for removing order message queue");
+            return false;
+        };
+
+        let force_unlock =
+            pq.is_dropped() && (current_millis() > pq.get_last_lock_timestamp() + *UNLOCK_DELAY_TIME_MILLS);
+        let consume_lock = tokio::time::timeout(Duration::from_millis(500), pq.consume_lock.write())
+            .await
+            .ok();
+        if force_unlock || consume_lock.is_some() {
+            let Some(offset_store) = default_mqpush_consumer_impl.offset_store() else {
+                error!("Offset store not initialized");
+                return false;
+            };
+            offset_store.persist(mq).await;
+            offset_store.remove_offset(mq).await;
+            pq.set_locked(false);
+            self.unlock(mq, true).await;
+            return true;
+        } else {
+            pq.inc_try_unlock_times();
+            warn!(
+                "Failed to acquire consume_lock for {}, incrementing try_unlock_times.",
+                mq
+            );
+        }
+
+        false
+    }
+}
+
+const UNLOCK_BATCH_MQ_TIMEOUT_MS: u64 = 1_000;
+
+type BrokerProcessQueueTable = HashMap<CheetahString, HashMap<MessageQueue, Arc<ProcessQueue>>>;
+
+impl Rebalance for RebalancePushImpl {
+    async fn message_queue_changed(
+        &self,
+        topic: &str,
+        mq_all: &HashSet<MessageQueue>,
+        mq_divided: &HashSet<MessageQueue>,
+    ) {
+        let consumer_config = self.consumer_config.load_full();
+        {
+            let Some(mut subscription_data) = self.rebalance_impl_inner.subscription_inner.get_mut(topic) else {
+                warn!("Subscription data not found for topic: {}", topic);
+                return;
+            };
+            let new_version = current_millis() as i64;
+            info!(
+                "{} Rebalance changed, also update version: {}, {}",
+                topic, subscription_data.sub_version, new_version
+            );
+            subscription_data.sub_version = new_version;
+        }
+
+        let current_queue_count = {
+            let process_queue_table = self.rebalance_impl_inner.process_queue_table.read().await;
+            process_queue_table.len()
+        };
+        if current_queue_count != 0 {
+            let mut pull_threshold_for_queue = None;
+            let mut pull_threshold_size_for_queue = None;
+            let pull_threshold_for_topic = consumer_config.pull_threshold_for_topic;
+            if pull_threshold_for_topic != -1 {
+                let new_val = 1.max(pull_threshold_for_topic / current_queue_count as i32);
+                info!(
+                    "The pullThresholdForQueue is changed from {} to {}",
+                    consumer_config.pull_threshold_for_queue, new_val
+                );
+                pull_threshold_for_queue = Some(new_val as u32);
+            }
+            let pull_threshold_size_for_topic = consumer_config.pull_threshold_size_for_topic;
+            if pull_threshold_size_for_topic != -1 {
+                let new_val = 1.max(pull_threshold_size_for_topic / current_queue_count as i32);
+                info!(
+                    "The pullThresholdSizeForQueue is changed from {} to {}",
+                    consumer_config.pull_threshold_size_for_queue, new_val
+                );
+                pull_threshold_size_for_queue = Some(new_val as u32);
+            }
+            if pull_threshold_for_queue.is_some() || pull_threshold_size_for_queue.is_some() {
+                self.update_consumer_config(|config| {
+                    if let Some(value) = pull_threshold_for_queue {
+                        config.pull_threshold_for_queue = value;
+                    }
+                    if let Some(value) = pull_threshold_size_for_queue {
+                        config.pull_threshold_size_for_queue = value;
+                    }
+                });
+                if let Some(consumer_impl) = self.default_mqpush_consumer_impl.get().and_then(Weak::upgrade) {
+                    consumer_impl
+                        .update_pull_thresholds_from_rebalance(pull_threshold_for_queue, pull_threshold_size_for_queue);
+                }
+            }
+        }
+
+        //notify broker
+        if let Some(client_instance) = self.rebalance_impl_inner.get_mq_client_factory() {
+            let _ = client_instance.send_heartbeat_to_all_broker_with_lock_v2(true).await;
+        }
+        if let Some(ref message_queue_listener) = consumer_config.message_queue_listener {
+            message_queue_listener.message_queue_changed(topic, mq_all, mq_divided);
+        }
+    }
+
+    async fn remove_unnecessary_message_queue(&self, mq: &MessageQueue, pq: &ProcessQueue) -> bool {
+        let consumer_config = self.consumer_config.load_full();
+        let Some(default_mqpush_consumer_impl) = self.default_mqpush_consumer_impl.get().and_then(Weak::upgrade) else {
+            error!("DefaultMQPushConsumerImpl not initialized");
+            return false;
+        };
+        let consume_orderly = default_mqpush_consumer_impl.is_consume_orderly();
+        let Some(offset_store) = default_mqpush_consumer_impl.offset_store() else {
+            error!("Offset store not initialized");
+            return false;
+        };
+        let offset_store = offset_store;
+
+        if consume_orderly && MessageModel::Clustering == consumer_config.message_model {
+            offset_store.persist(mq).await;
+            self.try_remove_order_message_queue(mq, pq).await
+        } else {
+            offset_store.persist(mq).await;
+            offset_store.remove_offset(mq).await;
+            true
+        }
+    }
+
+    fn consume_type(&self) -> ConsumeType {
+        ConsumeType::ConsumePassively
+    }
+
+    async fn remove_dirty_offset(&self, mq: &MessageQueue) {
+        if let Some(default_mqpush_consumer_impl) = self.default_mqpush_consumer_impl.get().and_then(Weak::upgrade) {
+            if let Some(offset_store) = default_mqpush_consumer_impl.offset_store() {
+                offset_store.remove_offset(mq).await;
+            } else {
+                warn!("Offset store not initialized, cannot remove dirty offset for {}", mq);
+            }
+        } else {
+            warn!(
+                "DefaultMQPushConsumerImpl not initialized, cannot remove dirty offset for {}",
+                mq
+            );
+        }
+    }
+
+    #[allow(deprecated)]
+    async fn compute_pull_from_where_with_exception(&self, mq: &MessageQueue) -> crate::ClientResult<i64> {
+        let consumer_config = self.consumer_config.load_full();
+        let consume_from_where = consumer_config.consume_from_where;
+        let default_mqpush_consumer_impl = self
+            .default_mqpush_consumer_impl
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| {
+                error!("DefaultMQPushConsumerImpl not initialized for mq: {}", mq);
+                mq_client_err!(
+                    ResponseCode::SystemError as i32,
+                    format!("DefaultMQPushConsumerImpl not initialized for mq: {}", mq)
+                )
+            })?;
+        let Some(offset_store) = default_mqpush_consumer_impl.offset_store() else {
+            error!("Offset store not initialized for mq: {}", mq);
+            return Err(mq_client_err!(
+                ResponseCode::SystemError as i32,
+                format!("Offset store not initialized for mq: {}", mq)
+            ));
+        };
+
+        let result = match consume_from_where {
+            ConsumeFromWhere::ConsumeFromLastOffset
+            | ConsumeFromWhere::ConsumeFromLastOffsetAndFromMinWhenBootFirst
+            | ConsumeFromWhere::ConsumeFromMinOffset
+            | ConsumeFromWhere::ConsumeFromMaxOffset => {
+                let last_offset = offset_store.read_offset(mq, ReadOffsetType::ReadFromStore).await;
+                if last_offset >= 0 {
+                    last_offset
+                } else if -1 == last_offset {
+                    if mq.topic_str().starts_with(mix_all::RETRY_GROUP_TOPIC_PREFIX) {
+                        0
+                    } else {
+                        let Some(client_instance) = self.rebalance_impl_inner.get_mq_client_factory() else {
+                            error!("Client instance not initialized for mq: {}", mq);
+                            return Err(mq_client_err!(
+                                ResponseCode::SystemError as i32,
+                                format!("Client instance not initialized for mq: {}", mq)
+                            ));
+                        };
+                        client_instance.mq_admin_impl.max_offset(mq).await?
+                    }
+                } else {
+                    return Err(mq_client_err!(
+                        ResponseCode::QueryNotFound as i32,
+                        format!("Failed to query consume offset from offset store for mq: {}", mq)
+                    ));
+                }
+            }
+            ConsumeFromWhere::ConsumeFromFirstOffset => {
+                let last_offset = offset_store.read_offset(mq, ReadOffsetType::ReadFromStore).await;
+                if last_offset >= 0 {
+                    last_offset
+                } else if -1 == last_offset {
+                    0
+                } else {
+                    return Err(mq_client_err!(
+                        ResponseCode::QueryNotFound as i32,
+                        format!("Failed to query consume offset from offset store for mq: {}", mq)
+                    ));
+                }
+            }
+            ConsumeFromWhere::ConsumeFromTimestamp => {
+                let last_offset = offset_store.read_offset(mq, ReadOffsetType::ReadFromStore).await;
+                if last_offset >= 0 {
+                    last_offset
+                } else if -1 == last_offset {
+                    if mq.topic_str().starts_with(mix_all::RETRY_GROUP_TOPIC_PREFIX) {
+                        let Some(client_instance) = self.rebalance_impl_inner.get_mq_client_factory() else {
+                            error!("Client instance not initialized for mq: {}", mq);
+                            return Err(mq_client_err!(
+                                ResponseCode::SystemError as i32,
+                                format!("Client instance not initialized for mq: {}", mq)
+                            ));
+                        };
+                        client_instance.mq_admin_impl.max_offset(mq).await?
+                    } else {
+                        let Some(client_instance) = self.rebalance_impl_inner.get_mq_client_factory() else {
+                            error!("Client instance not initialized for mq: {}", mq);
+                            return Err(mq_client_err!(
+                                ResponseCode::SystemError as i32,
+                                format!("Client instance not initialized for mq: {}", mq)
+                            ));
+                        };
+                        let timestamp =
+                            super::parse_consume_timestamp_millis(consumer_config.consume_timestamp.as_deref(), mq)?;
+                        client_instance.mq_admin_impl.search_offset(mq, timestamp).await?
+                    }
+                } else {
+                    return Err(mq_client_err!(
+                        ResponseCode::QueryNotFound as i32,
+                        format!("Failed to query consume offset from offset store for mq: {}", mq)
+                    ));
+                }
+            }
+        };
+        if result < 0 {
+            return Err(mq_client_err!(
+                ResponseCode::SystemError as i32,
+                format!(
+                    "Failed to query consume offset from offset store for mq: {}, result: {}",
+                    mq, result
+                )
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn compute_pull_from_where(&self, mq: &MessageQueue) -> i64 {
+        self.compute_pull_from_where_with_exception(mq)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Compute consume offset exception, mq={:?}", e);
+                -1
+            })
+    }
+
+    fn get_consume_init_mode(&self) -> i32 {
+        let consume_from_where = self.consumer_config.load_full().consume_from_where;
+        if consume_from_where == ConsumeFromWhere::ConsumeFromFirstOffset {
+            ConsumeInitMode::MIN
+        } else {
+            ConsumeInitMode::MAX
+        }
+    }
+
+    async fn dispatch_pull_request(&self, pull_request_list: Vec<PullRequest>, delay: u64) {
+        if let Some(mqpush_consumer_impl) = self.default_mqpush_consumer_impl.get().and_then(Weak::upgrade) {
+            for pull_request in pull_request_list {
+                if delay == 0 {
+                    mqpush_consumer_impl
+                        .execute_pull_request_immediately(pull_request)
+                        .await;
+                } else {
+                    mqpush_consumer_impl.execute_pull_request_later(pull_request, delay);
+                }
+            }
+        } else {
+            error!("mqpush_consumer_impl is not initialized");
+        }
+    }
+
+    async fn dispatch_pop_pull_request(&self, pop_request_list: Vec<PopRequest>, delay: u64) {
+        if let Some(mqpush_consumer_impl) = self.default_mqpush_consumer_impl.get().and_then(Weak::upgrade) {
+            for pop_request in pop_request_list {
+                if delay == 0 {
+                    mqpush_consumer_impl.execute_pop_request_immediately(pop_request).await;
+                } else {
+                    mqpush_consumer_impl.execute_pop_request_later(pop_request, delay);
+                }
+            }
+        } else {
+            error!("mqpush_consumer_impl is not initialized");
+        }
+    }
+
+    #[inline]
+    fn create_process_queue(&self) -> ProcessQueue {
+        ProcessQueue::new()
+    }
+
+    #[inline]
+    fn create_pop_process_queue(&self) -> PopProcessQueue {
+        PopProcessQueue::new()
+    }
+
+    async fn remove_process_queue(&self, mq: &MessageQueue) {
+        let mut process_queue_table = self.rebalance_impl_inner.process_queue_table.write().await;
+        let prev = process_queue_table.remove(mq);
+        drop(process_queue_table);
+        if let Some(pq) = prev {
+            let droped = pq.is_dropped();
+            pq.set_dropped(true);
+            self.remove_unnecessary_message_queue(mq, &pq).await;
+            if let Some(consumer_group) = self.rebalance_impl_inner.consumer_group() {
+                info!(
+                    "Fix Offset, {}, remove unnecessary mq, {} Droped: {}",
+                    consumer_group, mq, droped
+                );
+            }
+        }
+    }
+
+    async fn unlock(&self, mq: &MessageQueue, oneway: bool) {
+        let Some(client) = self.rebalance_impl_inner.get_mq_client_factory() else {
+            warn!("Client instance is not available for unlocking {}", mq);
+            return;
+        };
+        let Some(consumer_group) = self.rebalance_impl_inner.consumer_group() else {
+            warn!("Consumer group not set for unlocking {}", mq);
+            return;
+        };
+        let broker_name = client.get_broker_name_from_message_queue(mq).await;
+        let find_broker_result = client
+            .find_broker_address_in_subscribe(&broker_name, mix_all::MASTER_ID, true)
+            .await;
+        if let Some(find_broker_result) = find_broker_result {
+            let mut request_body = UnlockBatchRequestBody {
+                consumer_group: Some(consumer_group.clone()),
+                client_id: Some(client.client_id.clone()),
+                ..Default::default()
+            };
+            request_body.mq_set.insert(mq.clone());
+            let Some(mq_client_api_impl) = client.mq_client_api_impl.load_full() else {
+                warn!("unlockBatchMQ skipped: MQClientAPIImpl is not initialized, mq={}", mq);
+                return;
+            };
+            let result = mq_client_api_impl
+                .unlock_batch_mq(
+                    find_broker_result.broker_addr.as_ref(),
+                    request_body,
+                    UNLOCK_BATCH_MQ_TIMEOUT_MS,
+                    oneway,
+                )
+                .await;
+            if let Err(e) = result {
+                warn!("unlockBatchMQ exception, {},{}", mq, e);
+            } else {
+                warn!(
+                    "unlock messageQueue. group:{}, clientId:{}, mq:{}",
+                    consumer_group, client.client_id, mq
+                )
+            }
+        }
+    }
+
+    async fn lock_all(&self) {
+        if let Some(default_mqpush_consumer_impl) = self.default_mqpush_consumer_impl.get().and_then(Weak::upgrade) {
+            if default_mqpush_consumer_impl.is_consume_orderly() {
+                let process_queue_table = self.rebalance_impl_inner.process_queue_table.clone();
+                let consumer_group = self.rebalance_impl_inner.consumer_group();
+                let client_instance = self.rebalance_impl_inner.get_mq_client_factory();
+
+                if let Some(client_instance) = client_instance {
+                    let broker_mqs =
+                        build_process_queue_table_by_broker_name(&process_queue_table, &client_instance).await;
+                    lock_all_impl(broker_mqs, process_queue_table, consumer_group, client_instance).await;
+                }
+            }
+        }
+    }
+
+    async fn unlock_all(&self, oneway: bool) {
+        let process_queue_table = self.rebalance_impl_inner.process_queue_table.clone();
+        let consumer_group = self.rebalance_impl_inner.consumer_group();
+        let client_instance = self.rebalance_impl_inner.get_mq_client_factory();
+
+        if let Some(client_instance) = client_instance {
+            let broker_mqs = build_process_queue_table_by_broker_name(&process_queue_table, &client_instance).await;
+            unlock_all_impl(broker_mqs, process_queue_table, consumer_group, client_instance, oneway).await;
+        }
+    }
+
+    async fn do_rebalance(&self, is_order: bool) -> bool {
+        self.rebalance_impl_inner.do_rebalance(is_order).await
+    }
+
+    /// Determines if the client should perform rebalancing for the given topic.
+    ///
+    /// This function checks the following conditions to decide if rebalancing is needed:
+    /// 1. If `client_rebalance` is enabled in the consumer configuration.
+    /// 2. If the message model is set to `Broadcasting`.
+    /// 3. If the consumer is configured to consume messages in order.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - A string slice that holds the name of the topic.
+    ///
+    /// # Returns
+    ///
+    /// * `true` if the client should perform rebalancing.
+    /// * `false` otherwise.
+    fn client_rebalance(&self, _topic: &str) -> bool {
+        //Pop message mode, order message consumer not implement, it's use
+        // ConsumeMessageOrderlyService to consume
+        self.consumer_config.load_full().client_rebalance
+            || self.rebalance_impl_inner.message_model() == Some(MessageModel::Broadcasting)
+            || self
+                .default_mqpush_consumer_impl
+                .get()
+                .and_then(Weak::upgrade)
+                .map(|impl_ref| impl_ref.is_consume_orderly())
+                .unwrap_or(false)
+    }
+
+    fn destroy(&self) {
+        info!(
+            "Destroying RebalancePushImpl for consumer group: {:?}",
+            self.rebalance_impl_inner.consumer_group()
+        );
+        // Mark all process queues as dropped and clear the tables.
+        // Use try_write to avoid blocking; shutdown callers are expected to drain tasks first.
+        if let Ok(mut table) = self.rebalance_impl_inner.process_queue_table.try_write() {
+            for pq in table.values() {
+                pq.set_dropped(true);
+            }
+            table.clear();
+        } else {
+            warn!("destroy: could not acquire write lock on process_queue_table; queues may not be dropped cleanly");
+        }
+        if let Ok(mut pop_table) = self.rebalance_impl_inner.pop_process_queue_table.try_write() {
+            for pq in pop_table.values() {
+                pq.set_dropped(true);
+            }
+            pop_table.clear();
+        } else {
+            warn!(
+                "destroy: could not acquire write lock on pop_process_queue_table; queues may not be dropped cleanly"
+            );
+        }
+    }
+}
+
+async fn build_process_queue_table_by_broker_name(
+    process_queue_table: &Arc<RwLock<HashMap<MessageQueue, Arc<ProcessQueue>>>>,
+    client: &Arc<MQClientInstance>,
+) -> BrokerProcessQueueTable {
+    let queues: Vec<(MessageQueue, Arc<ProcessQueue>)> = {
+        let process_queue_table = process_queue_table.read().await;
+        process_queue_table
+            .iter()
+            .filter(|(_, process_queue)| !process_queue.is_dropped())
+            .map(|(mq, process_queue)| (mq.clone(), process_queue.clone()))
+            .collect()
+    };
+    let mut result = HashMap::new();
+    for (mq, process_queue) in queues {
+        let broker_name = client.get_broker_name_from_message_queue(&mq).await;
+        let entry = result.entry(broker_name).or_insert_with(HashMap::new);
+        entry.insert(mq, process_queue);
+    }
+    result
+}
+
+async fn lock_all_impl(
+    broker_mqs: BrokerProcessQueueTable,
+    process_queue_table: Arc<RwLock<HashMap<MessageQueue, Arc<ProcessQueue>>>>,
+    consumer_group: Option<CheetahString>,
+    client_instance: Arc<MQClientInstance>,
+) {
+    use rocketmq_protocol::protocol::body::request::lock_batch_request_body::LockBatchRequestBody;
+
+    let map = broker_mqs
+        .into_iter()
+        .map(|(broker_name, mqs)| {
+            let client_instance = client_instance.clone();
+            let process_queue_table = process_queue_table.clone();
+            let consumer_group = consumer_group.clone();
+            async move {
+                if mqs.is_empty() {
+                    return;
+                }
+                let mq_set = mqs.keys().cloned().collect();
+                let find_broker_result = client_instance
+                    .find_broker_address_in_subscribe(&broker_name, mix_all::MASTER_ID, true)
+                    .await;
+                if let Some(find_broker_result) = find_broker_result {
+                    let request_body = LockBatchRequestBody {
+                        consumer_group: consumer_group.clone(),
+                        client_id: Some(client_instance.client_id.clone()),
+                        mq_set,
+                        ..Default::default()
+                    };
+                    let Some(mq_client_api_impl) = client_instance.mq_client_api_impl.load_full() else {
+                        warn!(
+                            "lockBatchMQ skipped: MQClientAPIImpl is not initialized for broker {}",
+                            broker_name
+                        );
+                        return;
+                    };
+                    let result = mq_client_api_impl
+                        .lock_batch_mq(find_broker_result.broker_addr.as_str(), request_body, 1_000)
+                        .await;
+                    match result {
+                        Ok(lock_okmqset) => {
+                            let process_queue_table = process_queue_table.read().await;
+                            for (mq, expected) in &mqs {
+                                let is_current = process_queue_table
+                                    .get(mq)
+                                    .is_some_and(|current| Arc::ptr_eq(current, expected));
+                                if is_current {
+                                    if lock_okmqset.contains(mq) {
+                                        if !expected.is_locked() {
+                                            info!("the message queue locked OK, Group: {:?} {}", consumer_group, mq);
+                                        }
+                                        expected.set_locked(true);
+                                        expected.set_last_lock_timestamp(current_millis());
+                                    } else {
+                                        expected.set_locked(false);
+                                        warn!("the message queue locked Failed, Group: {:?} {}", consumer_group, mq);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("lockBatchMQ exception for broker: {}, error: {}", broker_name, e);
+                        }
+                    }
+                } else {
+                    warn!(
+                        "Failed to find broker address for broker: {}, Group: {:?}",
+                        broker_name, consumer_group
+                    );
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    futures::future::join_all(map).await;
+}
+
+async fn unlock_all_impl(
+    broker_mqs: BrokerProcessQueueTable,
+    process_queue_table: Arc<RwLock<HashMap<MessageQueue, Arc<ProcessQueue>>>>,
+    consumer_group: Option<CheetahString>,
+    client_instance: Arc<MQClientInstance>,
+    oneway: bool,
+) {
+    let map = broker_mqs
+        .into_iter()
+        .map(|(broker_name, mqs)| {
+            let client_instance = client_instance.clone();
+            let process_queue_table = process_queue_table.clone();
+            let consumer_group = consumer_group.clone();
+            async move {
+                if mqs.is_empty() {
+                    return;
+                }
+                let mq_set = mqs.keys().cloned().collect();
+                let find_broker_result = client_instance
+                    .find_broker_address_in_subscribe(&broker_name, mix_all::MASTER_ID, true)
+                    .await;
+                if let Some(find_broker_result) = find_broker_result {
+                    let request_body = UnlockBatchRequestBody {
+                        consumer_group: consumer_group.clone(),
+                        client_id: Some(client_instance.client_id.clone()),
+                        mq_set,
+                        ..Default::default()
+                    };
+                    let Some(mq_client_api_impl) = client_instance.mq_client_api_impl.load_full() else {
+                        warn!(
+                            "unlockBatchMQ skipped: MQClientAPIImpl is not initialized for broker {}",
+                            broker_name
+                        );
+                        return;
+                    };
+                    let result = mq_client_api_impl
+                        .unlock_batch_mq(&find_broker_result.broker_addr, request_body, 1_000, oneway)
+                        .await;
+                    match result {
+                        Ok(_) => {
+                            let process_queue_table = process_queue_table.read().await;
+                            for (mq, expected) in &mqs {
+                                let is_current = process_queue_table
+                                    .get(mq)
+                                    .is_some_and(|current| Arc::ptr_eq(current, expected));
+                                if is_current {
+                                    expected.set_locked(false);
+                                    info!("the message queue unlock OK, Group: {:?} {}", consumer_group, mq);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("unlockBatchMQ exception for broker: {}, error: {}", broker_name, e);
+                        }
+                    }
+                } else {
+                    warn!(
+                        "Failed to find broker address for broker: {}, Group: {:?}",
+                        broker_name, consumer_group
+                    );
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    futures::future::join_all(map).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    use cheetah_string::CheetahString;
+    use rocketmq_model::common::message::message_queue::MessageQueue;
+    use rocketmq_protocol::protocol::heartbeat::subscription_data::SubscriptionData;
+
+    use super::RebalancePushImpl;
+    use crate::base::client_config::ClientConfig;
+    use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+    use crate::consumer::consumer_impl::re_balance::Rebalance;
+    use crate::consumer::default_mq_push_consumer::ConsumerConfig;
+    use crate::consumer::message_queue_listener::MessageQueueListener;
+
+    struct CountingMessageQueueListener(Arc<AtomicUsize>);
+
+    impl MessageQueueListener for CountingMessageQueueListener {
+        fn message_queue_changed(
+            &self,
+            _topic: &str,
+            _mq_all: &HashSet<MessageQueue>,
+            _mq_assigned: &HashSet<MessageQueue>,
+        ) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn standard_weak_self_reference_does_not_keep_rebalance_alive() {
+        let rebalance = Arc::new(RebalancePushImpl::new(
+            ClientConfig::default(),
+            ConsumerConfig::default(),
+        ));
+        let weak = Arc::downgrade(&rebalance);
+        rebalance.set_rebalance_impl(weak.clone());
+
+        assert!(weak.upgrade().is_some());
+        drop(rebalance);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn constructor_keeps_an_immutable_config_generation() {
+        let mut source = ConsumerConfig {
+            client_rebalance: false,
+            ..Default::default()
+        };
+        let rebalance = RebalancePushImpl::new(ClientConfig::default(), source.clone());
+
+        source.client_rebalance = true;
+
+        assert!(!rebalance.consumer_config.load_full().client_rebalance);
+    }
+
+    #[tokio::test]
+    async fn queue_change_publishes_recomputed_threshold_snapshot() {
+        let topic = CheetahString::from_static_str("topic-a");
+        let config = ConsumerConfig {
+            pull_threshold_for_topic: 100,
+            pull_threshold_size_for_topic: 40,
+            pull_threshold_for_queue: 1_000,
+            pull_threshold_size_for_queue: 100,
+            ..Default::default()
+        };
+        let rebalance = RebalancePushImpl::new(ClientConfig::default(), config);
+        rebalance
+            .rebalance_impl_inner
+            .subscription_inner
+            .insert(topic.clone(), SubscriptionData::default());
+        let mut queues = HashSet::new();
+        {
+            let mut process_queues = rebalance.rebalance_impl_inner.process_queue_table.write().await;
+            for queue_id in 0..4 {
+                let mq = MessageQueue::from_parts(topic.clone(), "broker-a", queue_id);
+                queues.insert(mq.clone());
+                process_queues.insert(mq, Arc::new(ProcessQueue::new()));
+            }
+        }
+
+        rebalance.message_queue_changed(topic.as_str(), &queues, &queues).await;
+
+        let published = rebalance.consumer_config.load_full();
+        assert_eq!(published.pull_threshold_for_queue, 25);
+        assert_eq!(published.pull_threshold_size_for_queue, 10);
+    }
+
+    #[tokio::test]
+    async fn replaced_config_generation_drives_listener_callback() {
+        let topic = CheetahString::from_static_str("topic-a");
+        let old_calls = Arc::new(AtomicUsize::new(0));
+        let new_calls = Arc::new(AtomicUsize::new(0));
+        let rebalance = RebalancePushImpl::new(
+            ClientConfig::default(),
+            ConsumerConfig {
+                message_queue_listener: Some(Arc::new(CountingMessageQueueListener(old_calls.clone()))),
+                ..Default::default()
+            },
+        );
+        rebalance
+            .rebalance_impl_inner
+            .subscription_inner
+            .insert(topic.clone(), SubscriptionData::default());
+        rebalance.replace_consumer_config(ConsumerConfig {
+            message_queue_listener: Some(Arc::new(CountingMessageQueueListener(new_calls.clone()))),
+            ..Default::default()
+        });
+
+        rebalance
+            .message_queue_changed(topic.as_str(), &HashSet::new(), &HashSet::new())
+            .await;
+
+        assert_eq!(old_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(new_calls.load(Ordering::Relaxed), 1);
+    }
+}

@@ -1,0 +1,223 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use cheetah_string::CheetahString;
+use rocketmq_macros::RequestHeaderCodec;
+use serde::Deserialize;
+use serde::Serialize;
+
+use crate::protocol::command_custom_header::CommandCustomHeader;
+use crate::protocol::command_custom_header::FromMap;
+use crate::protocol::command_custom_header::HeaderMap;
+#[allow(
+    deprecated,
+    reason = "imports the legacy trait only to provide its compatibility adapter"
+)]
+use crate::protocol::FastCodesHeader;
+
+#[derive(Debug, Serialize, Deserialize, Default, RequestHeaderCodec)]
+#[header(
+    type_id = "rocketmq_protocol::protocol::header::message_operation_header::send_message_response_header::SendMessageResponseHeader",
+    java_class = "org.apache.rocketmq.remoting.protocol.header.SendMessageResponseHeader",
+    fast
+)]
+#[serde(rename_all = "camelCase")]
+pub struct SendMessageResponseHeader {
+    #[header(required)]
+    msg_id: CheetahString,
+    #[header(required)]
+    queue_id: i32,
+    #[header(required)]
+    queue_offset: i64,
+    transaction_id: Option<CheetahString>,
+    batch_uniq_id: Option<CheetahString>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recall_handle: Option<CheetahString>,
+}
+
+impl SendMessageResponseHeader {
+    pub fn new(
+        msg_id: CheetahString,
+        queue_id: i32,
+        queue_offset: i64,
+        transaction_id: Option<CheetahString>,
+        batch_uniq_id: Option<CheetahString>,
+        recall_handle: Option<CheetahString>,
+    ) -> Self {
+        SendMessageResponseHeader {
+            msg_id,
+            queue_id,
+            queue_offset,
+            transaction_id,
+            batch_uniq_id,
+            recall_handle,
+        }
+    }
+
+    pub fn msg_id(&self) -> &CheetahString {
+        &self.msg_id
+    }
+
+    pub fn queue_id(&self) -> i32 {
+        self.queue_id
+    }
+
+    pub fn queue_offset(&self) -> i64 {
+        self.queue_offset
+    }
+
+    pub fn transaction_id(&self) -> Option<&str> {
+        self.transaction_id.as_deref()
+    }
+
+    pub fn batch_uniq_id(&self) -> Option<&str> {
+        self.batch_uniq_id.as_deref()
+    }
+
+    pub fn recall_handle(&self) -> Option<&str> {
+        self.recall_handle.as_deref()
+    }
+
+    pub fn set_msg_id(&mut self, msg_id: impl Into<CheetahString>) {
+        self.msg_id = msg_id.into();
+    }
+
+    pub fn set_queue_id(&mut self, queue_id: i32) {
+        self.queue_id = queue_id;
+    }
+
+    pub fn set_queue_offset(&mut self, queue_offset: i64) {
+        self.queue_offset = queue_offset;
+    }
+
+    pub fn set_transaction_id(&mut self, transaction_id: Option<CheetahString>) {
+        self.transaction_id = transaction_id;
+    }
+
+    pub fn set_batch_uniq_id(&mut self, batch_uniq_id: Option<CheetahString>) {
+        self.batch_uniq_id = batch_uniq_id;
+    }
+
+    pub fn set_recall_handle(&mut self, recall_handle: Option<CheetahString>) {
+        self.recall_handle = recall_handle;
+    }
+}
+
+#[allow(deprecated, reason = "source-compatible adapter for the legacy public trait")]
+impl FastCodesHeader for SendMessageResponseHeader {
+    fn encode_fast(&mut self, out: &mut bytes::BytesMut) {
+        let _ = CommandCustomHeader::encode_direct_binary(self, out);
+    }
+
+    fn decode_fast(&mut self, fields: &HeaderMap) {
+        if let Ok(decoded) = <Self as FromMap>::from(fields) {
+            *self = decoded;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_message_response_header_serialization_and_deserialization() {
+        let mut header = SendMessageResponseHeader::default();
+        header.set_msg_id("msg123");
+        header.set_queue_id(1);
+        header.set_queue_offset(100);
+        header.set_transaction_id(Some(CheetahString::from("tx456")));
+        header.set_batch_uniq_id(Some(CheetahString::from("batch789")));
+        header.set_recall_handle(Some(CheetahString::from("recall-handle")));
+
+        let json = serde_json::to_string(&header).unwrap();
+        assert_eq!(
+            json,
+            r#"{"msgId":"msg123","queueId":1,"queueOffset":100,"transactionId":"tx456","batchUniqId":"batch789","recallHandle":"recall-handle"}"#
+        );
+
+        let header: SendMessageResponseHeader = serde_json::from_str(&json).unwrap();
+        assert_eq!(header.msg_id(), "msg123");
+        assert_eq!(header.queue_id(), 1);
+        assert_eq!(header.queue_offset(), 100);
+        assert_eq!(header.transaction_id(), Some("tx456"));
+        assert_eq!(header.batch_uniq_id(), Some("batch789"));
+        assert_eq!(header.recall_handle(), Some("recall-handle"));
+    }
+
+    #[test]
+    #[allow(
+        deprecated,
+        reason = "verifies the source-compatible legacy adapter delegates to the generated codec"
+    )]
+    fn send_message_response_header_encode_decode_fast() {
+        let mut header = SendMessageResponseHeader::new(
+            CheetahString::from("msg123"),
+            1,
+            100,
+            Some(CheetahString::from("tx456")),
+            Some(CheetahString::from("batch789")),
+            Some(CheetahString::from("recall-handle")),
+        );
+        assert_eq!(header.msg_id(), "msg123");
+        assert_eq!(header.queue_id(), 1);
+        assert_eq!(header.queue_offset(), 100);
+        assert_eq!(header.transaction_id(), Some("tx456"));
+        assert_eq!(header.batch_uniq_id(), Some("batch789"));
+        assert_eq!(header.recall_handle(), Some("recall-handle"));
+
+        let mut out = bytes::BytesMut::new();
+        FastCodesHeader::encode_fast(&mut header, &mut out);
+        assert!(!out.is_empty());
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(CheetahString::from("msgId"), CheetahString::from("msg123"));
+        fields.insert(CheetahString::from("queueId"), CheetahString::from("1"));
+        fields.insert(CheetahString::from("queueOffset"), CheetahString::from("100"));
+        fields.insert(CheetahString::from("transactionId"), CheetahString::from("tx456"));
+        fields.insert(CheetahString::from("batchUniqId"), CheetahString::from("batch789"));
+        fields.insert(
+            CheetahString::from("recallHandle"),
+            CheetahString::from("recall-handle"),
+        );
+
+        let mut header = SendMessageResponseHeader::default();
+        FastCodesHeader::decode_fast(&mut header, &fields);
+
+        assert_eq!(header.msg_id(), "msg123");
+        assert_eq!(header.queue_id(), 1);
+        assert_eq!(header.queue_offset(), 100);
+        assert_eq!(header.transaction_id(), Some("tx456"));
+        assert_eq!(header.batch_uniq_id(), Some("batch789"));
+        assert_eq!(header.recall_handle(), Some("recall-handle"));
+    }
+
+    #[test]
+    #[allow(
+        deprecated,
+        reason = "verifies the source-compatible legacy adapter delegates to the generated codec"
+    )]
+    fn send_message_response_header_fast_encode_writes_signed_numeric_fields() {
+        let mut header = SendMessageResponseHeader::new(CheetahString::from("msg123"), -1, -42, None, None, None);
+        let mut out = bytes::BytesMut::new();
+
+        FastCodesHeader::encode_fast(&mut header, &mut out);
+
+        let encoded = String::from_utf8(out.to_vec()).unwrap();
+        assert!(encoded.contains("queueId"));
+        assert!(encoded.contains("-1"));
+        assert!(encoded.contains("queueOffset"));
+        assert!(encoded.contains("-42"));
+    }
+}

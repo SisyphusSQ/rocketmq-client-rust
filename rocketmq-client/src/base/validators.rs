@@ -1,0 +1,509 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::HashMap;
+
+use cheetah_string::CheetahString;
+use rocketmq_model::common::config::TopicConfig;
+use rocketmq_model::common::constant::PermName;
+use rocketmq_model::common::message::MessageConst;
+use rocketmq_model::common::message::MessageTrait;
+use rocketmq_model::common::topic::TopicValidator;
+use rocketmq_protocol::code::response_code::ResponseCode;
+
+use crate::producer::default_mq_producer::ProducerConfig;
+
+/// Custom: compiled native regular expression, with independent search and full-match
+/// operations. Pattern syntax is explicit Rust fancy-regex syntax; callers can
+/// retain a compiled value instead of recompiling Java's Pattern per invocation.
+pub struct RegexPattern {
+    search: fancy_regex::Regex,
+    full: fancy_regex::Regex,
+}
+impl RegexPattern {
+    pub fn new(pattern: &str) -> crate::ClientResult<Self> {
+        Ok(Self {
+            search: fancy_regex::Regex::new(pattern)
+                .map_err(|error| crate::ClientError::config_parse_source("regex", error))?,
+            full: fancy_regex::Regex::new(&format!(r"\A(?:{pattern})\z"))
+                .map_err(|error| crate::ClientError::config_parse_source("regex", error))?,
+        })
+    }
+    pub fn first_match<'a>(&self, origin: &'a str) -> crate::ClientResult<Option<&'a str>> {
+        self.search
+            .find(origin)
+            .map(|value| value.map(|matched| matched.as_str()))
+            .map_err(|error| crate::ClientError::response_process_source("regular_expression", error))
+    }
+}
+
+pub struct Validators;
+
+impl Validators {
+    /// Custom: fixed Java Pattern and public literal share this ASCII grammar.
+    pub const VALID_PATTERN_STR: &'static str = "^[%|a-zA-Z0-9_-]+$";
+    pub const PATTERN: &'static str = Self::VALID_PATTERN_STR;
+    pub const CHARACTER_MAX_LENGTH: usize = 255;
+    pub const TOPIC_MAX_LENGTH: usize = 127;
+    // Custom fork: fixed Java 4.6.1 uses CHARACTER_MAX_LENGTH (255) for group names.
+    pub const GROUP_MAX_LENGTH: usize = 255;
+
+    /// Java getGroupWithRegularExpression returns the first complete match, or null.
+    pub fn get_group_with_regular_expression(origin: &str, pattern: &str) -> crate::ClientResult<Option<String>> {
+        Ok(RegexPattern::new(pattern)?.first_match(origin)?.map(str::to_owned))
+    }
+    pub fn regular_expression_matcher(origin: &str, pattern: Option<&RegexPattern>) -> crate::ClientResult<bool> {
+        match pattern {
+            None => Ok(true),
+            Some(pattern) => pattern
+                .full
+                .is_match(origin)
+                .map_err(|error| crate::ClientError::response_process_source("regular_expression", error)),
+        }
+    }
+
+    pub fn check_group(group: &str) -> crate::ClientResult<()> {
+        if group.trim().is_empty() {
+            return Err(mq_client_err!("the specified group is blank"));
+        }
+
+        if group.len() > Self::GROUP_MAX_LENGTH {
+            return Err(mq_client_err!(format!(
+                "the specified group[{}] is longer than group max length: {}.",
+                group,
+                Self::GROUP_MAX_LENGTH
+            )));
+        }
+
+        if TopicValidator::is_topic_or_group_illegal(group) {
+            return Err(mq_client_err!(format!(
+                "the specified group[{}] contains illegal characters, allowing only ^[%|a-zA-Z0-9_-]+$",
+                group
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn check_message<M>(msg: Option<&M>, producer_config: &ProducerConfig) -> crate::ClientResult<()>
+    where
+        M: MessageTrait,
+    {
+        let Some(msg) = msg else {
+            return Err(mq_client_err!(
+                ResponseCode::MessageIllegal as i32,
+                "the message is null".to_string()
+            ));
+        };
+        Self::check_topic(msg.topic())?;
+        Self::is_not_allowed_send_topic(msg.topic())?;
+        // Custom fork: unsupported or malformed delay/transaction combinations must
+        // fail before routing, never become an ordinary 4.6.1 message.
+        let batch = msg
+            .as_any()
+            .downcast_ref::<rocketmq_model::common::message::message_batch::MessageBatch>();
+        if let Some(batch) = batch {
+            rocketmq_model::common::message::message_batch::MessageBatch::validate_messages(&batch.messages)?;
+        }
+        let delays = [msg.try_delay_time_level()?, msg.delay_time_in_seconds()?];
+        if delays[0] != 0 && delays[1] != 0 {
+            return Err(crate::ClientError::illegal_argument(
+                "delayInSeconds and delayTimeLevel cannot both be nonzero",
+            ));
+        }
+        let delayed = delays.iter().any(|value| *value != 0);
+        if [
+            MessageConst::PROPERTY_TIMER_DELAY_SEC,
+            MessageConst::PROPERTY_TIMER_DELAY_MS,
+            MessageConst::PROPERTY_TIMER_DELIVER_MS,
+        ]
+        .iter()
+        .any(|key| msg.property(&CheetahString::from_static_str(key)).is_some())
+        {
+            return Err(crate::ClientError::illegal_argument(
+                "5.x timer properties are not supported by the fixed 4.6.1 Broker",
+            ));
+        }
+        let transaction = msg
+            .property(&CheetahString::from_static_str(
+                MessageConst::PROPERTY_TRANSACTION_PREPARED,
+            ))
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        // Custom fork: callers can mutate the public batch envelope after construction.
+        if batch.is_some() && (delayed || transaction) {
+            return Err(crate::ClientError::illegal_argument(
+                "delayed or transactional batch envelopes are not supported",
+            ));
+        }
+        if delayed && transaction {
+            return Err(crate::ClientError::illegal_argument(
+                "delayed transactions are not supported",
+            ));
+        }
+
+        let Some(body) = msg.get_body() else {
+            return Err(mq_client_err!(
+                ResponseCode::MessageIllegal as i32,
+                "the message body is null".to_string()
+            ));
+        };
+
+        let length = body.len();
+        if length == 0 {
+            return Err(mq_client_err!(
+                ResponseCode::MessageIllegal as i32,
+                "the message body length is zero".to_string()
+            ));
+        }
+
+        if length > producer_config.max_message_size() as usize {
+            return Err(mq_client_err!(
+                ResponseCode::MessageIllegal as i32,
+                format!(
+                    "the message body size over max value, MAX: {}",
+                    producer_config.max_message_size()
+                )
+            ));
+        }
+
+        let lmq_path = msg.user_property(&CheetahString::from_static_str(
+            MessageConst::PROPERTY_INNER_MULTI_DISPATCH,
+        ));
+        if let Some(value) = lmq_path {
+            if value.contains(std::path::MAIN_SEPARATOR) {
+                return Err(mq_client_err!(
+                    ResponseCode::MessageIllegal as i32,
+                    format!(
+                        "INNER_MULTI_DISPATCH {} can not contains {} character",
+                        value,
+                        std::path::MAIN_SEPARATOR
+                    )
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn check_topic(topic: &str) -> crate::ClientResult<()> {
+        if topic.trim().is_empty() {
+            return Err(mq_client_err!("The specified topic is blank"));
+        }
+
+        if topic.len() > Self::TOPIC_MAX_LENGTH {
+            return Err(mq_client_err!(format!(
+                "The specified topic is longer than topic max length {}.",
+                Self::TOPIC_MAX_LENGTH
+            )));
+        }
+
+        if TopicValidator::is_topic_or_group_illegal(topic) {
+            return Err(mq_client_err!(format!(
+                "The specified topic[{}] contains illegal characters, allowing only ^[%|a-zA-Z0-9_-]+$",
+                topic
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub fn is_system_topic(topic: &str) -> crate::ClientResult<()> {
+        if TopicValidator::is_system_topic(topic) {
+            return Err(mq_client_err!(format!(
+                "The topic[{}] is conflict with system topic.",
+                topic
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn is_not_allowed_send_topic(topic: &str) -> crate::ClientResult<()> {
+        if TopicValidator::is_not_allowed_send_topic(topic) {
+            return Err(mq_client_err!(format!(
+                "Sending message to topic[{}] is forbidden.",
+                topic
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub fn check_topic_config(topic_config: &TopicConfig) -> crate::ClientResult<()> {
+        if !PermName::is_valid(topic_config.perm) {
+            return Err(mq_client_err!(
+                ResponseCode::NoPermission as i32,
+                format!("topicPermission value: {} is invalid.", topic_config.perm)
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn check_broker_config(broker_config: &HashMap<String, String>) -> crate::ClientResult<()> {
+        if let Some(broker_permission) = broker_config.get("brokerPermission") {
+            if !PermName::is_valid_str(broker_permission) {
+                return Err(mq_client_err!(format!(
+                    "brokerPermission value: {} is invalid.",
+                    broker_permission
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn custom_rejects_delayed_transactions_mutated_batches_and_foreign_timer_properties() {
+        use rocketmq_model::common::message::message_batch::MessageBatch;
+        use rocketmq_model::common::message::message_single::Message;
+        use rocketmq_model::common::message::{MessageConst, MessageTrait};
+        let message = || {
+            Message::builder()
+                .topic("Fixture")
+                .body_slice(b"payload")
+                .build_unchecked()
+        };
+        let mut delayed = message();
+        delayed.put_property(MessageConst::PROPERTY_DELAY_TIME_IN_SECONDS.into(), "1".into());
+        delayed.put_property(MessageConst::PROPERTY_TRANSACTION_PREPARED.into(), "true".into());
+        assert!(super::Validators::check_message(Some(&delayed), &ProducerConfig::default()).is_err());
+        let mut batch = MessageBatch::generate_from_messages(vec![message()]).unwrap();
+        batch.messages[0].put_property(MessageConst::PROPERTY_TRANSACTION_PREPARED.into(), "true".into());
+        assert!(super::Validators::check_message(Some(&batch), &ProducerConfig::default()).is_err());
+        for key in [
+            MessageConst::PROPERTY_TIMER_DELAY_SEC,
+            MessageConst::PROPERTY_TIMER_DELAY_MS,
+            MessageConst::PROPERTY_TIMER_DELIVER_MS,
+        ] {
+            let mut timer = message();
+            timer.put_property(key.into(), "1".into());
+            assert!(super::Validators::check_message(Some(&timer), &ProducerConfig::default()).is_err());
+        }
+    }
+    use crate::test_support::error_assertions::client_exception;
+    use std::collections::HashMap;
+
+    use bytes::Bytes;
+    use rocketmq_model::common::config::TopicConfig;
+    use rocketmq_model::common::message::message_accessor::MessageAccessor;
+    use rocketmq_model::common::message::message_single::Message;
+
+    use super::*;
+
+    #[test]
+    fn check_group_blank_group() {
+        let result = Validators::check_group("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_message_accepts_exact_body_limit_and_rejects_one_byte_over() {
+        let producer_config = ProducerConfig::default();
+        let max_message_size = producer_config.max_message_size() as usize;
+        let exact = Message::builder()
+            .topic("TopicTest")
+            .body(Bytes::from(vec![0_u8; max_message_size]))
+            .build_unchecked();
+        let oversized = Message::builder()
+            .topic("TopicTest")
+            .body(Bytes::from(vec![0_u8; max_message_size + 1]))
+            .build_unchecked();
+
+        assert!(Validators::check_message(Some(&exact), &producer_config).is_ok());
+        assert!(Validators::check_message(Some(&oversized), &producer_config).is_err());
+    }
+
+    #[test]
+    fn check_message_rejects_absent_message() {
+        let producer_config = ProducerConfig::default();
+
+        let error =
+            Validators::check_message(None::<&Message>, &producer_config).expect_err("absent message is rejected");
+
+        assert_eq!(
+            client_exception(&error).response_code(),
+            ResponseCode::MessageIllegal as i32
+        );
+    }
+
+    #[test]
+    fn check_message_rejects_missing_and_empty_body_with_the_same_code() {
+        let producer_config = ProducerConfig::default();
+
+        let no_body = Message::builder().topic("TopicTest").build_unchecked();
+        let error = Validators::check_message(Some(&no_body), &producer_config).expect_err("missing body is rejected");
+        assert_eq!(
+            client_exception(&error).response_code(),
+            ResponseCode::MessageIllegal as i32
+        );
+
+        let empty_body = Message::builder()
+            .topic("TopicTest")
+            .body(Bytes::new())
+            .build_unchecked();
+        let error = Validators::check_message(Some(&empty_body), &producer_config).expect_err("empty body is rejected");
+        assert_eq!(
+            client_exception(&error).response_code(),
+            ResponseCode::MessageIllegal as i32
+        );
+    }
+
+    #[test]
+    fn check_message_rejects_multi_dispatch_property_containing_path_separator() {
+        let producer_config = ProducerConfig::default();
+        let mut msg = Message::builder()
+            .topic("TopicTest")
+            .body(Bytes::from_static(b"body"))
+            .build_unchecked();
+        let separator = std::path::MAIN_SEPARATOR;
+        MessageAccessor::put_property(
+            &mut msg,
+            CheetahString::from_static_str(MessageConst::PROPERTY_INNER_MULTI_DISPATCH),
+            CheetahString::from_string(format!("queue-a{separator}queue-b")),
+        );
+
+        let error = Validators::check_message(Some(&msg), &producer_config)
+            .expect_err("multi-dispatch value containing the path separator is rejected");
+
+        assert_eq!(
+            client_exception(&error).response_code(),
+            ResponseCode::MessageIllegal as i32
+        );
+    }
+
+    #[test]
+    fn check_message_accepts_multi_dispatch_property_without_separator_or_absent() {
+        let producer_config = ProducerConfig::default();
+
+        let plain = Message::builder()
+            .topic("TopicTest")
+            .body(Bytes::from_static(b"body"))
+            .build_unchecked();
+        assert!(Validators::check_message(Some(&plain), &producer_config).is_ok());
+
+        let mut with_property = Message::builder()
+            .topic("TopicTest")
+            .body(Bytes::from_static(b"body"))
+            .build_unchecked();
+        MessageAccessor::put_property(
+            &mut with_property,
+            CheetahString::from_static_str(MessageConst::PROPERTY_INNER_MULTI_DISPATCH),
+            CheetahString::from_static_str("queue-a,queue-b"),
+        );
+        assert!(Validators::check_message(Some(&with_property), &producer_config).is_ok());
+    }
+
+    #[test]
+    fn check_group_long_group() {
+        let long_group = "a".repeat(256);
+        let result = Validators::check_group(&long_group);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_group_matches_java_max_length() {
+        let max_group = "a".repeat(Validators::GROUP_MAX_LENGTH);
+        assert!(Validators::check_group(&max_group).is_ok());
+
+        let too_long_group = "a".repeat(Validators::GROUP_MAX_LENGTH + 1);
+        let result = Validators::check_group(&too_long_group);
+        assert!(result.is_err());
+        assert!(client_exception(&result.unwrap_err())
+            .to_string()
+            .contains("longer than group max length: 255."));
+    }
+
+    #[test]
+    fn check_group_illegal_characters() {
+        let result = Validators::check_group("illegal@group");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_group_valid_group() {
+        let result = Validators::check_group("valid_group");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_topic_blank_topic() {
+        let result = Validators::check_topic("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_topic_long_topic() {
+        let long_topic = "a".repeat(128);
+        let result = Validators::check_topic(&long_topic);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_topic_illegal_characters() {
+        let result = Validators::check_topic("illegal@topic");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_topic_valid_topic() {
+        let result = Validators::check_topic("valid_topic");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_topic_config_invalid_permission() {
+        let topic_config = TopicConfig {
+            perm: 999,
+            ..Default::default()
+        };
+        let result = Validators::check_topic_config(&topic_config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_topic_config_valid_permission() {
+        let topic_config = TopicConfig {
+            perm: 6,
+            ..Default::default()
+        };
+        let result = Validators::check_topic_config(&topic_config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_broker_config_invalid_permission() {
+        let mut broker_config = HashMap::new();
+        broker_config.insert("brokerPermission".to_string(), "999".to_string());
+        let result = Validators::check_broker_config(&broker_config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_broker_config_rejects_non_numeric_permission_without_panic() {
+        let mut broker_config = HashMap::new();
+        broker_config.insert("brokerPermission".to_string(), "abc".to_string());
+        let result = Validators::check_broker_config(&broker_config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_broker_config_valid_permission() {
+        let mut broker_config = HashMap::new();
+        broker_config.insert("brokerPermission".to_string(), "6".to_string());
+        let result = Validators::check_broker_config(&broker_config);
+        assert!(result.is_ok());
+    }
+}

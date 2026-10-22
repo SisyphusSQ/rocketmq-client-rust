@@ -1,0 +1,821 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::HashSet;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+
+use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
+use rocketmq_error::SharedError;
+use rocketmq_runtime::BudgetDimension;
+use rocketmq_runtime::BudgetLimit;
+use rocketmq_runtime::FullPolicy;
+use rocketmq_runtime::RateLimit;
+use rocketmq_runtime::ResourceBudget;
+use rocketmq_runtime::ResourceBudgetTree;
+use rocketmq_runtime::ResourcePermit;
+
+use rocketmq_protocol::protocol::remoting_command::RemotingCommand;
+
+use crate::deadline::RequestDeadline;
+use crate::error_helpers::configuration_invalid_caused_by;
+use crate::error_helpers::connection_failed_without_source;
+use crate::error_helpers::TransportStage;
+
+static NEXT_TABLE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Estimates the heap and inline memory retained while a remoting command is
+/// in flight.
+///
+/// The estimate deliberately includes metadata as well as the body so
+/// header-heavy requests cannot bypass byte admission with an empty body.
+pub(crate) fn materialize_and_estimate_remoting_command_retained_bytes(command: &mut RemotingCommand) -> usize {
+    command.materialize_custom_header_to_ext_fields();
+    let remark_bytes = command.remark().map_or(0, cheetah_string::CheetahString::len);
+    let ext_field_bytes = command.ext_fields().map_or(0, |fields| {
+        fields
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(
+                cheetah_string::CheetahString,
+                cheetah_string::CheetahString,
+            )>())
+            .saturating_add(
+                fields
+                    .iter()
+                    .map(|(key, value)| key.len().saturating_add(value.len()))
+                    .sum::<usize>(),
+            )
+    });
+    let body_bytes = command.body().map_or(0, bytes::Bytes::len);
+
+    std::mem::size_of::<RemotingCommand>()
+        .saturating_add(remark_bytes)
+        .saturating_add(ext_field_bytes)
+        .saturating_add(body_bytes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PendingRequestKey {
+    owner_id: u64,
+    opaque: i32,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingRequestToken {
+    key: PendingRequestKey,
+    reservation: u64,
+}
+
+/// A single physical connection's request-correlation generation.
+///
+/// Owners are never reused within a table. Once an owner is retired by close or
+/// timeout, callers must create a new connection and owner before registering
+/// more requests. This prevents a late response from completing a request on a
+/// replacement connection without retaining an unbounded opaque tombstone set.
+#[derive(Debug, Clone)]
+pub struct PendingRequestOwner {
+    table_id: u64,
+    id: u64,
+    accepting: Arc<AtomicBool>,
+    completion: Arc<tokio::sync::Notify>,
+    // Custom fork: keeping a timed-out socket must not allow a late opaque to
+    // complete a later request. Bounded per-connection state rotates the owner
+    // after 512 abandoned identifiers instead of accumulating tombstones forever.
+    abandoned: Arc<parking_lot::Mutex<HashSet<i32>>>,
+    close_on_timeout: Arc<AtomicBool>,
+    last_inbound_millis: Arc<AtomicU64>,
+}
+
+impl PendingRequestOwner {
+    fn new(table_id: u64, id: u64) -> Self {
+        Self {
+            table_id,
+            id,
+            accepting: Arc::new(AtomicBool::new(true)),
+            completion: Arc::new(tokio::sync::Notify::new()),
+            abandoned: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            close_on_timeout: Arc::new(AtomicBool::new(true)),
+            last_inbound_millis: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn retire(&self) {
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_close_on_timeout(&self, close: bool) {
+        self.close_on_timeout.store(close, Ordering::Release);
+    }
+
+    pub(crate) fn mark_inbound_activity(&self) {
+        self.last_inbound_millis.store(
+            rocketmq_runtime::common::time_utils::current_millis(),
+            Ordering::Release,
+        );
+    }
+
+    pub(crate) fn last_inbound_millis(&self) -> u64 {
+        self.last_inbound_millis.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_inbound_millis_for_test(&self, millis: u64) {
+        self.last_inbound_millis.store(millis, Ordering::Release);
+    }
+
+    fn remember_abandoned(&self, abandoned: &mut HashSet<i32>, opaque: i32, timeout: bool) {
+        if (timeout && self.close_on_timeout.load(Ordering::Acquire)) || abandoned.len() >= 512 {
+            self.retire();
+        } else {
+            abandoned.insert(opaque);
+        }
+    }
+}
+
+struct PendingRequest {
+    reservation: u64,
+    owner: PendingRequestOwner,
+    created_at: Instant,
+    deadline: RequestDeadline,
+    _permit: ResourcePermit,
+    completion: PendingCompletion,
+}
+
+enum PendingCompletion {
+    OneShot(tokio::sync::oneshot::Sender<PendingRequestCompletion>),
+}
+
+impl PendingCompletion {
+    fn complete(self, result: PendingRequestCompletion) {
+        match self {
+            Self::OneShot(sender) => {
+                let _ = sender.send(result);
+            }
+        }
+    }
+}
+
+struct PendingRequestTableInner {
+    table_id: u64,
+    entries: DashMap<PendingRequestKey, PendingRequest>,
+    next_owner: AtomicU64,
+    next_reservation: AtomicU64,
+    #[cfg(test)]
+    default_owner: PendingRequestOwner,
+    budget: ResourceBudget,
+    max_request_age: Duration,
+    rejected_count: AtomicUsize,
+    rejected_bytes: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingRequestLimits {
+    pub max_count: usize,
+    pub max_bytes: usize,
+    pub admission_rate_per_second: u64,
+    pub max_request_age: Duration,
+}
+
+impl Default for PendingRequestLimits {
+    fn default() -> Self {
+        Self {
+            max_count: PendingRequestTable::DEFAULT_CAPACITY,
+            max_bytes: PendingRequestTable::DEFAULT_MAX_BYTES,
+            admission_rate_per_second: PendingRequestTable::DEFAULT_CAPACITY as u64,
+            max_request_age: Duration::from_secs(300),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingRequestUsage {
+    pub count: usize,
+    pub bytes: usize,
+    pub rejected_count: usize,
+    pub rejected_bytes: usize,
+}
+
+pub(crate) enum PendingRegistrationOutcome {
+    Registered(PendingRequestGuard),
+    DeadlineExpired,
+    SessionClosed,
+    QueueSaturated,
+    OperationalFailure(SharedError),
+}
+
+pub(crate) enum PendingRequestCompletion {
+    Response(RemotingCommand),
+    DeadlineExpired,
+    Cancelled,
+    SessionClosed,
+    OperationalFailure(SharedError),
+}
+
+/// What became of a response that arrived for one pending-request owner.
+///
+/// A response can legitimately arrive after its request already settled: the
+/// caller stopped waiting, the request deadline elapsed, or the owning session
+/// started draining and retired the owner. Those cases are reported separately
+/// from a response that does not belong to this table at all, which indicates a
+/// routing or generation mistake rather than ordinary cancellation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingResponseOutcome {
+    /// The response matched a registered request and completed it.
+    Completed,
+    /// No request is registered for the opaque: it already settled.
+    Late,
+    /// The owner belongs to a different pending-request table generation.
+    ForeignOwner,
+}
+
+impl PendingRequestCompletion {
+    #[track_caller]
+    pub(crate) fn operational(error: SharedError) -> Self {
+        Self::OperationalFailure(error)
+    }
+}
+
+/// Concurrent pending request registry with connection-aware, exactly-once completion.
+#[derive(Clone)]
+pub struct PendingRequestTable {
+    inner: Arc<PendingRequestTableInner>,
+}
+
+/// RAII ownership of one pending request reservation.
+pub struct PendingRequestGuard {
+    table: PendingRequestTable,
+    token: Option<PendingRequestToken>,
+    owner: PendingRequestOwner,
+    #[cfg(test)]
+    deadline: RequestDeadline,
+}
+
+impl Default for PendingRequestTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PendingRequestTable {
+    const DEFAULT_CAPACITY: usize = 65_536;
+    const DEFAULT_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+    pub fn new() -> Self {
+        Self::with_limits(PendingRequestLimits::default())
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_limits(PendingRequestLimits {
+            max_count: capacity,
+            ..PendingRequestLimits::default()
+        })
+    }
+
+    /// Builds a table from explicit count, byte, rate, and age limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed configuration error when budget validation fails.
+    pub fn try_with_limits(limits: PendingRequestLimits) -> Result<Self, rocketmq_error::SharedError> {
+        let process_budget = ResourceBudgetTree::new(
+            "standalone-pending-request-process",
+            BudgetLimit::new(limits.max_count.max(1), limits.max_bytes.max(1), FullPolicy::Reject),
+        )
+        .map_err(|error| configuration_invalid_caused_by("transport.pendingRequest.standalone", error))?
+        .root();
+        Self::try_with_limits_and_budget(limits, &process_budget)
+    }
+
+    /// Builds a table below an injected process resource root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed configuration error when the derived budget is invalid.
+    pub fn try_with_limits_and_budget(
+        limits: PendingRequestLimits,
+        process_budget: &ResourceBudget,
+    ) -> Result<Self, rocketmq_error::SharedError> {
+        let process_capacity = process_budget.limit().capacity;
+        let max_count = limits.max_count.max(1).min(process_capacity.count);
+        let max_bytes = limits.max_bytes.max(1).min(process_capacity.bytes);
+        let request_rate = limits.admission_rate_per_second.max(1);
+        let max_request_age = limits.max_request_age;
+        let table_id = NEXT_TABLE_ID.fetch_add(1, Ordering::Relaxed);
+        let budget = process_budget
+            .child(
+                format!("pending-request-table-{table_id}"),
+                BudgetLimit::new(max_count, max_bytes, FullPolicy::Reject)
+                    .with_rate(RateLimit::new(request_rate, request_rate))
+                    .with_max_age(max_request_age),
+            )
+            .map_err(|error| configuration_invalid_caused_by("transport.pendingRequest", error))?;
+        Ok(Self {
+            inner: Arc::new(PendingRequestTableInner {
+                table_id,
+                entries: DashMap::with_capacity(max_count),
+                next_owner: AtomicU64::new(2),
+                next_reservation: AtomicU64::new(1),
+                #[cfg(test)]
+                default_owner: PendingRequestOwner::new(table_id, 1),
+                budget,
+                max_request_age,
+                rejected_count: AtomicUsize::new(0),
+                rejected_bytes: AtomicUsize::new(0),
+            }),
+        })
+    }
+
+    /// Compatibility constructor for callers that cannot return startup
+    /// configuration errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics when process-memory detection or budget validation fails. New
+    /// production composition should use [`Self::try_with_limits`].
+    pub fn with_limits(limits: PendingRequestLimits) -> Self {
+        Self::try_with_limits(limits).unwrap_or_else(|error| panic!("invalid pending request resource limits: {error}"))
+    }
+
+    /// Creates a correlation owner for one physical connection.
+    pub fn new_owner(&self) -> PendingRequestOwner {
+        PendingRequestOwner::new(
+            self.inner.table_id,
+            self.inner.next_owner.fetch_add(1, Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register(
+        &self,
+        opaque: i32,
+        deadline: RequestDeadline,
+        sender: tokio::sync::oneshot::Sender<PendingRequestCompletion>,
+    ) -> PendingRegistrationOutcome {
+        self.register_with_bytes(opaque, deadline, 0, sender)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_with_bytes(
+        &self,
+        opaque: i32,
+        deadline: RequestDeadline,
+        retained_bytes: usize,
+        sender: tokio::sync::oneshot::Sender<PendingRequestCompletion>,
+    ) -> PendingRegistrationOutcome {
+        self.register_for_owner_with_bytes(&self.inner.default_owner, opaque, deadline, retained_bytes, sender)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn register_for_owner(
+        &self,
+        owner: &PendingRequestOwner,
+        opaque: i32,
+        deadline: RequestDeadline,
+        sender: tokio::sync::oneshot::Sender<PendingRequestCompletion>,
+    ) -> PendingRegistrationOutcome {
+        self.register_for_owner_with_bytes(owner, opaque, deadline, 0, sender)
+    }
+
+    pub(crate) fn register_for_owner_with_bytes(
+        &self,
+        owner: &PendingRequestOwner,
+        opaque: i32,
+        deadline: RequestDeadline,
+        retained_bytes: usize,
+        sender: tokio::sync::oneshot::Sender<PendingRequestCompletion>,
+    ) -> PendingRegistrationOutcome {
+        let deadline = deadline.capped(self.inner.max_request_age);
+        if deadline.is_expired() {
+            return PendingRegistrationOutcome::DeadlineExpired;
+        }
+        if owner.table_id != self.inner.table_id {
+            return PendingRegistrationOutcome::OperationalFailure(connection_failed_without_source(
+                TransportStage::Closed,
+            ));
+        }
+        if !owner.accepting.load(Ordering::Acquire) {
+            return PendingRegistrationOutcome::SessionClosed;
+        }
+        let abandoned = owner.abandoned.lock();
+        if abandoned.contains(&opaque) {
+            return PendingRegistrationOutcome::OperationalFailure(Arc::new(rocketmq_error::Error::new(
+                &rocketmq_error::CORE_ARGUMENT_INVALID,
+            )));
+        }
+        let permit = match self.inner.budget.try_acquire_data(retained_bytes) {
+            Ok(permit) => permit,
+            Err(error) => {
+                match error.dimension() {
+                    Some(BudgetDimension::Bytes) => {
+                        self.inner.rejected_bytes.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(BudgetDimension::Count | BudgetDimension::Rate) => {
+                        self.inner.rejected_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => return PendingRegistrationOutcome::SessionClosed,
+                }
+                return PendingRegistrationOutcome::QueueSaturated;
+            }
+        };
+        let reservation = self.inner.next_reservation.fetch_add(1, Ordering::Relaxed);
+        let key = PendingRequestKey {
+            owner_id: owner.id,
+            opaque,
+        };
+        let token = PendingRequestToken { key, reservation };
+        let created_at = Instant::now();
+        let pending = PendingRequest {
+            reservation,
+            owner: owner.clone(),
+            created_at,
+            deadline,
+            _permit: permit,
+            completion: PendingCompletion::OneShot(sender),
+        };
+
+        let result = match self.inner.entries.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(pending);
+                PendingRegistrationOutcome::Registered(PendingRequestGuard {
+                    table: self.clone(),
+                    token: Some(token),
+                    owner: owner.clone(),
+                    #[cfg(test)]
+                    deadline,
+                })
+            }
+            Entry::Occupied(_) => {
+                PendingRegistrationOutcome::OperationalFailure(connection_failed_without_source(TransportStage::Closed))
+            }
+        };
+        if matches!(&result, PendingRegistrationOutcome::Registered(_)) && !owner.accepting.load(Ordering::Acquire) {
+            if let Some(pending) = self.take_token(token) {
+                pending.complete(PendingRequestCompletion::SessionClosed);
+            }
+            return PendingRegistrationOutcome::SessionClosed;
+        }
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_response(&self, opaque: i32, response: RemotingCommand) -> PendingResponseOutcome {
+        self.complete_response_for_owner(&self.inner.default_owner, opaque, response)
+    }
+
+    pub(crate) fn complete_response_for_owner(
+        &self,
+        owner: &PendingRequestOwner,
+        opaque: i32,
+        response: RemotingCommand,
+    ) -> PendingResponseOutcome {
+        if owner.table_id != self.inner.table_id {
+            return PendingResponseOutcome::ForeignOwner;
+        }
+        let Some(pending) = self.take_key(PendingRequestKey {
+            owner_id: owner.id,
+            opaque,
+        }) else {
+            return PendingResponseOutcome::Late;
+        };
+        pending.complete(PendingRequestCompletion::Response(response));
+        PendingResponseOutcome::Completed
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.entries.is_empty()
+    }
+
+    pub fn usage(&self) -> PendingRequestUsage {
+        let snapshot = self.inner.budget.snapshot();
+        PendingRequestUsage {
+            count: snapshot.current_count,
+            bytes: snapshot.current_bytes,
+            rejected_count: self.inner.rejected_count.load(Ordering::Relaxed),
+            rejected_bytes: self.inner.rejected_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn max_request_age(&self) -> Duration {
+        self.inner.max_request_age
+    }
+
+    /// Returns the age of the oldest pending request for low-cardinality diagnostics.
+    pub fn oldest_age(&self, now: Instant) -> Option<Duration> {
+        self.inner.entries.iter().map(|entry| entry.age(now)).max()
+    }
+
+    pub(crate) fn close_owner<F>(&self, owner: &PendingRequestOwner, mut cause: F) -> usize
+    where
+        F: FnMut() -> PendingRequestCompletion,
+    {
+        if owner.table_id != self.inner.table_id {
+            return 0;
+        }
+        owner.accepting.store(false, Ordering::Release);
+        let tokens = self.tokens_for_owner(owner.id);
+        let mut completed = 0;
+        for token in tokens {
+            let Some(pending) = self.take_token(token) else {
+                continue;
+            };
+            pending.complete(cause());
+            completed += 1;
+        }
+        completed
+    }
+
+    /// Stops one connection owner from registering new requests without completing in-flight work.
+    pub(crate) fn retire_owner(&self, owner: &PendingRequestOwner) {
+        if owner.table_id == self.inner.table_id {
+            owner.retire();
+        }
+    }
+
+    /// Returns the current in-flight request count for one connection owner.
+    pub(crate) fn owner_len(&self, owner: &PendingRequestOwner) -> usize {
+        if owner.table_id != self.inner.table_id {
+            return 0;
+        }
+        self.inner
+            .entries
+            .iter()
+            .filter(|entry| entry.key().owner_id == owner.id)
+            .count()
+    }
+
+    /// Waits until an owner's already-registered requests finish or the deadline expires.
+    pub(crate) async fn wait_owner_empty(&self, owner: &PendingRequestOwner, timeout: Duration) -> bool {
+        if owner.table_id != self.inner.table_id {
+            return true;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = owner.completion.notified();
+            if self.owner_len(owner) == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.owner_len(owner) == 0;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_all<F>(&self, mut cause: F) -> usize
+    where
+        F: FnMut() -> PendingRequestCompletion,
+    {
+        let tokens: Vec<PendingRequestToken> = self
+            .inner
+            .entries
+            .iter()
+            .map(|entry| PendingRequestToken {
+                key: *entry.key(),
+                reservation: entry.reservation,
+            })
+            .collect();
+        self.inner.default_owner.retire();
+        let mut completed = 0;
+        for token in tokens {
+            let Some(pending) = self.take_token(token) else {
+                continue;
+            };
+            pending.owner.retire();
+            pending.complete(cause());
+            completed += 1;
+        }
+        completed
+    }
+
+    /// Completes every request whose registered absolute response deadline has elapsed.
+    pub fn expire_due(&self, now: tokio::time::Instant) -> usize {
+        let expired: Vec<(PendingRequestToken, PendingRequestOwner)> = self
+            .inner
+            .entries
+            .iter()
+            .filter(|entry| entry.is_expired(now))
+            .map(|entry| {
+                (
+                    PendingRequestToken {
+                        key: *entry.key(),
+                        reservation: entry.reservation,
+                    },
+                    entry.owner.clone(),
+                )
+            })
+            .collect();
+        let mut completed = 0;
+        for (token, owner) in expired {
+            if self.abandon_token(token, &owner, true, PendingRequestCompletion::DeadlineExpired) {
+                completed += 1;
+            }
+        }
+        completed
+    }
+
+    pub(crate) fn complete_token(&self, token: PendingRequestToken, result: PendingRequestCompletion) -> bool {
+        let Some(pending) = self.take_token(token) else {
+            return false;
+        };
+        pending.complete(result);
+        true
+    }
+
+    fn abandon_token(
+        &self,
+        token: PendingRequestToken,
+        owner: &PendingRequestOwner,
+        timeout: bool,
+        result: PendingRequestCompletion,
+    ) -> bool {
+        let mut abandoned = owner.abandoned.lock();
+        let Some(pending) = self.take_token(token) else {
+            return false;
+        };
+        owner.remember_abandoned(&mut abandoned, token.key.opaque, timeout);
+        drop(abandoned);
+        pending.complete(result);
+        true
+    }
+
+    fn tokens_for_owner(&self, owner_id: u64) -> Vec<PendingRequestToken> {
+        self.inner
+            .entries
+            .iter()
+            .filter(|entry| entry.key().owner_id == owner_id)
+            .map(|entry| PendingRequestToken {
+                key: *entry.key(),
+                reservation: entry.reservation,
+            })
+            .collect()
+    }
+
+    fn take_token(&self, token: PendingRequestToken) -> Option<PendingRequest> {
+        let pending = match self.inner.entries.entry(token.key) {
+            Entry::Occupied(entry) if entry.get().reservation == token.reservation => Some(entry.remove()),
+            Entry::Occupied(_) | Entry::Vacant(_) => None,
+        };
+        if let Some(pending) = &pending {
+            pending.owner.completion.notify_one();
+        }
+        pending
+    }
+
+    fn take_key(&self, key: PendingRequestKey) -> Option<PendingRequest> {
+        let pending = match self.inner.entries.entry(key) {
+            Entry::Occupied(entry) => Some(entry.remove()),
+            Entry::Vacant(_) => None,
+        };
+        if let Some(pending) = &pending {
+            pending.owner.completion.notify_one();
+        }
+        pending
+    }
+}
+
+impl PendingRequestGuard {
+    #[doc(hidden)]
+    pub fn token(&self) -> PendingRequestToken {
+        self.token.expect("active pending request guard must have a token")
+    }
+
+    #[cfg(test)]
+    pub fn deadline(&self) -> RequestDeadline {
+        self.deadline
+    }
+
+    pub(crate) fn complete(mut self, result: PendingRequestCompletion) -> bool {
+        let token = self
+            .token
+            .take()
+            .expect("active pending request guard must have a token");
+        self.table.complete_token(token, result)
+    }
+
+    pub(crate) fn expire_with_error(mut self, source: SharedError) -> SharedError {
+        let token = self
+            .token
+            .take()
+            .expect("active pending request guard must have a token");
+        let error = Arc::clone(&source);
+        self.table.abandon_token(
+            token,
+            &self.owner,
+            true,
+            PendingRequestCompletion::OperationalFailure(source),
+        );
+        error
+    }
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.table
+                .abandon_token(token, &self.owner, false, PendingRequestCompletion::Cancelled);
+        }
+    }
+}
+
+impl PendingRequest {
+    fn complete(self, result: PendingRequestCompletion) {
+        drop(self._permit);
+        self.completion.complete(result);
+    }
+
+    fn age(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.created_at)
+    }
+
+    fn is_expired(&self, now: tokio::time::Instant) -> bool {
+        now >= self.deadline.instant()
+    }
+}
+
+#[cfg(test)]
+mod owner_epoch_tests {
+    use std::collections::HashMap;
+
+    use cheetah_string::CheetahString;
+
+    use super::*;
+
+    #[test]
+    fn retained_byte_estimate_includes_body_and_dynamic_metadata() {
+        let mut command = RemotingCommand::create_remoting_command(7)
+            .set_remark("resource-budget")
+            .set_ext_fields(HashMap::from([(
+                CheetahString::from_static_str("tenant"),
+                CheetahString::from_static_str("tenant-a"),
+            )]))
+            .set_body(vec![1_u8; 1024]);
+
+        let estimate = materialize_and_estimate_remoting_command_retained_bytes(&mut command);
+
+        assert!(estimate >= std::mem::size_of::<RemotingCommand>() + 1024);
+        assert!(estimate > std::mem::size_of::<RemotingCommand>() + 1024 + "resource-budget".len());
+    }
+
+    #[test]
+    fn retired_owner_rejects_registration_without_leaking() {
+        let table = PendingRequestTable::new();
+        let owner = table.new_owner();
+        owner.retire();
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        let result = table.register_for_owner(&owner, 7, RequestDeadline::from_timeout_millis(30_000), sender);
+
+        assert!(matches!(result, PendingRegistrationOutcome::SessionClosed));
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn abandoned_opaque_tracking_is_bounded_and_retires_only_its_connection_owner() {
+        let table = PendingRequestTable::new();
+        let owner = table.new_owner();
+        owner.set_close_on_timeout(false);
+        for opaque in 0..513 {
+            let (sender, _receiver) = tokio::sync::oneshot::channel();
+            let PendingRegistrationOutcome::Registered(guard) =
+                table.register_for_owner(&owner, opaque, RequestDeadline::from_timeout_millis(30000), sender)
+            else {
+                panic!("unique request must fit before the bounded owner retires");
+            };
+            drop(guard);
+        }
+        assert_eq!(owner.abandoned.lock().len(), 512);
+        assert!(!owner.is_accepting());
+        assert!(table.is_empty());
+        let next_owner = table.new_owner();
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        assert!(matches!(
+            table.register_for_owner(&next_owner, 0, RequestDeadline::from_timeout_millis(30000), sender),
+            PendingRegistrationOutcome::Registered(_)
+        ));
+    }
+}

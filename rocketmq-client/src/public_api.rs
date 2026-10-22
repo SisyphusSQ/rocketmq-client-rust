@@ -1,0 +1,202 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Deliberate stable Client entry points.
+
+// Custom fork: expose the canonical companion-crate message types at the SDK entry.
+// Custom fork: explicit business success/failure/unknown receipt operations.
+pub use crate::consumer::consumer_impl::default_lite_pull_consumer_impl::{LitePullBatch, LitePullBusinessOutcome};
+pub use rocketmq_model::common::consumer::consume_from_where::ConsumeFromWhere;
+pub use rocketmq_model::common::message::message_accessor::MessageAccessor;
+pub use rocketmq_model::common::message::message_batch::MessageBatch;
+pub use rocketmq_model::common::message::message_batch::MessageExtBatch;
+pub use rocketmq_model::common::message::message_client_ext::MessageClientExt;
+pub use rocketmq_model::common::message::message_client_id_setter::MessageClientIDSetter;
+pub use rocketmq_model::common::message::message_enum::MessageType;
+pub use rocketmq_model::common::message::message_ext::MessageExt;
+pub use rocketmq_model::common::message::message_ext_broker_inner::MessageExtBrokerInner;
+pub use rocketmq_model::common::message::message_id::MessageId;
+pub use rocketmq_model::common::message::message_queue::MessageQueue;
+pub use rocketmq_model::common::message::message_single::Message;
+pub use rocketmq_model::common::message::MessageConst;
+pub use rocketmq_model::common::message::MessageTrait;
+pub use rocketmq_protocol::protocol::heartbeat::message_model::MessageModel;
+
+#[cfg(feature = "admin-full")]
+pub use crate::admin::AuthAdmin;
+#[cfg(feature = "admin-full")]
+pub use crate::admin::BrokerAdmin;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::BrokerConfigAllowlisted;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::BrokerConfigPatchOutcome;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::BrokerMutationConfigState;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::BrokerReadFailure;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::ConditionalConsumerOffsetOutcome;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::ConsumeStatsReadResult;
+#[cfg(feature = "admin-full")]
+pub use crate::admin::ConsumerAdmin;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::ConsumerConnectionRead;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::ConsumerGroupConfigRead;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::ConsumerProgressRead;
+pub use crate::admin::DefaultMQAdminExt;
+pub use crate::admin::DefaultMQAdminExtImpl;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::InfrastructureObservationReadError;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::InfrastructureObservationReadErrorCode;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::MQAdminConsumerObservationReadExt;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::MQAdminInfrastructureObservationReadExt;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::MQAdminMessageReadExt;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::MQAdminMutationExt;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::MQAdminReadExt;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::MQAdminTopicInventoryReadExt;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::MQAdminTopicStatsReadExt;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::MessageMetadataRead;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::MutationConsumerOffsetPreview;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::MutationExpectedMessageRequestMode;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::MutationExpectedState;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::MutationMessageRequestMode;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::MutationMessageRequestModeOutcome;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::MutationPersistenceState;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::MutationStateCasOutcome;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::MutationSubscriptionGroupConfig;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::MutationSubscriptionGroupConfigState;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::MutationTopicConfig;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::MutationTopicConfigState;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::MutationTopicConfigVersioned;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::MutationTopicMessageType;
+#[cfg(feature = "admin-full")]
+pub use crate::admin::OffsetAdmin;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::ReadFailureCode;
+#[cfg(feature = "admin-full")]
+pub use crate::admin::RouteAdmin;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::SubscriptionGroupConfigPatch;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::SubscriptionGroupConfigPatchOutcome;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::SubscriptionGroupConfigVersioned;
+#[cfg(feature = "admin-full")]
+pub use crate::admin::TopicAdmin;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::TopicConfigPatch;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::TopicConfigPatchOutcome;
+#[cfg(feature = "admin-read")]
+pub use crate::admin::TopicConfigVersioned;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::TopicOffsetMutationFailureCode;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::TopicOffsetMutationOutcome;
+#[cfg(feature = "admin-mutation")]
+pub use crate::admin::TopicOffsetMutationTargetOutcome;
+pub use crate::base::client_config::ClientConfig;
+pub use crate::base::client_options::ClientOptions;
+pub use crate::cluster_session::{
+    client_config_for_managed_domain, rpc_hook_from_outbound_signer, ClientInstanceHandle, ClientRpcHook,
+};
+pub use crate::consumer::AssignmentControl;
+pub use crate::consumer::ConsumerLifecycle;
+pub use crate::consumer::ConsumerOffsetControl;
+pub use crate::consumer::DefaultLitePullConsumer;
+pub use crate::consumer::DefaultMQPushConsumer;
+pub use crate::consumer::MessagePoll;
+pub use crate::consumer::SubscriptionControl;
+pub use crate::nameserver_discovery::DnsName;
+pub use crate::nameserver_discovery::NameServerAuthority;
+pub use crate::nameserver_discovery::NameServerDiscoveryConfig;
+pub use crate::nameserver_discovery::NameServerDiscoveryErrorCategory;
+pub use crate::nameserver_discovery::NameServerDiscoveryFreshness;
+pub use crate::nameserver_discovery::NameServerDiscoverySourceKind;
+pub use crate::nameserver_discovery::NameServerDiscoveryStatus;
+pub use crate::nameserver_discovery::NameServerSource;
+pub use crate::nameserver_discovery::ResolvedNameServerEndpoint;
+pub use crate::producer::transaction_send_result::TransactionEndRequestOutcome;
+pub use crate::producer::DefaultMQProducer;
+pub use crate::producer::MessageQuery;
+pub use crate::producer::MessageRecall;
+pub use crate::producer::MessageSend;
+pub use crate::producer::ProducerConfig;
+pub use crate::producer::ProducerTopicAdmin;
+pub use crate::producer::RequestReply;
+pub use crate::producer::TransactionSend;
+pub use crate::session::ClientSession;
+pub use crate::session::ClientSessionProvider;
+// Custom fork: public dedicated Group/Token connection identity.
+pub use crate::client_error::ClientFailureKind;
+pub use rocketmq_transport::api::ConnectionAuthentication;
+pub use rocketmq_transport::api::{
+    ConnectConfig, MaintenanceConfig, OutboundRequestStage, SocketOptions, TcpKeepaliveConfig,
+};
+
+// Custom: canonical Java 4.6.1 resource/configuration models and complete per-node errors.
+pub use crate::admin::{
+    AclConfig, AdminNodeReport, AdminNodeResult, AdminPartialFailure, AdminProperties, BrokerConfig,
+    BrokerConfigDefaults, BrokerConfigProperty, BrokerPropertyKind, ClusterAclVersionInfo, PlainAccessConfig,
+    BROKER_CONFIG_PROPERTIES,
+};
+pub use rocketmq_model::topic::TopicConfig;
+pub use rocketmq_protocol::protocol::{
+    body::{
+        broker_body::cluster_info::ClusterInfo, kv_table::KVTable,
+        subscription_group_wrapper::SubscriptionGroupWrapper, topic_info_wrapper::TopicConfigSerializeWrapper,
+    },
+    route::{route_data_view::BrokerData, topic_route_data::TopicRouteData},
+    subscription::subscription_group_config::SubscriptionGroupConfig,
+};
+
+// Custom: complete diagnostic/administrative result types, usable by independent applications.
+pub use rocketmq_model::common::tools::{message_track::MessageTrack, track_type::TrackType};
+pub use rocketmq_protocol::protocol::{
+    admin::{
+        consume_stats::ConsumeStats, consume_stats_list::ConsumeStatsList, offset_wrapper::OffsetWrapper,
+        rollback_stats::RollbackStats, topic_offset::TopicOffset, topic_stats_table::TopicStatsTable,
+    },
+    body::{
+        broker_stats_item::BrokerStatsItem, connection::Connection, consume_queue_data::ConsumeQueueData,
+        consume_status::ConsumeStatus, consumer_connection::ConsumerConnection, group_list::GroupList,
+        producer_connection::ProducerConnection, query_consume_queue_response_body::QueryConsumeQueueResponseBody,
+    },
+    subscription::broker_stats_data::BrokerStatsData,
+};

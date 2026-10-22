@@ -1,0 +1,1159 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![allow(
+    dead_code,
+    reason = "legacy private Client items remain under the non-growth lint debt registry"
+)]
+#![recursion_limit = "256"]
+
+extern crate core;
+
+// Define macros at crate root so they're available throughout the crate
+/// Create a client error with optional response code
+#[macro_export]
+macro_rules! mq_client_err {
+    // Handle errors with a custom ResponseCode and formatted string
+    ($response_code:expr, $fmt:expr, $($arg:expr),*) => {{
+        let formatted_msg = format!($fmt, $($arg),*);
+        $crate::ClientError::from($crate::MQClientException::new_with_code(
+            $response_code as i32,
+            formatted_msg,
+        ))
+    }};
+
+    ($response_code:expr, $error_message:expr) => {{
+        $crate::ClientError::from($crate::MQClientException::new_with_code(
+            $response_code as i32,
+            $error_message,
+        ))
+    }};
+
+    // Handle errors without a ResponseCode, using only the error message (accepts both &str and String)
+    ($error_message:expr) => {{
+        $crate::ClientError::from($crate::MQClientException::new($error_message))
+    }};
+}
+
+/// Create a broker operation error
+#[macro_export]
+macro_rules! client_broker_err {
+    // Handle errors with a custom ResponseCode and formatted string
+    ($response_code:expr, $error_message:expr, $broker_addr:expr) => {{
+        $crate::ClientError::broker_operation_failed("BROKER_OPERATION", $response_code as i32, $error_message)
+            .with_broker_addr($broker_addr)
+    }};
+    // Handle errors without a ResponseCode, using only the error message
+    ($response_code:expr, $error_message:expr) => {{
+        $crate::ClientError::broker_operation_failed("BROKER_OPERATION", $response_code as i32, $error_message)
+    }};
+}
+
+mod admin;
+mod base;
+mod client_error;
+// Custom fork: request-code1000 tracking is independent of Apache Trace Topic.
+mod common;
+mod config_support;
+mod consumer;
+pub mod custom_track;
+mod exception;
+mod factory;
+mod hook;
+mod implementation;
+mod latency;
+mod legacy;
+mod lock;
+mod nameserver_discovery;
+pub mod prelude;
+mod producer;
+mod public_api;
+mod runtime;
+mod session;
+mod stat;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+mod trace;
+mod types;
+mod utils;
+
+pub use crate::base::admin_query::{MQAdminQueryFailure, MQAdminQueryOptions, MQAdminQueryReport};
+pub use crate::base::mq_admin::MQAdminContext;
+pub use crate::base::query_result::QueryResult;
+pub use crate::base::MQAdmin;
+// Custom fork: canonical public management and queue-diagnostic models.
+pub use crate::base::MqClientAdmin;
+pub use crate::base::MqClientAdminInner;
+pub use crate::client_error::ClientError;
+pub use crate::client_error::ClientResult;
+pub use crate::common::acl::AclConstants;
+pub use crate::common::acl::AclException;
+pub use crate::common::acl::AclSigner;
+pub use crate::common::acl::AclUtils;
+pub use crate::common::acl::Permission;
+pub use crate::common::acl::SigningAlgorithm;
+pub use crate::common::acl_client_rpc_hook::AclClientRPCHook;
+pub use crate::common::admin_tool_result::AdminToolResult;
+pub use crate::common::admin_tools_result_code_enum::AdminToolsResultCodeEnum;
+pub use crate::common::nameserver_access_config::NameserverAccessConfig;
+pub use crate::common::session_credentials::SessionCredentials;
+pub use crate::common::thread_local_index::ThreadLocalIndex;
+pub use crate::consumer::consumer_impl::process_queue::ProcessQueue;
+pub use crate::consumer::pop_retry_policy::pop_retry_subscription_topics;
+pub use crate::consumer::pop_retry_policy::resolve_pop_retry_topic;
+pub use crate::implementation::mq_admin_impl::MQAdminImpl;
+pub use rocketmq_protocol::protocol::body::{
+    consume_message_directly_result::ConsumeMessageDirectlyResult,
+    consumer_running_info::ConsumerRunningInfo,
+    process_queue_info::ProcessQueueInfo,
+    queue_time_span::QueueTimeSpan,
+    response::{get_consumer_status_body::GetConsumerStatusBody, reset_offset_body::ResetOffsetBody},
+};
+
+mod cluster_session {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use cheetah_string::CheetahString;
+    use rocketmq_protocol::protocol::remoting_command::RemotingCommand;
+    use rocketmq_security_api::OutboundSigner;
+    use rocketmq_security_api::SecurityRequestView;
+    use rocketmq_transport::api::RPCHook;
+
+    pub use rocketmq_model::common::boundary_type::BoundaryType;
+    pub use rocketmq_model::common::message::message_ext::MessageExt;
+    pub use rocketmq_model::common::message::message_queue::MessageQueue;
+    pub use rocketmq_model::common::message::message_queue_assignment::MessageQueueAssignment;
+
+    pub type ClientRpcHook = dyn RPCHook;
+
+    /// Opaque compatibility handle for the Client instance owned by the Proxy
+    /// Cluster worker.
+    ///
+    /// The standard shared owner remains private to Client; the Cluster adapter
+    /// can only use the instance API and keeps cloned handles on its managed worker.
+    pub struct ClientInstanceHandle {
+        inner: Arc<crate::factory::mq_client_instance::MQClientInstance>,
+        pool: crate::implementation::mq_client_manager::ClientPool,
+        token: Mutex<Option<crate::implementation::mq_client_manager::ClientPoolToken>>,
+        operation_gate: Arc<tokio::sync::Mutex<()>>,
+    }
+
+    /// Isolates a managed Client owner in its injected [`crate::ClientPool`] while
+    /// preserving the caller-provided instance name as a readable prefix.
+    pub fn client_config_for_managed_domain(
+        domain_id: u64,
+        mut client_config: crate::base::client_config::ClientConfig,
+    ) -> crate::base::client_config::ClientConfig {
+        client_config.set_instance_name(CheetahString::from_string(format!(
+            "{}#managed-domain-{domain_id}",
+            client_config.instance_name
+        )));
+        client_config
+    }
+
+    impl ClientInstanceHandle {
+        pub fn get_or_create(
+            client_runtime: &crate::runtime::ClientRuntime,
+            domain_id: u64,
+            client_config: crate::base::client_config::ClientConfig,
+            rpc_hook: Option<Arc<ClientRpcHook>>,
+        ) -> crate::ClientResult<Self> {
+            let client_config = client_config_for_managed_domain(domain_id, client_config);
+            let pool = client_runtime.pool().clone();
+            let (inner, token) = pool.get_or_create(client_config, rpc_hook)?.into_parts();
+            Ok(Self {
+                inner,
+                pool,
+                token: Mutex::new(Some(token)),
+                operation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            })
+        }
+
+        pub async fn start(&self) -> crate::ClientResult<()> {
+            let _operation = self.operation().await;
+            self.inner.start().await
+        }
+
+        /// Invokes one canonical Remoting command on a Broker selected by a managed caller.
+        pub async fn invoke_remoting(
+            &self,
+            broker_addr: &CheetahString,
+            request: RemotingCommand,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<RemotingCommand> {
+            let _operation = self.operation().await;
+            self.inner
+                .get_mq_client_api_impl()?
+                .invoke(broker_addr, request, timeout_millis)
+                .await
+        }
+
+        /// Returns low-cardinality NameServer discovery state without endpoint identities.
+        pub async fn nameserver_discovery_status(&self) -> Option<crate::NameServerDiscoveryStatus> {
+            let _operation = self.operation().await;
+            self.inner.nameserver_discovery_status().await
+        }
+
+        pub async fn topic_route(
+            &self,
+            topic: &str,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<Option<rocketmq_protocol::protocol::route::topic_route_data::TopicRouteData>> {
+            let _operation = self.operation().await;
+            self.inner
+                .get_mq_client_api_impl()?
+                .get_topic_route_info_from_name_server(topic, timeout_millis)
+                .await
+        }
+
+        pub async fn lock_batch_mq(
+            &self,
+            broker_addr: &str,
+            request: rocketmq_protocol::protocol::body::request::lock_batch_request_body::LockBatchRequestBody,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<std::collections::HashSet<MessageQueue>> {
+            let _operation = self.operation().await;
+            self.inner
+                .get_mq_client_api_impl()?
+                .lock_batch_mq(broker_addr, request, timeout_millis)
+                .await
+        }
+
+        pub async fn unlock_batch_mq(
+            &self,
+            broker_addr: &CheetahString,
+            request: rocketmq_protocol::protocol::body::unlock_batch_request_body::UnlockBatchRequestBody,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<()> {
+            let _operation = self.operation().await;
+            self.inner
+                .get_mq_client_api_impl()?
+                .unlock_batch_mq(broker_addr, request, timeout_millis, false)
+                .await
+        }
+
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "mirrors the RocketMQ query-assignment wire contract"
+        )]
+        pub async fn query_assignment(
+            &self,
+            broker_addr: &CheetahString,
+            topic: CheetahString,
+            consumer_group: CheetahString,
+            client_id: CheetahString,
+            strategy_name: CheetahString,
+            message_model: rocketmq_protocol::protocol::heartbeat::message_model::MessageModel,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<Option<Vec<MessageQueueAssignment>>> {
+            let _operation = self.operation().await;
+            self.inner
+                .get_mq_client_api_impl()?
+                .query_assignment(
+                    broker_addr,
+                    topic,
+                    consumer_group,
+                    client_id,
+                    strategy_name,
+                    message_model,
+                    rocketmq_transport::api::RequestDeadline::from_timeout_millis(timeout_millis),
+                )
+                .await
+                .map_err(assignment_query_error)
+                .map(|assignments| assignments.map(|items| items.into_iter().collect()))
+        }
+
+        pub async fn pop_message(
+            &self,
+            broker_name: &CheetahString,
+            broker_addr: &CheetahString,
+            request: rocketmq_protocol::protocol::header::pop_message_request_header::PopMessageRequestHeader,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<crate::consumer::pop_result::PopResult> {
+            let _operation = self.operation().await;
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            self.inner
+                .get_mq_client_api_impl()?
+                .pop_message_async(
+                    broker_name,
+                    broker_addr,
+                    request,
+                    timeout_millis,
+                    OwnedPopCallback { sender: Some(sender) },
+                )
+                .await?;
+            receiver.await.unwrap_or_else(|source| {
+                Err(crate::ClientError::internal(
+                    "receive client pop callback result",
+                    source,
+                ))
+            })
+        }
+
+        pub async fn ack_message(
+            &self,
+            broker_addr: &CheetahString,
+            request: rocketmq_protocol::protocol::header::ack_message_request_header::AckMessageRequestHeader,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<crate::consumer::ack_result::AckResult> {
+            let _operation = self.operation().await;
+            self.inner
+                .get_mq_client_api_impl()?
+                .ack_message(broker_addr, request, timeout_millis)
+                .await
+        }
+
+        pub async fn batch_ack_message(
+            &self,
+            broker_addr: &CheetahString,
+            request: rocketmq_protocol::protocol::body::batch_ack_message_request_body::BatchAckMessageRequestBody,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<crate::consumer::ack_result::AckResult> {
+            let _operation = self.operation().await;
+            self.inner
+                .get_mq_client_api_impl()?
+                .batch_ack_message(broker_addr, request, timeout_millis)
+                .await
+        }
+
+        #[cfg(feature = "admin-mutation")]
+        pub async fn sync_lite_subscription(
+            &self,
+            broker_addr: &CheetahString,
+            request: rocketmq_model::common::lite::LiteSubscriptionDTO,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<()> {
+            let _operation = self.operation().await;
+            self.inner
+                .get_mq_client_api_impl()?
+                .sync_lite_subscription_async(broker_addr, request, timeout_millis)
+                .await
+        }
+
+        pub async fn change_invisible_time(
+            &self,
+            broker_name: &CheetahString,
+            broker_addr: &CheetahString,
+            request: rocketmq_protocol::protocol::header::change_invisible_time_request_header::ChangeInvisibleTimeRequestHeader,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<crate::consumer::ack_result::AckResult> {
+            let _operation = self.operation().await;
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            self.inner
+                .get_mq_client_api_impl()?
+                .change_invisible_time_async(
+                    broker_name,
+                    broker_addr,
+                    request,
+                    timeout_millis,
+                    OwnedAckCallback::new(sender),
+                )
+                .await?;
+            receiver.await.unwrap_or_else(|source| {
+                Err(crate::ClientError::internal(
+                    "receive client change-invisible callback result",
+                    source,
+                ))
+            })
+        }
+
+        pub async fn end_transaction(
+            &self,
+            broker_addr: &CheetahString,
+            request: rocketmq_protocol::protocol::header::end_transaction_request_header::EndTransactionRequestHeader,
+            remark: CheetahString,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<()> {
+            let _operation = self.operation().await;
+            self.inner
+                .get_mq_client_api_impl()?
+                .end_transaction_oneway(broker_addr, request, remark, timeout_millis)
+                .await
+        }
+
+        pub async fn find_subscribe_broker_addr(
+            &self,
+            broker_name: &CheetahString,
+            broker_id: u64,
+            only_this_broker: bool,
+        ) -> Option<CheetahString> {
+            let _operation = self.operation().await;
+            let instance = self.inner.clone();
+            instance
+                .find_broker_address_in_subscribe(broker_name, broker_id, only_this_broker)
+                .await
+                .map(|found| found.broker_addr)
+        }
+
+        pub async fn refresh_topic_route(&self, topic: &CheetahString) -> bool {
+            let _operation = self.operation().await;
+            let instance = self.inner.clone();
+            instance.update_topic_route_info_from_name_server_topic(topic).await
+        }
+
+        pub async fn broker_name_for_queue(&self, queue: &MessageQueue) -> CheetahString {
+            let _operation = self.operation().await;
+            self.inner.get_broker_name_from_message_queue(queue).await
+        }
+
+        pub async fn pull_outcome_from_broker(
+            &self,
+            broker_addr: &str,
+            request: rocketmq_protocol::protocol::header::pull_message_request_header::PullMessageRequestHeader,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<rocketmq_model::result::PullOutcome<MessageExt>> {
+            let _operation = self.operation().await;
+            let result = self
+                .inner
+                .pull_message_from_broker(broker_addr, request, timeout_millis)
+                .await?;
+            Ok((&result).into())
+        }
+
+        #[allow(clippy::too_many_arguments, reason = "mirrors the RocketMQ send-back wire contract")]
+        pub async fn consumer_send_message_back(
+            &self,
+            broker_addr: &str,
+            broker_name: Option<&str>,
+            message: &MessageExt,
+            consumer_group: &str,
+            delay_level: i32,
+            timeout_millis: u64,
+            max_consume_retry_times: i32,
+        ) -> crate::ClientResult<()> {
+            let _operation = self.operation().await;
+            self.inner
+                .consumer_send_message_back(
+                    broker_addr,
+                    broker_name,
+                    message,
+                    consumer_group,
+                    delay_level,
+                    timeout_millis,
+                    max_consume_retry_times,
+                )
+                .await
+        }
+
+        pub async fn update_consumer_offset(
+            &self,
+            broker_addr: &CheetahString,
+            request: rocketmq_protocol::protocol::header::update_consumer_offset_header::UpdateConsumerOffsetRequestHeader,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<()> {
+            let _operation = self.operation().await;
+            self.inner
+                .update_consumer_offset(broker_addr, request, timeout_millis)
+                .await
+        }
+
+        pub async fn query_consumer_offset(
+            &self,
+            broker_addr: &str,
+            request: rocketmq_protocol::protocol::header::query_consumer_offset_request_header::QueryConsumerOffsetRequestHeader,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<i64> {
+            let _operation = self.operation().await;
+            self.inner
+                .query_consumer_offset(broker_addr, request, timeout_millis)
+                .await
+        }
+
+        pub async fn min_offset(
+            &self,
+            broker_addr: &str,
+            queue: &MessageQueue,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<i64> {
+            let _operation = self.operation().await;
+            self.inner.get_min_offset(broker_addr, queue, timeout_millis).await
+        }
+
+        pub async fn max_offset(
+            &self,
+            broker_addr: &str,
+            queue: &MessageQueue,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<i64> {
+            let _operation = self.operation().await;
+            self.inner.get_max_offset(broker_addr, queue, timeout_millis).await
+        }
+
+        pub async fn search_offset(
+            &self,
+            broker_addr: &str,
+            queue: &MessageQueue,
+            timestamp: i64,
+            boundary_type: BoundaryType,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<i64> {
+            let _operation = self.operation().await;
+            self.inner
+                .search_offset_by_timestamp(broker_addr, queue, timestamp, boundary_type, timeout_millis)
+                .await
+        }
+
+        pub async fn topic_config(
+            &self,
+            broker_addr: &CheetahString,
+            topic: CheetahString,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<rocketmq_model::common::config::TopicConfig> {
+            let _operation = self.operation().await;
+            self.inner.get_topic_config(broker_addr, topic, timeout_millis).await
+        }
+
+        pub async fn subscription_group_config(
+            &self,
+            broker_addr: &CheetahString,
+            group: CheetahString,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<
+            rocketmq_protocol::protocol::subscription::subscription_group_config::SubscriptionGroupConfig,
+        > {
+            let _operation = self.operation().await;
+            self.inner
+                .get_subscription_group_config(broker_addr, group, timeout_millis)
+                .await
+        }
+
+        pub async fn broker_cluster_info(
+            &self,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<rocketmq_protocol::protocol::body::broker_body::cluster_info::ClusterInfo> {
+            let _operation = self.operation().await;
+            self.inner.get_broker_cluster_info(timeout_millis).await
+        }
+
+        pub async fn user(
+            &self,
+            broker_addr: CheetahString,
+            username: CheetahString,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<Option<rocketmq_protocol::protocol::body::user_info::UserInfo>> {
+            let _operation = self.operation().await;
+            self.inner.get_user(broker_addr, username, timeout_millis).await
+        }
+
+        pub async fn acl(
+            &self,
+            broker_addr: CheetahString,
+            subject: CheetahString,
+            timeout_millis: u64,
+        ) -> crate::ClientResult<Option<rocketmq_protocol::protocol::body::acl_info::AclInfo>> {
+            let _operation = self.operation().await;
+            self.inner.get_acl(broker_addr, subject, timeout_millis).await
+        }
+
+        pub async fn shutdown_owned(&self) {
+            let token = self
+                .token
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let Some(token) = token else {
+                return;
+            };
+            let _operation = self.operation().await;
+            self.pool.release(token).await;
+        }
+
+        async fn operation(&self) -> tokio::sync::OwnedMutexGuard<()> {
+            self.operation_gate.clone().lock_owned().await
+        }
+    }
+
+    fn assignment_query_error(input: crate::common::retry_policy::RetryInput) -> crate::ClientError {
+        use crate::common::retry_policy::RetryInput;
+        use crate::ClientError;
+        use rocketmq_error::fields;
+        use rocketmq_error::Error;
+        use rocketmq_error::ErrorContext;
+        use rocketmq_transport::api::OutboundRequestContractReason;
+        use rocketmq_transport::api::OutboundRequestRejectionReason;
+
+        match input {
+            RetryInput::Transport(error) => ClientError::from_shared(error.into_shared_error()),
+            RetryInput::Rejected(rejection) => match rejection.reason() {
+                OutboundRequestRejectionReason::DeadlineExpired => {
+                    let mut context = ErrorContext::new().with_text(fields::OPERATION_DIAGNOSTIC, "query_assignment");
+                    if let Some(timeout_millis) = rejection.timeout_millis() {
+                        context = context.with_u64(fields::TIMEOUT_MS, timeout_millis);
+                    }
+                    ClientError::from_shared(Arc::new(
+                        Error::new(&rocketmq_error::CORE_OPERATION_TIMED_OUT).with_context(context),
+                    ))
+                }
+                OutboundRequestRejectionReason::ClientStopping => ClientError::not_started(),
+                OutboundRequestRejectionReason::QueueSaturated => ClientError::from_shared(Arc::new(Error::new(
+                    &rocketmq_error::TRANSPORT_ADMISSION_QUEUE_SATURATED,
+                ))),
+                OutboundRequestRejectionReason::Cancelled
+                | OutboundRequestRejectionReason::SessionClosed
+                | OutboundRequestRejectionReason::EndpointUnavailable => {
+                    ClientError::from_shared(Arc::new(Error::new(&rocketmq_error::TRANSPORT_CONNECTION_FAILED)))
+                }
+            },
+            RetryInput::Contract(contract) => match contract.reason() {
+                OutboundRequestContractReason::NameServerEndpointMissing => {
+                    ClientError::from_shared(Arc::new(Error::new(&rocketmq_error::TRANSPORT_CONNECTION_FAILED)))
+                }
+            },
+            RetryInput::Response { terminal_error, .. } | RetryInput::BusinessError(terminal_error) => terminal_error,
+            // The query-assignment wire operation cannot construct producer send status or
+            // route-selection inputs; MQClientInstance owns route selection before this facade.
+            RetryInput::SendStatus(_) | RetryInput::RouteUnavailable => {
+                unreachable!("query-assignment API returned an unrelated retry input")
+            }
+        }
+    }
+
+    impl Drop for ClientInstanceHandle {
+        fn drop(&mut self) {
+            if self
+                .token
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+            {
+                tracing::warn!(
+                    client_id = %self.inner.client_id,
+                    "managed Client handle dropped before asynchronous shutdown completed"
+                );
+            }
+        }
+    }
+
+    struct OwnedPopCallback {
+        sender: Option<tokio::sync::oneshot::Sender<crate::ClientResult<crate::consumer::pop_result::PopResult>>>,
+    }
+
+    impl crate::consumer::pop_callback::PopCallback for OwnedPopCallback {
+        async fn on_success(&mut self, pop_result: crate::consumer::pop_result::PopResult) {
+            if let Some(sender) = self.sender.take() {
+                let _ = sender.send(Ok(pop_result));
+            }
+        }
+
+        fn on_error(&mut self, error: crate::ClientError) {
+            if let Some(sender) = self.sender.take() {
+                let _ = sender.send(Err(error));
+            }
+        }
+    }
+
+    struct OwnedAckCallback {
+        sender:
+            Mutex<Option<tokio::sync::oneshot::Sender<crate::ClientResult<crate::consumer::ack_result::AckResult>>>>,
+    }
+
+    impl OwnedAckCallback {
+        fn new(
+            sender: tokio::sync::oneshot::Sender<crate::ClientResult<crate::consumer::ack_result::AckResult>>,
+        ) -> Self {
+            Self {
+                sender: Mutex::new(Some(sender)),
+            }
+        }
+
+        fn send(&self, result: crate::ClientResult<crate::consumer::ack_result::AckResult>) {
+            let mut sender = match self.sender.lock() {
+                Ok(sender) => sender,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(sender) = sender.take() {
+                let _ = sender.send(result);
+            }
+        }
+    }
+
+    impl crate::consumer::ack_callback::AckCallback for OwnedAckCallback {
+        fn on_success(&self, ack_result: crate::consumer::ack_result::AckResult) {
+            self.send(Ok(ack_result));
+        }
+
+        fn on_exception(&self, error: crate::ClientError) {
+            self.send(Err(error));
+        }
+    }
+
+    pub fn rpc_hook_from_outbound_signer(signer: Arc<dyn OutboundSigner>) -> Arc<ClientRpcHook> {
+        Arc::new(OutboundSignerRpcHook { signer })
+    }
+
+    struct OutboundSignerRpcHook {
+        signer: Arc<dyn OutboundSigner>,
+    }
+
+    impl RPCHook for OutboundSignerRpcHook {
+        fn do_before_request(
+            &self,
+            _remote_addr: SocketAddr,
+            request: &mut RemotingCommand,
+        ) -> Result<(), rocketmq_error::SharedError> {
+            // RPCHook callers normally serialize the custom header first, but
+            // keep the adapter correct when invoked directly or by another
+            // Client transport path.
+            request.make_custom_header_to_net();
+            let empty_fields = HashMap::new();
+            let fields = request.ext_fields().unwrap_or(&empty_fields);
+            let signature = self
+                .signer
+                .sign(SecurityRequestView::new(
+                    request.code(),
+                    request.version(),
+                    fields,
+                    request.body().map(AsRef::as_ref),
+                    None,
+                ))
+                .map_err(|source| source.into_shared_error())?;
+
+            request.ensure_ext_fields_initialized();
+            for (key, value) in signature.fields() {
+                request.add_ext_field(key.clone(), value.expose_secret().clone());
+            }
+            Ok(())
+        }
+
+        fn do_after_response(
+            &self,
+            _remote_addr: SocketAddr,
+            _request: &RemotingCommand,
+            _response: &mut RemotingCommand,
+        ) -> Result<(), rocketmq_error::SharedError> {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::Arc;
+
+        use super::rpc_hook_from_outbound_signer;
+        use super::ClientInstanceHandle;
+        use super::OutboundSigner;
+        use super::RemotingCommand;
+        use super::SecurityRequestView;
+        use rocketmq_protocol::code::request_code::RequestCode;
+        use rocketmq_protocol::protocol::header::client_request_header::GetRouteInfoRequestHeader;
+        use rocketmq_security_api::Secret;
+        use rocketmq_security_api::SecurityOperation;
+        use rocketmq_security_api::SecurityProviderError;
+        use rocketmq_security_api::SecurityProviderFailure;
+        use rocketmq_security_api::Signature;
+
+        struct FixedSigner;
+
+        impl OutboundSigner for FixedSigner {
+            fn sign(&self, request: SecurityRequestView<'_>) -> Result<Signature, SecurityProviderError> {
+                assert_eq!(
+                    request.fields().get("topic").map(|value| value.as_str()),
+                    Some("TopicA")
+                );
+                Ok(Signature::new(vec![
+                    ("AccessKey".into(), Secret::new("cluster-client".into())),
+                    ("Signature".into(), Secret::new("redacted-signature".into())),
+                ]))
+            }
+        }
+
+        struct FailingSigner;
+
+        impl OutboundSigner for FailingSigner {
+            fn sign(&self, _request: SecurityRequestView<'_>) -> Result<Signature, SecurityProviderError> {
+                Err(SecurityProviderError::caused_by(
+                    SecurityProviderFailure::OperationFailed,
+                    SecurityOperation::SignRequest,
+                    std::io::Error::other("secret signing diagnostic"),
+                ))
+            }
+        }
+
+        #[test]
+        fn outbound_signer_adapter_applies_fields_to_client_rpc_request() {
+            let hook = rpc_hook_from_outbound_signer(Arc::new(FixedSigner));
+            let mut request = RemotingCommand::create_request_command(
+                RequestCode::GetRouteinfoByTopic,
+                GetRouteInfoRequestHeader::new("TopicA", None),
+            );
+
+            hook.do_before_request("127.0.0.1:9876".parse().unwrap(), &mut request)
+                .unwrap();
+
+            let fields = request.ext_fields().unwrap();
+            assert_eq!(
+                fields.get("AccessKey").map(|value| value.as_str()),
+                Some("cluster-client")
+            );
+            assert_eq!(
+                fields.get("Signature").map(|value| value.as_str()),
+                Some("redacted-signature")
+            );
+        }
+
+        #[test]
+        fn outbound_signer_adapter_redacts_signer_failures() {
+            let hook = rpc_hook_from_outbound_signer(Arc::new(FailingSigner));
+            let mut request = RemotingCommand::create_request_command(
+                RequestCode::GetRouteinfoByTopic,
+                GetRouteInfoRequestHeader::new("TopicA", None),
+            );
+
+            let error = hook
+                .do_before_request("127.0.0.1:9876".parse().unwrap(), &mut request)
+                .expect_err("signing failure must fail closed");
+            let message = error.to_string();
+            assert!(message.contains("auth.security_provider.operation_failed"));
+            assert!(!message.contains("secret signing diagnostic"));
+            assert_eq!(error.descriptor(), &rocketmq_error::SECURITY_PROVIDER_OPERATION_FAILED);
+            let io = std::error::Error::source(error.as_ref()).expect("I/O cause must remain available");
+            assert!(io.downcast_ref::<std::io::Error>().is_some());
+        }
+
+        #[tokio::test]
+        async fn managed_client_is_shared_until_the_last_owner_releases_it() {
+            let runtime = crate::runtime::test_client_runtime("managed-client-shared-test");
+            let domain_id = 71_001;
+            let mut config = crate::base::client_config::ClientConfig::default();
+            config.set_instance_name("managed-client-shared".into());
+
+            let first = ClientInstanceHandle::get_or_create(&runtime, domain_id, config.clone(), None).unwrap();
+            let second = ClientInstanceHandle::get_or_create(&runtime, domain_id, config, None).unwrap();
+
+            assert!(Arc::ptr_eq(&first.inner, &second.inner));
+            assert_eq!(runtime.pool().instance_count(), 1);
+
+            first.shutdown_owned().await;
+            assert_eq!(runtime.pool().instance_count(), 1);
+
+            second.shutdown_owned().await;
+            assert_eq!(runtime.pool().instance_count(), 0);
+        }
+
+        #[tokio::test]
+        async fn managed_client_rejects_conflicting_configuration_for_the_same_identity() {
+            let runtime = crate::runtime::test_client_runtime("managed-client-conflict-test");
+            let domain_id = 71_002;
+            let mut first_config = crate::base::client_config::ClientConfig::default();
+            first_config.set_instance_name("managed-client-conflict".into());
+            first_config.set_namesrv_addr("127.0.0.1:9876".into());
+            let mut second_config = first_config.clone();
+            second_config.set_namesrv_addr("127.0.0.2:9876".into());
+
+            let first = ClientInstanceHandle::get_or_create(&runtime, domain_id, first_config, None).unwrap();
+            let error = ClientInstanceHandle::get_or_create(&runtime, domain_id, second_config, None)
+                .err()
+                .expect("conflicting managed configuration must fail closed");
+
+            assert!(error.is(&rocketmq_error::CORE_ARGUMENT_INVALID));
+            first.shutdown_owned().await;
+        }
+
+        #[tokio::test]
+        async fn managed_client_isolated_across_runtime_domains() {
+            let mut config = crate::base::client_config::ClientConfig::default();
+            config.set_instance_name("managed-client-cross-domain".into());
+            let first_runtime = crate::runtime::test_client_runtime("managed-client-domain-a");
+            let second_runtime = crate::runtime::test_client_runtime("managed-client-domain-b");
+            let first = ClientInstanceHandle::get_or_create(&first_runtime, 71_004, config.clone(), None).unwrap();
+            let second = ClientInstanceHandle::get_or_create(&second_runtime, 71_004, config, None).unwrap();
+
+            assert!(!Arc::ptr_eq(&first.inner, &second.inner));
+            assert_eq!(first_runtime.pool().instance_count(), 1);
+            assert_eq!(second_runtime.pool().instance_count(), 1);
+
+            first.shutdown_owned().await;
+            assert_eq!(first_runtime.pool().instance_count(), 0);
+            assert_eq!(second_runtime.pool().instance_count(), 1);
+            second.shutdown_owned().await;
+            assert_eq!(second_runtime.pool().instance_count(), 0);
+        }
+
+        #[tokio::test]
+        async fn releasing_the_last_lease_prevents_manager_aba_reuse() {
+            let runtime = crate::runtime::test_client_runtime("managed-client-aba-test");
+            let mut config = crate::base::client_config::ClientConfig::default();
+            config.set_instance_name("managed-client-aba".into());
+            let first = ClientInstanceHandle::get_or_create(&runtime, 71_008, config.clone(), None).unwrap();
+            first.shutdown_owned().await;
+
+            let second = ClientInstanceHandle::get_or_create(&runtime, 71_008, config, None).unwrap();
+            assert!(!Arc::ptr_eq(&first.inner, &second.inner));
+            second.shutdown_owned().await;
+        }
+    }
+}
+pub use crate::consumer::classic_pull_business::{
+    ClassicPullBatch, ClassicPullBusinessReceipt, ClassicSendBackFailure, ClassicSendBackOutcome,
+};
+pub use crate::consumer::consumer_impl::pull_request_ext::PullResultExt;
+pub use crate::consumer::default_mq_pull_consumer::ClassicPullRequest;
+pub use crate::consumer::listener::message_listener_concurrently::ArcMessageListenerConcurrently;
+pub use crate::consumer::listener::message_listener_orderly::ArcMessageListenerOrderly;
+pub use crate::consumer::mq_pull_consumer_schedule_service::PullScheduleSnapshot;
+pub use crate::consumer::notify_result::NotifyResult;
+pub use crate::consumer::pull_result::PullOutcome;
+pub use crate::consumer::AbstractAllocateMessageQueueStrategy;
+pub use crate::consumer::AckCallback;
+pub use crate::consumer::AckCallbackFn;
+pub use crate::consumer::AckResult;
+pub use crate::consumer::AckStatus;
+pub use crate::consumer::AllocateMachineRoomNearby;
+pub use crate::consumer::AllocateMessageQueueAveragely;
+pub use crate::consumer::AllocateMessageQueueAveragelyByCircle;
+pub use crate::consumer::AllocateMessageQueueByConfig;
+pub use crate::consumer::AllocateMessageQueueByMachineRoom;
+pub use crate::consumer::AllocateMessageQueueByMachineRoomNearby;
+pub use crate::consumer::AllocateMessageQueueConsistentHash;
+pub use crate::consumer::AllocateMessageQueueStrategy;
+pub use crate::consumer::ArcMessageQueueListener;
+pub use crate::consumer::ClassicPullCallback;
+pub use crate::consumer::ConsumeConcurrentlyContext;
+pub use crate::consumer::ConsumeConcurrentlyStatus;
+pub use crate::consumer::ConsumeOrderlyContext;
+pub use crate::consumer::ConsumeOrderlyStatus;
+pub use crate::consumer::ConsumerTuningProfile;
+pub use crate::consumer::ControllableOffset;
+pub use crate::consumer::DefaultLitePullConsumerBuilder;
+#[allow(deprecated)]
+pub use crate::consumer::DefaultMQPullConsumer;
+pub use crate::consumer::DefaultMQPullConsumerBuilder;
+pub use crate::consumer::DefaultMQPushConsumerBuilder;
+pub use crate::consumer::HashFunction;
+pub use crate::consumer::LocalFileOffsetStore;
+pub use crate::consumer::MQConsumer;
+pub use crate::consumer::MQConsumerInner;
+#[allow(deprecated)]
+pub use crate::consumer::MQPullConsumer;
+pub use crate::consumer::MQPushConsumer;
+pub use crate::consumer::MachineRoomResolver;
+pub use crate::consumer::MessageListener;
+pub use crate::consumer::MessageListenerConcurrently;
+pub use crate::consumer::MessageListenerOrderly;
+pub use crate::consumer::MessageQueueListener;
+pub use crate::consumer::MessageSelector;
+pub use crate::consumer::OffsetSerialize;
+pub use crate::consumer::OffsetSerializeWrapper;
+pub use crate::consumer::OffsetStore;
+pub use crate::consumer::PopCallback;
+pub use crate::consumer::PopCallbackFn;
+pub use crate::consumer::PopResult;
+pub use crate::consumer::PopStatus;
+pub use crate::consumer::PullCallback;
+pub use crate::consumer::PullCallbackFn;
+pub use crate::consumer::PullOptions;
+pub use crate::consumer::PullResult;
+pub use crate::consumer::PullStatus;
+pub use crate::consumer::ReadOffsetType;
+pub use crate::consumer::RemoteBrokerOffsetStore;
+pub use crate::consumer::TopicMessageQueueChangeListener;
+pub use crate::exception::MQBrokerException;
+pub use crate::exception::MQClientException;
+pub use crate::exception::OffsetNotFoundException;
+pub use crate::exception::RequestTimeoutException;
+pub use crate::hook::check_forbidden_context::CheckForbiddenContext;
+pub use crate::hook::check_forbidden_hook::CheckForbiddenHook;
+pub use crate::hook::consume_message_context::ConsumeMessageContext;
+pub use crate::hook::consume_message_hook::ConsumeMessageHook;
+pub use crate::hook::consume_message_hook::ConsumeMessageHookArc;
+pub use crate::hook::namespace_rpc_hook::NamespaceRpcHook;
+pub use crate::implementation::mq_client_api_factory::MQClientAPIFactory;
+pub use crate::implementation::mq_client_api_impl::AdminClient;
+pub use crate::implementation::mq_client_api_impl::ConsumerClient;
+pub use crate::implementation::mq_client_api_impl::ProducerClient;
+pub use crate::implementation::mq_client_api_impl::RouteClient;
+pub use crate::implementation::mq_client_api_impl::TransactionClient;
+pub use crate::implementation::mq_client_manager::ClientPool;
+pub use crate::latency::BrokerFilter;
+pub use crate::latency::MQFaultStrategy;
+pub use crate::latency::Resolver;
+pub use crate::latency::ServiceDetector;
+#[allow(deprecated)]
+pub use crate::legacy::ConsumeMessageOpenTracingHookImpl;
+pub use crate::legacy::ConsumeRequest;
+#[allow(deprecated)]
+pub use crate::legacy::DefaultMQPullConsumerImpl;
+pub use crate::legacy::DoNothingClientRemotingProcessor;
+#[allow(deprecated)]
+pub use crate::legacy::EndTransactionOpenTracingHookImpl;
+#[allow(deprecated)]
+pub use crate::legacy::MQHelper;
+#[allow(deprecated)]
+pub use crate::legacy::MQPullConsumerScheduleService;
+#[allow(deprecated)]
+pub use crate::legacy::PullTaskCallback;
+#[allow(deprecated)]
+pub use crate::legacy::PullTaskContext;
+#[allow(deprecated)]
+pub use crate::legacy::PullTaskImpl;
+pub use crate::legacy::RebalanceImpl;
+#[allow(deprecated)]
+pub use crate::legacy::RebalancePullImpl;
+#[allow(deprecated)]
+pub use crate::legacy::SendMessageOpenTracingHookImpl;
+#[allow(deprecated)]
+pub use crate::lock::ReadWriteCASLock;
+pub use crate::producer::send_callback::ArcSendCallback;
+pub use crate::producer::transaction_listener::ArcTransactionListener;
+pub use crate::producer::BatchSendCallbackRequest;
+pub use crate::producer::BatchSendRequest;
+pub use crate::producer::JavaHashCode;
+pub use crate::producer::LocalTransactionState;
+pub use crate::producer::MessageQueueSelector;
+pub use crate::producer::MessageQueueSelectorFn;
+pub use crate::producer::ProducerLifecycle;
+pub use crate::producer::ProducerQueryRequest;
+pub use crate::producer::ProducerQueryResponse;
+pub use crate::producer::RecallRequest;
+pub use crate::producer::RequestCallback;
+pub use crate::producer::RequestReplyCallbackRequest;
+pub use crate::producer::RequestReplyRequest;
+pub use crate::producer::SelectMessageQueueByHash;
+pub use crate::producer::SelectMessageQueueByMachineRoom;
+pub use crate::producer::SelectMessageQueueByRandom;
+pub use crate::producer::SelectedRequestReplyCallbackRequest;
+pub use crate::producer::SelectedRequestReplyRequest;
+pub use crate::producer::SelectedSendCallbackRequest;
+pub use crate::producer::SelectedSendRequest;
+pub use crate::producer::SendCallback;
+pub use crate::producer::SendCallbackRequest;
+pub use crate::producer::SendDestination;
+pub use crate::producer::SendMode;
+pub use crate::producer::SendRequest;
+pub use crate::producer::SendResult;
+pub use crate::producer::SendStatus;
+pub use crate::producer::TopicCreateRequest;
+pub use crate::producer::TransactionListener;
+pub use crate::producer::TransactionMQProducer;
+pub use crate::producer::TransactionMQProducerBuilder;
+pub use crate::producer::TransactionSendRequest;
+pub use crate::producer::TransactionSendResult;
+pub use crate::runtime::ClientMetrics;
+pub use crate::runtime::ClientRuntime;
+pub use crate::runtime::ClientRuntimeConfig;
+pub use crate::runtime::TelemetryHandle;
+pub use crate::trace::async_trace_dispatcher::AsyncTraceDispatcher;
+pub use crate::trace::trace_data_encoder::TraceDataEncoder;
+pub use crate::trace::trace_dispatcher::ArcTraceDispatcher;
+pub use crate::trace::trace_dispatcher::TraceDispatcher;
+pub use crate::trace::trace_dispatcher::Type as TraceDispatcherOperation;
+pub use crate::trace::trace_dispatcher_type::TraceDispatcherType;
+pub use crate::trace::trace_type::TraceType;
+pub use crate::utils::message_util::MessageUtil;
+pub use public_api::*;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mq_client_err_without_response_code_preserves_message() {
+        let err = crate::mq_client_err!("simple client error");
+
+        assert!(err.is(&rocketmq_error::CORE_ARGUMENT_INVALID));
+        assert!(!err.to_string().contains("simple client error"));
+    }
+}
+
+pub use custom_track::{
+    AsyncReporter, AsyncTrackReporter, CustomTrackClient, LogTracker, ReportConsumeStageHook, TrackFlushReport,
+    TrackReportSender, TrackReporterConfig, TrackReporterSnapshot, TrackShutdownReport, Tracker,
+};
+pub use rocketmq_protocol::track::{
+    ConsumeStageRecord, ProduceStageRecord, StoreStageRecord, TrackBean, TrackContext, TrackEncoder, TrackMsgType,
+    TrackTransferBean,
+};
+
+pub use crate::hook::consume_message_context::ConsumeBusinessOutcome;
+
+pub use crate::custom_track::TrackFailureObservation;
+
+// Custom fork: public standard-trace models and extension hooks, distinct from code1000 TrackContext.
+pub use crate::trace::async_trace_dispatcher::{StandardTraceFailure, StandardTraceSnapshot};
+pub use crate::trace::hook::consume_message_trace_hook_impl::ConsumeMessageTraceHookImpl;
+pub use crate::trace::hook::send_message_trace_hook_impl::SendMessageTraceHookImpl;
+pub use crate::trace::trace_bean::TraceBean as StandardTraceBean;
+pub use crate::trace::trace_constants::TraceConstants as StandardTraceConstants;
+pub use crate::trace::trace_context::TraceContext as StandardTraceContext;
+pub use crate::trace::trace_transfer_bean::TraceTransferBean as StandardTraceTransferBean;
+
+// Custom fork: required to configure the public standard-trace LOCAL/CLOUD contract.
+pub use crate::base::access_channel::AccessChannel;
+
+// Custom fork: complete public standard trace Hook and pre-start Producer configuration paths.
+pub use crate::hook::send_message_context::{SendMessageContext, SendMessageTraceSnapshot};
+pub use crate::hook::send_message_hook::SendMessageHook;
+pub use crate::producer::default_mq_produce_builder::DefaultMQProducerBuilder;
+
+// Custom fork: public Request/Reply helpers and native cancellation/diagnostic equivalents.
+pub use crate::producer::request_callback::{request_callback_fn, RequestCallbackFn};
+pub use crate::producer::request_future_holder::{RequestFutureHolder, RequestHandle};
+pub use crate::producer::request_response_future::RequestResponseFuture;
+
+// Custom fork: distinguish local Request/Reply error codes from received Broker response codes.
+pub use crate::common::client_error_code::ClientErrorCode;
+
+// Custom: public legacy transaction extension SPIs.
+pub use crate::producer::{
+    ArcLocalTransactionExecuter, ArcTransactionCheckListener, LocalTransactionExecuter, TransactionCheckListener,
+};
+
+pub use crate::consumer::store::offset_store::CustomOffsetStore;
+pub use rocketmq_transport::api::RPCHook;
+
+// Custom: nameable native equivalents of Java's public auxiliary and impl APIs.
+pub use crate::consumer::consumer_impl::assigned_message_queue::{AssignedMessageQueue, RebalanceProcessQueueTable};
+pub use crate::consumer::consumer_impl::default_lite_pull_consumer_impl::{
+    DefaultLitePullConsumerImpl, LitePullConsumerConfig, LitePullTask,
+};
+pub use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
+pub use crate::consumer::consumer_impl::lite_pull_consume_request::LitePullConsumeRequest;
+pub use crate::consumer::consumer_impl::pull_api_wrapper::PullAPIWrapper;
+pub use crate::consumer::default_mq_push_consumer::ConsumerConfig;
+pub use crate::factory::mq_client_instance::MQClientInstance;
+pub use crate::implementation::find_broker_result::FindBrokerResult;
+pub use crate::implementation::mq_client_api_impl::MQClientAPIImpl;
+pub use crate::latency::latency_fault_tolerance::LatencyFaultTolerance;
+pub use crate::latency::latency_fault_tolerance_impl::{FaultItem, LatencyFaultToleranceImpl};
+pub use crate::producer::producer_impl::default_mq_producer_impl::DefaultMQProducerImpl;
+pub use crate::stat::consumer_stats_manager::ConsumerStatsManager;
+
+pub use crate::hook::filter_message_context::FilterMessageContext;
+pub use crate::hook::filter_message_hook::FilterMessageHook;
+pub use rocketmq_error::{Result as CoreResult, SharedError as CoreSharedError};
+
+pub use cheetah_string::CheetahString;
+
+pub use crate::base::validators::{RegexPattern, Validators};
+mod java_remoting_profile;
+pub use java_remoting_profile::{ClientLogger, JavaRemotingProfile};
+
+pub use crate::consumer::consumer_impl::consume_message_concurrently_service::ConsumeMessageConcurrentlyService;
+pub use crate::consumer::consumer_impl::consume_message_orderly_service::ConsumeMessageOrderlyService;
+pub use crate::consumer::consumer_impl::consume_message_service::{
+    ConsumeMessageService, ConsumeMessageServiceGeneral, ConsumeMessageServiceHandle, ConsumeMessageServiceTrait,
+};
+pub use crate::consumer::consumer_impl::process_queue::{REBALANCE_LOCK_INTERVAL, REBALANCE_LOCK_MAX_LIVE_TIME};
+pub use crate::consumer::consumer_impl::pull_message_service::PullMessageService;
+pub use crate::consumer::consumer_impl::pull_request::PullRequest;
+pub use crate::consumer::consumer_impl::re_balance::rebalance_lite_pull_impl::RebalanceLitePullImpl;
+pub use crate::consumer::consumer_impl::re_balance::rebalance_push_impl::RebalancePushImpl;
+pub use crate::consumer::mq_consumer_inner::MQConsumerInnerImpl;
+pub use crate::consumer::store::local_file_offset_store::LOCAL_OFFSET_STORE_DIR;
+pub use crate::implementation::client_remoting_processor::ClientRemotingProcessor;
+pub use crate::implementation::mq_client_manager::{ClientPoolToken, PooledClient};
+pub use crate::producer::producer_impl::mq_producer_inner::{MQProducerInner, MQProducerInnerImpl};
+pub use rocketmq_runtime::task::service_task::{ServiceManager, ServiceTask, ServiceTaskContext, ServiceTaskState};
+pub use rocketmq_transport::api::{InvokeCallback, ResponseFailure, ResponseFuture, SemaphoreReleaseOnlyOnce};

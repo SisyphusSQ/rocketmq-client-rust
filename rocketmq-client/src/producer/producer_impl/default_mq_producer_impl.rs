@@ -1,0 +1,482 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Custom fork: Java 4.6.1 network lifecycle and preserved physical request failures.
+
+use std::any::Any;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::future::Future;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::Weak;
+use std::time::Duration;
+use std::time::Instant;
+
+use arc_swap::ArcSwap;
+use parking_lot::Mutex as ParkingLotMutex;
+use parking_lot::RwLock as ParkingLotRwLock;
+
+use crate::ClientError;
+use cheetah_string::CheetahString;
+use dashmap::DashMap;
+use rand::random;
+use rocketmq_error::fields;
+use rocketmq_error::Error;
+use rocketmq_error::ErrorContext;
+use rocketmq_model::common::base::service_state::ServiceState;
+use rocketmq_model::common::compression::compression_type::CompressionType;
+use rocketmq_model::common::message::message_accessor::MessageAccessor;
+use rocketmq_model::common::message::message_batch::MessageBatch;
+use rocketmq_model::common::message::message_client_id_setter::MessageClientIDSetter;
+use rocketmq_model::common::message::message_enum::MessageType;
+use rocketmq_model::common::message::message_ext::MessageExt;
+use rocketmq_model::common::message::message_queue::MessageQueue;
+use rocketmq_model::common::message::message_single::Message;
+use rocketmq_model::common::message::MessageConst;
+use rocketmq_model::common::message::MessageTrait;
+use rocketmq_model::common::mix_all;
+use rocketmq_model::common::mix_all::CLIENT_INNER_PRODUCER_GROUP;
+use rocketmq_model::common::mix_all::DEFAULT_PRODUCER_GROUP;
+use rocketmq_model::common::producer::RecallMessageHandle;
+use rocketmq_model::common::sys_flag::message_sys_flag::MessageSysFlag;
+use rocketmq_model::common::FAQUrl;
+use rocketmq_model::utils::correlation_id_util::CorrelationIdUtil;
+use rocketmq_protocol::common::compression::compressor::Compressor;
+use rocketmq_protocol::common::message::message_decoder as MessageDecoder;
+use rocketmq_protocol::protocol::header::check_transaction_state_request_header::CheckTransactionStateRequestHeader;
+use rocketmq_protocol::protocol::header::end_transaction_request_header::EndTransactionRequestHeader;
+use rocketmq_protocol::protocol::header::message_operation_header::send_message_request_header::SendMessageRequestHeader;
+use rocketmq_protocol::protocol::header::recall_message_request_header::RecallMessageRequestHeader;
+use rocketmq_protocol::protocol::namespace_util::NamespaceUtil;
+use rocketmq_protocol::protocol::remoting_command::RemotingCommand;
+use rocketmq_runtime::common::time_utils::current_millis;
+use rocketmq_runtime::ChildServiceContext;
+use rocketmq_transport::api::OutboundRequestContractReason;
+use rocketmq_transport::api::OutboundRequestRejectionReason;
+use rocketmq_transport::api::OutboundRequestStage;
+use rocketmq_transport::api::RPCHook;
+use rocketmq_transport::api::RequestDeadline;
+use rocketmq_transport::api::RpcRequestHeader;
+use rocketmq_transport::api::TopicRequestHeader;
+use tokio::sync::watch;
+use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+use tracing::warn;
+
+use crate::base::client_config::ClientConfig;
+use crate::base::client_options::ClientOptions;
+use crate::base::query_result::QueryResult;
+use crate::base::validators::Validators;
+use crate::common::client_error_code::ClientErrorCode;
+use crate::common::retry_policy::producer_send_fault_decision;
+use crate::common::retry_policy::RetryAction;
+use crate::common::retry_policy::RetryContext;
+use crate::common::retry_policy::RetryIdempotency;
+use crate::common::retry_policy::RetryInput;
+use crate::common::retry_policy::RetryOperation;
+use crate::common::retry_policy::RetryPolicy;
+use crate::factory::mq_client_instance::MQClientInstance;
+use crate::hook::check_forbidden_context::CheckForbiddenContext;
+use crate::hook::check_forbidden_hook::CheckForbiddenHook;
+use crate::hook::end_transaction_context::EndTransactionContext;
+use crate::hook::end_transaction_hook::EndTransactionHook;
+use crate::hook::send_message_context::SendMessageContext;
+use crate::hook::send_message_context::SendMessageTraceSnapshot;
+use crate::hook::send_message_hook::SendMessageHook;
+use crate::implementation::communication_mode::CommunicationMode;
+use crate::implementation::mq_client_manager::ClientPool;
+use crate::implementation::mq_client_manager::ClientPoolToken;
+use crate::latency::mq_fault_strategy::MQFaultStrategy;
+use crate::latency::resolver::Resolver;
+use crate::latency::service_detector::ServiceDetector;
+use crate::nameserver_discovery::NameServerDiscoveryConfig;
+use crate::producer::default_mq_producer::ProducerConfig;
+use crate::producer::default_mq_producer::MIN_BACK_PRESSURE_FOR_ASYNC_SEND_NUM;
+use crate::producer::default_mq_producer::MIN_BACK_PRESSURE_FOR_ASYNC_SEND_SIZE;
+use crate::producer::local_transaction_state::LocalTransactionState;
+use crate::producer::producer_impl::egress::BoundedEgress;
+use crate::producer::producer_impl::egress::OnewayAdmissionOutcome;
+use crate::producer::producer_impl::egress::OnewayEgressSnapshot;
+use crate::producer::producer_impl::egress::OnewayEnvelope;
+use crate::producer::producer_impl::mq_producer_inner::MQProducerInner;
+use crate::producer::producer_impl::mq_producer_inner::MQProducerInnerImpl;
+use crate::producer::producer_impl::topic_publish_info::TopicPublishInfo;
+use crate::producer::request_callback::RequestCallbackFn;
+use crate::producer::request_future_holder::RequestFutureHolder;
+use crate::producer::request_response_future::RequestResponseFuture;
+use crate::producer::send_callback::ArcSendCallback;
+use crate::producer::send_result::SendResult;
+use crate::producer::send_status::SendStatus;
+use crate::producer::transaction_listener::{
+    ArcLocalTransactionExecuter, ArcTransactionCheckListener, ArcTransactionListener,
+};
+use crate::producer::transaction_send_result::TransactionSendResult;
+use crate::runtime::spawn_client_blocking_io_with_context;
+use crate::runtime::spawn_client_task_with_context;
+use crate::runtime::ClientRuntime;
+
+type Topic = CheetahString;
+type TopicPublishInfoSnapshot = Arc<TopicPublishInfo>;
+
+#[derive(Clone)]
+struct ProducerSendConfigSnapshot {
+    producer_group: CheetahString,
+    create_topic_key: CheetahString,
+    default_topic_queue_nums: i32,
+    compress_msg_body_over_howmuch: usize,
+    compress_level: i32,
+    compress_type: CompressionType,
+    compressor: Option<&'static (dyn Compressor + Send + Sync)>,
+    unit_mode: bool,
+}
+
+impl ProducerSendConfigSnapshot {
+    fn new(client_config: &ClientConfig, producer_config: &ProducerConfig) -> Self {
+        Self {
+            producer_group: producer_config.producer_group().clone(),
+            create_topic_key: producer_config.create_topic_key().clone(),
+            default_topic_queue_nums: producer_config.default_topic_queue_nums() as i32,
+            compress_msg_body_over_howmuch: producer_config.compress_msg_body_over_howmuch() as usize,
+            compress_level: producer_config.compress_level(),
+            compress_type: producer_config.compress_type(),
+            compressor: producer_config.compressor(),
+            unit_mode: client_config.unit_mode,
+        }
+    }
+}
+
+const PRODUCER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const PRODUCER_TASK_FORCE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Producer state machine (atomic)
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProducerState {
+    Created = 0,
+    Starting = 1,
+    Running = 2,
+    Stopping = 3,
+    Stopped = 4,
+    StartFailed = 5,
+}
+
+impl ProducerState {
+    #[inline]
+    fn from_u8(val: u8) -> Self {
+        match val {
+            0 => Self::Created,
+            1 => Self::Starting,
+            2 => Self::Running,
+            3 => Self::Stopping,
+            4 => Self::Stopped,
+            5 => Self::StartFailed,
+            _ => Self::Stopped,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TransactionCheckEnv {
+    // Custom fork: queued capacity excludes listeners already executing, like Java.
+    queued_slots: Arc<Semaphore>,
+    worker_slots: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+struct ProducerRuntimeSnapshot {
+    client_config: ClientConfig,
+    producer_config: Arc<ProducerConfig>,
+    send_config: ProducerSendConfigSnapshot,
+}
+
+impl ProducerRuntimeSnapshot {
+    fn new(client_config: ClientConfig, producer_config: ProducerConfig) -> Self {
+        let send_config = ProducerSendConfigSnapshot::new(&client_config, &producer_config);
+        Self {
+            client_config,
+            producer_config: Arc::new(producer_config),
+            send_config,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct TransactionRuntime {
+    listener: Option<ArcTransactionListener>,
+    legacy_listener: Option<ArcTransactionCheckListener>,
+    check_env: Option<TransactionCheckEnv>,
+    check_executor: Option<rocketmq_runtime::BlockingExecutor>,
+}
+
+fn spawn_producer_task<F>(
+    service_context: &ChildServiceContext,
+    thread_name: &'static str,
+    tracker: &TaskTracker,
+    shutdown_token: &CancellationToken,
+    task: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    if shutdown_token.is_cancelled() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "producer is shutting down",
+        ));
+    }
+
+    let shutdown_token = shutdown_token.clone();
+    let tracked_task = tracker.track_future(async move {
+        let mut task = Box::pin(task);
+        tokio::select! {
+            biased;
+            _ = shutdown_token.cancelled() => {}
+            _ = &mut task => {}
+        }
+    });
+
+    drop(spawn_client_task_with_context(
+        service_context,
+        thread_name,
+        Box::pin(tracked_task),
+    )?);
+    Ok(())
+}
+
+/// Send context - encapsulates mutable state during message sending
+struct SendContext {
+    invoke_id: u64,
+    deadline: RequestDeadline,
+    communication_mode: CommunicationMode,
+}
+
+impl SendContext {
+    fn new(deadline: RequestDeadline, communication_mode: CommunicationMode) -> Self {
+        Self {
+            invoke_id: random::<u64>(),
+            deadline,
+            communication_mode,
+        }
+    }
+
+    #[inline]
+    fn elapsed(&self) -> u64 {
+        self.deadline
+            .budget()
+            .saturating_sub(self.deadline.remaining())
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
+    }
+}
+
+/// Retry state tracker
+struct RetryState {
+    times_total: u32,
+    brokers_sent: Vec<String>,
+    last_error: Option<crate::ClientError>,
+    last_send_result: Option<SendResult>,
+}
+
+impl RetryState {
+    fn new(times_total: u32) -> Self {
+        Self {
+            times_total,
+            brokers_sent: Vec::new(),
+            last_error: None,
+            last_send_result: None,
+        }
+    }
+
+    fn record_broker(&mut self, attempt: usize, broker_name: &str) {
+        if attempt == self.brokers_sent.len() {
+            self.brokers_sent.push(broker_name.to_string());
+        }
+    }
+
+    fn set_error(&mut self, error: crate::ClientError) {
+        self.last_error = Some(error);
+    }
+
+    fn take_last_error(&mut self) -> Option<crate::ClientError> {
+        self.last_error.take()
+    }
+
+    fn record_send_result(&mut self, result: SendResult) {
+        self.last_send_result = Some(result);
+    }
+
+    fn take_last_send_result(&mut self) -> Option<SendResult> {
+        self.last_send_result.take()
+    }
+
+    fn take_failure_error(&mut self, topic: &CheetahString, elapsed_ms: u128) -> crate::ClientError {
+        if let Some(error) = self.last_error.take() {
+            return error;
+        }
+
+        let info = format!(
+            "Send [{}] times, still failed, cost [{}]ms, Topic:{}, BrokersSent: {} {}",
+            self.times_total,
+            elapsed_ms,
+            topic,
+            self.brokers_sent.join(","),
+            FAQUrl::suggest_todo(FAQUrl::SEND_MSG_FAILED)
+        );
+
+        mq_client_err!(info)
+    }
+}
+
+pub(crate) fn producer_retry_input_error(input: RetryInput, remote_addr: Option<&CheetahString>) -> ClientError {
+    match input {
+        RetryInput::Transport(error) => ClientError::from_transport(error),
+        RetryInput::Rejected(rejection) => match rejection.reason() {
+            OutboundRequestRejectionReason::DeadlineExpired => {
+                let mut context = ErrorContext::new().with_text(fields::OPERATION_DIAGNOSTIC, "producer_send");
+                if let Some(timeout_millis) = rejection.timeout_millis() {
+                    context = context.with_u64(fields::TIMEOUT_MS, timeout_millis);
+                }
+                ClientError::from_shared(Arc::new(
+                    Error::new(&rocketmq_error::CORE_OPERATION_TIMED_OUT).with_context(context),
+                ))
+            }
+            OutboundRequestRejectionReason::ClientStopping => {
+                ClientError::from_shared(Arc::new(Error::new(&rocketmq_error::CLIENT_LIFECYCLE_NOT_STARTED)))
+            }
+            OutboundRequestRejectionReason::QueueSaturated => {
+                let context = remote_addr.map_or_else(ErrorContext::new, |addr| {
+                    ErrorContext::new().with_text(fields::REMOTE_ADDR, addr.as_str())
+                });
+                ClientError::from_shared(Arc::new(
+                    Error::new(&rocketmq_error::TRANSPORT_ADMISSION_QUEUE_SATURATED).with_context(context),
+                ))
+            }
+            OutboundRequestRejectionReason::Cancelled => {
+                producer_connection_error(request_stage_phase(rejection.stage()), rejection.remote_addr_present())
+            }
+            OutboundRequestRejectionReason::SessionClosed => {
+                producer_connection_error("closed", rejection.remote_addr_present())
+            }
+            OutboundRequestRejectionReason::EndpointUnavailable => {
+                producer_connection_error("connect", rejection.remote_addr_present())
+            }
+        }
+        .with_request_stage(rejection.stage()),
+        RetryInput::Contract(contract) => match contract.reason() {
+            OutboundRequestContractReason::NameServerEndpointMissing => {
+                producer_connection_error("connect", contract.remote_addr_present())
+            }
+        },
+        RetryInput::Response { terminal_error, .. } | RetryInput::BusinessError(terminal_error) => terminal_error,
+        RetryInput::SendStatus(status) => mq_client_err!(format!("Send status not OK: {status:?}")),
+        RetryInput::RouteUnavailable => {
+            mq_client_err!(ClientErrorCode::BROKER_NOT_EXIST_EXCEPTION, "No route available")
+        }
+    }
+}
+
+fn producer_retry_hook_error(input: &RetryInput) -> Arc<ClientError> {
+    match input {
+        RetryInput::Transport(error) => Arc::new(ClientError::from_transport(error.clone())),
+        _ => DefaultMQProducerImpl::context_error("send failed".to_string()),
+    }
+}
+
+fn producer_connection_error(phase: &'static str, remote_addr_present: bool) -> ClientError {
+    let mut context = ErrorContext::new().with_text(fields::PHASE, phase);
+    if remote_addr_present {
+        context = context.with_secret_presence(fields::REMOTE_ADDR_PRESENT);
+    }
+    ClientError::from_shared(Arc::new(
+        Error::new(&rocketmq_error::TRANSPORT_CONNECTION_FAILED).with_context(context),
+    ))
+}
+
+const fn request_stage_phase(stage: OutboundRequestStage) -> &'static str {
+    match stage {
+        OutboundRequestStage::BeforeWrite => "before_write",
+        OutboundRequestStage::Writing => "writing",
+        OutboundRequestStage::AwaitingResponse => "awaiting_response",
+        OutboundRequestStage::ResponseReceived => "response_received",
+    }
+}
+
+pub struct DefaultMQProducerImpl {
+    client_runtime: Option<Arc<ClientRuntime>>,
+    service_context: ChildServiceContext,
+    client_pool: Option<ClientPool>,
+    client_pool_token: ParkingLotMutex<Option<ClientPoolToken>>,
+    nameserver_discovery: Option<NameServerDiscoveryConfig>,
+    request_future_holder: Arc<RequestFutureHolder>,
+    // Custom fork: unique producer lifetime, independent of Group reuse and identity.
+    request_owner_id: String,
+    // ===== Immutable configuration =====
+    runtime: ArcSwap<ProducerRuntimeSnapshot>,
+    config_update: ParkingLotMutex<()>,
+
+    // ===== Atomic state machine =====
+    state: AtomicU8, // ProducerState
+    state_changes: watch::Sender<ProducerState>,
+    lifecycle_transition: TokioMutex<()>,
+    service_state: ParkingLotRwLock<ServiceState>, // Keep for compatibility
+
+    // ===== Read-only hot data (immutable after init, zero-cost sharing) =====
+    send_message_hook_list: ParkingLotRwLock<Arc<[Arc<dyn SendMessageHook>]>>,
+    end_transaction_hook_list: ParkingLotRwLock<Arc<[Arc<dyn EndTransactionHook>]>>,
+    check_forbidden_hook_list: ParkingLotRwLock<Arc<[Arc<dyn CheckForbiddenHook>]>>,
+
+    // Temporary hook storage during initialization
+    pending_send_hooks: parking_lot::Mutex<Option<Vec<Arc<dyn SendMessageHook>>>>,
+    pending_end_transaction_hooks: parking_lot::Mutex<Option<Vec<Arc<dyn EndTransactionHook>>>>,
+    pending_forbidden_hooks: parking_lot::Mutex<Option<Vec<Arc<dyn CheckForbiddenHook>>>>,
+
+    topic_publish_info_table: Arc<DashMap<Topic, TopicPublishInfoSnapshot>>,
+
+    rpc_hook: ParkingLotRwLock<Option<Arc<dyn RPCHook>>>,
+    client_instance: OnceLock<Weak<MQClientInstance>>,
+    mq_fault_strategy: ParkingLotRwLock<MQFaultStrategy>,
+
+    // ===== Backpressure control =====
+    semaphore_async_send_num: Arc<Semaphore>,
+    semaphore_async_send_size: Arc<Semaphore>,
+    default_mqproducer_impl_inner: OnceLock<Weak<DefaultMQProducerImpl>>,
+    transaction_runtime: ParkingLotRwLock<TransactionRuntime>,
+    callback_executor: ParkingLotRwLock<Option<rocketmq_runtime::BlockingExecutor>>,
+    async_sender_executor: ParkingLotRwLock<ChildServiceContext>,
+    producer_task_tracker: TaskTracker,
+    producer_task_shutdown: CancellationToken,
+    task_admission: ParkingLotMutex<()>,
+    oneway_egress: OnceLock<BoundedEgress>,
+    compressor_missing_logged: AtomicBool,
+}
+
+mod hooks;
+mod lifecycle;
+mod retry;
+mod retry_action;
+mod send;
+mod transaction;
+
+pub(crate) use send::DefaultResolver;
+pub(crate) use send::DefaultServiceDetector;
+
+#[cfg(test)]
+#[path = "../../../tests/producer/default_mq_producer_impl/unit.rs"]
+mod tests;

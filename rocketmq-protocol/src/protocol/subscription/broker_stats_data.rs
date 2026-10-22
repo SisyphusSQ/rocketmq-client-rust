@@ -1,0 +1,125 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use serde::Deserialize;
+use serde::Serialize;
+
+use crate::protocol::body::broker_stats_item::BrokerStatsItem;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// Represents broker statistics over different time periods (minute, hour, day)
+pub struct BrokerStatsData {
+    /// Statistics for the last minute
+    // Custom: nullable fixed Java period; absent is not a zero measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stats_minute: Option<BrokerStatsItem>,
+    /// Statistics for the last hour
+    // Custom: nullable fixed Java period; absent is not a zero measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stats_hour: Option<BrokerStatsItem>,
+    /// Statistics for the last day
+    // Custom: nullable fixed Java period; absent is not a zero measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stats_day: Option<BrokerStatsItem>,
+}
+
+static EMPTY_PERIOD: std::sync::LazyLock<BrokerStatsItem> = std::sync::LazyLock::new(BrokerStatsItem::default);
+
+impl BrokerStatsData {
+    pub fn optional_stats_day(&self) -> Option<&BrokerStatsItem> {
+        self.stats_day.as_ref()
+    }
+    pub fn set_optional_stats_day(&mut self, value: Option<BrokerStatsItem>) {
+        self.stats_day = value;
+    }
+
+    pub fn optional_stats_hour(&self) -> Option<&BrokerStatsItem> {
+        self.stats_hour.as_ref()
+    }
+    pub fn set_optional_stats_hour(&mut self, value: Option<BrokerStatsItem>) {
+        self.stats_hour = value;
+    }
+
+    pub fn optional_stats_minute(&self) -> Option<&BrokerStatsItem> {
+        self.stats_minute.as_ref()
+    }
+    pub fn set_optional_stats_minute(&mut self, value: Option<BrokerStatsItem>) {
+        self.stats_minute = value;
+    }
+
+    pub fn new(stats_minute: BrokerStatsItem, stats_hour: BrokerStatsItem, stats_day: BrokerStatsItem) -> Self {
+        Self {
+            stats_minute: Some(stats_minute),
+            stats_hour: Some(stats_hour),
+            stats_day: Some(stats_day),
+        }
+    }
+
+    pub fn get_stats_minute(&self) -> &BrokerStatsItem {
+        self.stats_minute.as_ref().unwrap_or(&EMPTY_PERIOD)
+    }
+
+    pub fn set_stats_minute(&mut self, stats_minute: BrokerStatsItem) {
+        self.stats_minute = Some(stats_minute);
+    }
+
+    pub fn get_stats_hour(&self) -> &BrokerStatsItem {
+        self.stats_hour.as_ref().unwrap_or(&EMPTY_PERIOD)
+    }
+
+    pub fn set_stats_hour(&mut self, stats_hour: BrokerStatsItem) {
+        self.stats_hour = Some(stats_hour);
+    }
+
+    pub fn get_stats_day(&self) -> &BrokerStatsItem {
+        self.stats_day.as_ref().unwrap_or(&EMPTY_PERIOD)
+    }
+
+    pub fn set_stats_day(&mut self, stats_day: BrokerStatsItem) {
+        self.stats_day = Some(stats_day);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn methods_and_serde_preserve_broker_stats_periods() {
+        let stats_minute = BrokerStatsItem::new(100, 12.5, 8.3);
+        let stats_hour = BrokerStatsItem::new(500, 15.0, 9.0);
+        let stats_day = BrokerStatsItem::new(1000, 20.0, 10.0);
+        let mut broker_stats = BrokerStatsData::new(stats_minute, stats_hour, stats_day);
+
+        assert_eq!(broker_stats.get_stats_minute().get_sum(), 100);
+        assert_eq!(broker_stats.get_stats_hour().get_sum(), 500);
+        assert_eq!(broker_stats.get_stats_day().get_sum(), 1000);
+
+        broker_stats.set_stats_minute(BrokerStatsItem::new(200, 25.0, 12.0));
+        broker_stats.set_stats_hour(BrokerStatsItem::new(600, 18.0, 10.0));
+        broker_stats.set_stats_day(BrokerStatsItem::new(1200, 22.0, 11.0));
+
+        let json = serde_json::to_string(&broker_stats).unwrap();
+        assert_eq!(
+            json,
+            r#"{"statsMinute":{"sum":200,"tps":25.0,"avgpt":12.0},"statsHour":{"sum":600,"tps":18.0,"avgpt":10.0},"statsDay":{"sum":1200,"tps":22.0,"avgpt":11.0}}"#
+        );
+
+        let decoded: BrokerStatsData = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.get_stats_minute().get_sum(), 200);
+        assert_eq!(decoded.get_stats_hour().get_tps(), 18.0);
+        assert_eq!(decoded.get_stats_day().get_avgpt(), 11.0);
+    }
+}

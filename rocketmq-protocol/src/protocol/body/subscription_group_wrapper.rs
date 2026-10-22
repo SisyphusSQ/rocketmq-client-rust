@@ -1,0 +1,66 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::HashMap;
+
+use cheetah_string::CheetahString;
+use serde::Deserialize;
+use serde::Serialize;
+
+use crate::protocol::subscription::subscription_group_config::SubscriptionGroupConfig;
+use crate::protocol::DataVersion;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionGroupWrapper {
+    pub subscription_group_table: HashMap<CheetahString, SubscriptionGroupConfig>,
+    // Custom: this newer extension is absent from Java 4.6.1 responses.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub forbidden_table: HashMap<CheetahString, HashMap<CheetahString, i32>>,
+    pub data_version: DataVersion,
+}
+
+// Custom: a new local wrapper has the same empty table/version ownership as Java.
+impl Default for SubscriptionGroupWrapper {
+    fn default() -> Self {
+        Self {
+            subscription_group_table: HashMap::new(),
+            forbidden_table: HashMap::new(),
+            data_version: crate::protocol::data_version_compat::new_data_version(),
+        }
+    }
+}
+
+impl SubscriptionGroupWrapper {
+    pub fn get_subscription_group_table(&self) -> &HashMap<CheetahString, SubscriptionGroupConfig> {
+        &self.subscription_group_table
+    }
+
+    pub fn get_subscription_group_table_mut(&mut self) -> &mut HashMap<CheetahString, SubscriptionGroupConfig> {
+        &mut self.subscription_group_table
+    }
+
+    pub fn data_version_mut(&mut self) -> &mut DataVersion {
+        &mut self.data_version
+    }
+    pub fn set_data_version(&mut self, version: DataVersion) {
+        self.data_version = version;
+    }
+    pub fn set_subscription_group_table(&mut self, table: HashMap<CheetahString, SubscriptionGroupConfig>) {
+        self.subscription_group_table = table;
+    }
+    pub fn data_version(&self) -> &DataVersion {
+        &self.data_version
+    }
+}

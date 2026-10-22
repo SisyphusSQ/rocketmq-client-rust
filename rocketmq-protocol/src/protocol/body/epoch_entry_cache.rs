@@ -1,0 +1,209 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::fmt;
+
+use cheetah_string::CheetahString;
+use serde::Deserialize;
+use serde::Serialize;
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EpochEntry {
+    #[serde(default)]
+    epoch: i32,
+    #[serde(default)]
+    start_offset: i64,
+    #[serde(default = "EpochEntry::default_end_offset")]
+    end_offset: i64,
+}
+
+impl Default for EpochEntry {
+    fn default() -> Self {
+        Self::new(0, 0)
+    }
+}
+
+impl EpochEntry {
+    fn default_end_offset() -> i64 {
+        i64::MAX
+    }
+
+    pub fn new(epoch: i32, start_offset: i64) -> Self {
+        Self {
+            epoch,
+            start_offset,
+            end_offset: i64::MAX,
+        }
+    }
+
+    pub fn with_end_offset(epoch: i32, start_offset: i64, end_offset: i64) -> Self {
+        Self {
+            epoch,
+            start_offset,
+            end_offset,
+        }
+    }
+
+    pub fn get_epoch(&self) -> i32 {
+        self.epoch
+    }
+
+    pub fn set_epoch(&mut self, epoch: i32) {
+        self.epoch = epoch;
+    }
+
+    pub fn get_start_offset(&self) -> i64 {
+        self.start_offset
+    }
+
+    pub fn set_start_offset(&mut self, start_offset: i64) {
+        self.start_offset = start_offset;
+    }
+
+    pub fn get_end_offset(&self) -> i64 {
+        self.end_offset
+    }
+
+    pub fn set_end_offset(&mut self, end_offset: i64) {
+        self.end_offset = end_offset;
+    }
+}
+
+impl fmt::Display for EpochEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "EpochEntry{{epoch={}, startOffset={}, endOffset={}}}",
+            self.epoch, self.start_offset, self.end_offset
+        )
+    }
+}
+
+#[derive(Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EpochEntryCache {
+    cluster_name: CheetahString,
+    broker_name: CheetahString,
+    broker_id: u64,
+    epoch_list: Vec<EpochEntry>,
+    max_offset: u64,
+}
+
+impl EpochEntryCache {
+    pub fn new(
+        cluster_name: impl Into<CheetahString>,
+        broker_name: impl Into<CheetahString>,
+        broker_id: u64,
+        epoch_list: Vec<EpochEntry>,
+        max_offset: u64,
+    ) -> Self {
+        Self {
+            cluster_name: cluster_name.into(),
+            broker_name: broker_name.into(),
+            broker_id,
+            epoch_list,
+            max_offset,
+        }
+    }
+    pub fn get_cluster_name(&self) -> &CheetahString {
+        &self.cluster_name
+    }
+    pub fn set_cluster_name(&mut self, cluster_name: impl Into<CheetahString>) {
+        self.cluster_name = cluster_name.into()
+    }
+    pub fn get_broker_name(&self) -> &CheetahString {
+        &self.broker_name
+    }
+    pub fn set_broker_name(&mut self, broker_name: impl Into<CheetahString>) {
+        self.broker_name = broker_name.into()
+    }
+    pub fn get_broker_id(&self) -> u64 {
+        self.broker_id
+    }
+    pub fn get_epoch_list(&self) -> &Vec<EpochEntry> {
+        &self.epoch_list
+    }
+    pub fn get_epoch_list_mut(&mut self) -> &mut Vec<EpochEntry> {
+        &mut self.epoch_list
+    }
+    pub fn get_max_offset(&self) -> u64 {
+        self.max_offset
+    }
+    pub fn set_max_offset(&mut self, max_offset: u64) {
+        self.max_offset = max_offset;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cheetah_string::CheetahString;
+
+    use super::*;
+
+    #[test]
+    fn epoch_entry_default_matches_constructor_and_missing_wire_fields() {
+        let expected = EpochEntry::new(0, 0);
+        assert_eq!(expected.get_end_offset(), i64::MAX);
+        assert_eq!(EpochEntry::default(), expected);
+        assert_eq!(serde_json::from_str::<EpochEntry>("{}").unwrap(), expected);
+        assert_eq!(
+            serde_json::to_value(&expected).unwrap(),
+            serde_json::json!({
+                "epoch": 0, "startOffset": 0, "endOffset": i64::MAX
+            })
+        );
+        for end_offset in [0, 42] {
+            let value = serde_json::json!({"endOffset": end_offset});
+            assert_eq!(
+                serde_json::from_value::<EpochEntry>(value).unwrap(),
+                EpochEntry::with_end_offset(0, 0, end_offset)
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_entry_and_cache_accessors_update_all_fields() {
+        let mut entry = EpochEntry::new(1, 0);
+        assert_eq!(entry.get_end_offset(), i64::MAX);
+        entry.set_epoch(2);
+        entry.set_start_offset(100);
+        entry.set_end_offset(200);
+        assert_eq!(entry.get_epoch(), 2);
+        assert_eq!(entry.get_start_offset(), 100);
+        assert_eq!(entry.get_end_offset(), 200);
+
+        let mut cache = EpochEntryCache::new("cluster1", "broker1", 1, vec![entry], 500);
+        assert_eq!(cache.get_cluster_name(), &CheetahString::from("cluster1"));
+        assert_eq!(cache.get_broker_name(), &CheetahString::from("broker1"));
+        assert_eq!(cache.get_broker_id(), 1);
+        assert_eq!(cache.get_epoch_list().len(), 1);
+        assert_eq!(cache.get_max_offset(), 500);
+
+        cache.set_cluster_name("cluster2");
+        cache.set_broker_name("broker2");
+        cache.set_max_offset(600);
+        cache.get_epoch_list_mut().push(EpochEntry::new(3, 200));
+        assert_eq!(cache.get_cluster_name(), &CheetahString::from("cluster2"));
+        assert_eq!(cache.get_broker_name(), &CheetahString::from("broker2"));
+        assert_eq!(cache.get_max_offset(), 600);
+        assert_eq!(cache.get_epoch_list().len(), 2);
+    }
+
+    #[test]
+    fn epoch_entry_display() {
+        let entry = EpochEntry::with_end_offset(1, 100, 200);
+        assert_eq!(entry.to_string(), "EpochEntry{epoch=1, startOffset=100, endOffset=200}");
+    }
+}

@@ -1,0 +1,567 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::future::Future;
+use std::sync::Arc;
+
+use crate::blocking::BlockingExecutor;
+use crate::blocking::BlockingLane;
+use crate::blocking::BlockingLanePolicies;
+use crate::blocking::GlobalBlockingBudget;
+use crate::critical::CriticalFailureState;
+use crate::diagnostics::RuntimeDiagnostics;
+use crate::diagnostics::RuntimeDiagnosticsSnapshot;
+use crate::error::RuntimeContractViolation;
+use crate::error::RuntimeResult;
+use crate::handle::RuntimeHandle;
+use crate::resource_budget::ResourceBudget;
+use crate::resources::RuntimeResources;
+use crate::scheduled::ScheduledTaskGroup;
+use crate::shutdown_report::ShutdownReport;
+use crate::task_group::TaskGroup;
+use crate::task_group::TaskId;
+use crate::task_group::TaskKind;
+use crate::task_spawner::TaskSpawner;
+use crate::RuntimeContractPolicy;
+
+/// A validated, named position in the service ownership tree.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ScopeId(Arc<str>);
+
+impl ScopeId {
+    /// Creates a scope identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns a deterministic contract violation when `name` is empty or
+    /// only contains whitespace.
+    pub fn try_new(name: impl Into<Arc<str>>) -> Result<Self, RuntimeContractViolation> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(RuntimeContractViolation::InvalidConfiguration {
+                policy: RuntimeContractPolicy::ServiceContextScopeNotBlank,
+            });
+        }
+        Ok(Self(name))
+    }
+
+    /// Creates a statically named scope.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `name` is empty or only contains whitespace. Static scope
+    /// names are programmer-owned lifecycle invariants.
+    pub fn from_static(name: &'static str) -> Self {
+        Self::try_new(Arc::<str>::from(name)).expect("static service context scope name must be valid")
+    }
+
+    /// Borrows this value as str.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn into_inner(self) -> Arc<str> {
+        self.0
+    }
+}
+
+impl From<&'static str> for ScopeId {
+    fn from(value: &'static str) -> Self {
+        Self::from_static(value)
+    }
+}
+
+impl TryFrom<String> for ScopeId {
+    type Error = RuntimeContractViolation;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_new(Arc::<str>::from(value))
+    }
+}
+
+impl TryFrom<Arc<str>> for ScopeId {
+    type Error = RuntimeContractViolation;
+
+    fn try_from(value: Arc<str>) -> Result<Self, Self::Error> {
+        Self::try_new(value)
+    }
+}
+
+#[cfg(test)]
+mod scope_id_tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_scope_ids_return_contract_violations() {
+        assert_eq!(
+            ScopeId::try_new(Arc::<str>::from("  ")),
+            Err(RuntimeContractViolation::InvalidConfiguration {
+                policy: RuntimeContractPolicy::ServiceContextScopeNotBlank,
+            })
+        );
+        assert!(ScopeId::try_from(String::new()).is_err());
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BlockingLanes {
+    storage_io: BlockingExecutor,
+    metadata_io: BlockingExecutor,
+    cpu_crypto: BlockingExecutor,
+}
+
+impl BlockingLanes {
+    fn new(policies: BlockingLanePolicies, global_capacity: usize, runtime: RuntimeHandle, scope: &TaskGroup) -> Self {
+        let budget = GlobalBlockingBudget::managed(global_capacity, &policies);
+        Self {
+            storage_io: BlockingExecutor::new_managed(
+                policies.storage_io,
+                BlockingLane::StorageIo,
+                budget.clone(),
+                runtime.clone(),
+            )
+            .expect("RuntimeConfig validates storage blocking policy before root context construction")
+            .scoped_to(scope.clone()),
+            metadata_io: BlockingExecutor::new_managed(
+                policies.metadata_io,
+                BlockingLane::MetadataIo,
+                budget.clone(),
+                runtime.clone(),
+            )
+            .expect("RuntimeConfig validates metadata blocking policy before root context construction")
+            .scoped_to(scope.clone()),
+            cpu_crypto: BlockingExecutor::new_managed(policies.cpu_crypto, BlockingLane::CpuCrypto, budget, runtime)
+                .expect("RuntimeConfig validates CPU blocking policy before root context construction")
+                .scoped_to(scope.clone()),
+        }
+    }
+
+    fn scoped_to(&self, scope: &TaskGroup) -> Self {
+        Self {
+            storage_io: self.storage_io.scoped_to(scope.clone()),
+            metadata_io: self.metadata_io.scoped_to(scope.clone()),
+            cpu_crypto: self.cpu_crypto.scoped_to(scope.clone()),
+        }
+    }
+
+    fn get(&self, lane: BlockingLane) -> &BlockingExecutor {
+        match lane {
+            BlockingLane::StorageIo => &self.storage_io,
+            BlockingLane::MetadataIo => &self.metadata_io,
+            BlockingLane::CpuCrypto => &self.cpu_crypto,
+        }
+    }
+
+    fn snapshots(&self) -> Vec<crate::blocking::BlockingExecutorSnapshot> {
+        vec![
+            self.storage_io.snapshot(),
+            self.metadata_io.snapshot(),
+            self.cpu_crypto.snapshot(),
+        ]
+    }
+
+    fn aggregates(&self) -> Vec<crate::blocking::BlockingExecutorAggregate> {
+        vec![
+            self.storage_io.aggregate(),
+            self.metadata_io.aggregate(),
+            self.cpu_crypto.aggregate(),
+        ]
+    }
+}
+
+/// The unique, non-cloneable lifecycle root owned by [`crate::RuntimeOwner`].
+///
+/// The type has no public constructor and cannot be promoted from a child
+/// context. Composition roots only use it to derive the first named child.
+#[derive(Debug)]
+pub struct RootServiceContext {
+    name: Arc<str>,
+    task_group: TaskGroup,
+    blocking_lanes: BlockingLanes,
+    diagnostics: RuntimeDiagnostics,
+    resources: RuntimeResources,
+    _sealed: RootContextSeal,
+}
+
+#[derive(Debug)]
+struct RootContextSeal;
+
+/// Permit to create a root [`TaskGroup`].
+///
+/// The private field keeps construction inside this module, so
+/// [`RootServiceContext::new`] is the only code that can create a root group.
+pub(crate) struct RootGroupPermit(());
+
+impl RootServiceContext {
+    /// Creates a root context and the root task group it owns.
+    pub(crate) fn new(
+        name: Arc<str>,
+        runtime: RuntimeHandle,
+        blocking_policies: BlockingLanePolicies,
+        global_blocking_capacity: usize,
+        diagnostics: RuntimeDiagnostics,
+        resources: RuntimeResources,
+    ) -> Self {
+        let task_group = TaskGroup::root(Arc::clone(&name), runtime.clone(), RootGroupPermit(()));
+        let blocking_lanes = BlockingLanes::new(blocking_policies, global_blocking_capacity, runtime, &task_group);
+        Self {
+            name,
+            task_group,
+            blocking_lanes,
+            diagnostics,
+            resources,
+            _sealed: RootContextSeal,
+        }
+    }
+
+    /// Returns the name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Creates a long-lived component context owned by this process root.
+    ///
+    /// Dynamically supplied names must be validated with [`ScopeId::try_new`]
+    /// before they reach this boundary. Static literals may use the constrained
+    /// `From<&'static str>` conversion.
+    pub fn component(&self, scope: impl Into<ScopeId>) -> ChildServiceContext {
+        ChildServiceContext::new(
+            scope.into(),
+            &self.task_group,
+            self.blocking_lanes.clone(),
+            self.diagnostics.clone(),
+            self.resources.clone(),
+        )
+    }
+
+    /// Returns the shared process resource-budget root.
+    pub fn process_budget(&self) -> ResourceBudget {
+        self.resources.process_budget()
+    }
+
+    /// Returns the process-wide runtime resource capabilities.
+    pub fn resources(&self) -> &RuntimeResources {
+        &self.resources
+    }
+
+    /// Returns the diagnostics snapshot.
+    pub fn diagnostics_snapshot(&self) -> RuntimeDiagnosticsSnapshot {
+        self.diagnostics
+            .snapshot(&self.task_group, self.blocking_lanes.snapshots())
+    }
+
+    /// Returns a bounded, sanitized diagnostics view for this service runtime.
+    pub fn diagnostics_view_v1(
+        &self,
+        component: crate::diagnostics::RuntimeComponent,
+    ) -> crate::diagnostics::RuntimeDiagnosticsViewV1 {
+        self.diagnostics.view_v1_with_aggregates(
+            component,
+            &self.task_group,
+            self.blocking_lanes.aggregates(),
+            Default::default(),
+        )
+    }
+
+    pub(crate) fn task_group(&self) -> &TaskGroup {
+        &self.task_group
+    }
+
+    pub(crate) fn blocking(&self, lane: BlockingLane) -> &BlockingExecutor {
+        self.blocking_lanes.get(lane)
+    }
+
+    pub(crate) fn diagnostics(&self) -> &RuntimeDiagnostics {
+        &self.diagnostics
+    }
+
+    /// Adds the blocking work of the managed lanes and of the isolated
+    /// executors bound to this tree to `report`.
+    pub(crate) fn merge_blocking_into(&self, report: &mut ShutdownReport) {
+        for snapshot in self.blocking_lanes.snapshots() {
+            report.merge_blocking(snapshot);
+        }
+        let (still_running, tasks) = self.task_group.isolated_blocking_report();
+        report.merge_blocking_tasks(still_running, tasks);
+    }
+}
+
+/// A sealed, cloneable descendant of a [`RootServiceContext`].
+///
+/// Libraries receive this type or a capability derived from it. They cannot
+/// construct it from a Tokio handle, create a root task group, or promote it
+/// back to a root.
+#[derive(Debug, Clone)]
+pub struct ChildServiceContext {
+    name: Arc<str>,
+    task_group: TaskGroup,
+    blocking_lanes: BlockingLanes,
+    diagnostics: RuntimeDiagnostics,
+    resources: RuntimeResources,
+    _sealed: Arc<ChildContextSeal>,
+}
+
+#[derive(Debug)]
+struct ChildContextSeal;
+
+impl ChildServiceContext {
+    fn new(
+        scope: ScopeId,
+        parent_group: &TaskGroup,
+        blocking_lanes: BlockingLanes,
+        diagnostics: RuntimeDiagnostics,
+        resources: RuntimeResources,
+    ) -> Self {
+        let name = scope.into_inner();
+        let task_group = parent_group.component(name.clone());
+        Self {
+            name: name.clone(),
+            task_group: task_group.clone(),
+            blocking_lanes: blocking_lanes.scoped_to(&task_group),
+            diagnostics,
+            resources,
+            _sealed: Arc::new(ChildContextSeal),
+        }
+    }
+
+    fn try_new(
+        scope: ScopeId,
+        parent_group: &TaskGroup,
+        blocking_lanes: BlockingLanes,
+        diagnostics: RuntimeDiagnostics,
+        resources: RuntimeResources,
+    ) -> RuntimeResult<Self> {
+        let name = scope.into_inner();
+        let task_group = parent_group.try_child(name.clone())?;
+        Ok(Self {
+            name: name.clone(),
+            task_group: task_group.clone(),
+            blocking_lanes: blocking_lanes.scoped_to(&task_group),
+            diagnostics,
+            resources,
+            _sealed: Arc::new(ChildContextSeal),
+        })
+    }
+
+    /// Returns the name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the task spawner.
+    pub fn task_spawner(&self) -> TaskSpawner {
+        TaskSpawner::new(self.task_group.clone())
+    }
+
+    /// Returns the task group.
+    pub fn task_group(&self) -> &TaskGroup {
+        &self.task_group
+    }
+
+    /// Returns the blocking.
+    pub fn blocking(&self, lane: BlockingLane) -> &BlockingExecutor {
+        self.blocking_lanes.get(lane)
+    }
+
+    /// Returns the storage io.
+    pub fn storage_io(&self) -> &BlockingExecutor {
+        self.blocking(BlockingLane::StorageIo)
+    }
+
+    /// Returns the metadata io.
+    pub fn metadata_io(&self) -> &BlockingExecutor {
+        self.blocking(BlockingLane::MetadataIo)
+    }
+
+    /// Returns the cpu crypto.
+    pub fn cpu_crypto(&self) -> &BlockingExecutor {
+        self.blocking(BlockingLane::CpuCrypto)
+    }
+
+    /// Returns the diagnostics.
+    pub fn diagnostics(&self) -> &RuntimeDiagnostics {
+        &self.diagnostics
+    }
+
+    /// Returns the shared process resource-budget root.
+    pub fn process_budget(&self) -> ResourceBudget {
+        self.resources.process_budget()
+    }
+
+    /// Returns the process-wide runtime resource capabilities.
+    pub fn resources(&self) -> &RuntimeResources {
+        &self.resources
+    }
+
+    /// Returns the diagnostics snapshot.
+    pub fn diagnostics_snapshot(&self) -> RuntimeDiagnosticsSnapshot {
+        self.diagnostics
+            .snapshot(&self.task_group, self.blocking_lanes.snapshots())
+    }
+
+    /// Returns a bounded, sanitized diagnostics view for this service subtree.
+    pub fn diagnostics_view_v1(
+        &self,
+        component: crate::diagnostics::RuntimeComponent,
+    ) -> crate::diagnostics::RuntimeDiagnosticsViewV1 {
+        self.diagnostics.view_v1_with_aggregates(
+            component,
+            &self.task_group,
+            self.blocking_lanes.aggregates(),
+            Default::default(),
+        )
+    }
+
+    /// Returns a bounded, explicitly scoped diagnostics view for this subtree.
+    ///
+    /// The runtime context does not own scheduled groups or a metadata actor, so
+    /// the caller supplies the snapshots it holds; a section without an input is
+    /// reported as absent rather than as an empty value.
+    pub fn diagnostics_view_v2(
+        &self,
+        component: crate::diagnostics::RuntimeComponent,
+        inputs: crate::diagnostics::RuntimeDiagnosticsInputs,
+    ) -> crate::diagnostics::RuntimeDiagnosticsViewV2 {
+        self.diagnostics_view_v2_with_options(
+            component,
+            inputs,
+            crate::diagnostics::RuntimeDiagnosticsViewOptionsV2::default(),
+        )
+    }
+
+    /// Returns a bounded, explicitly scoped diagnostics view with explicit
+    /// budget limits, including the scan and output budgets of an on-demand task
+    /// detail list.
+    pub fn diagnostics_view_v2_with_options(
+        &self,
+        component: crate::diagnostics::RuntimeComponent,
+        inputs: crate::diagnostics::RuntimeDiagnosticsInputs,
+        options: crate::diagnostics::RuntimeDiagnosticsViewOptionsV2,
+    ) -> crate::diagnostics::RuntimeDiagnosticsViewV2 {
+        self.diagnostics.view_v2_with_aggregates(
+            component,
+            &self.task_group,
+            self.blocking_lanes.aggregates(),
+            inputs,
+            options,
+        )
+    }
+
+    /// Creates a long-lived component context owned by this service.
+    ///
+    /// Dynamically supplied names must be validated with [`ScopeId::try_new`]
+    /// before they reach this boundary. Static literals may use the constrained
+    /// `From<&'static str>` conversion.
+    pub fn component(&self, scope: impl Into<ScopeId>) -> Self {
+        Self::new(
+            scope.into(),
+            &self.task_group,
+            self.blocking_lanes.clone(),
+            self.diagnostics.clone(),
+            self.resources.clone(),
+        )
+    }
+
+    /// Creates an independently cancellable child component owned by this service.
+    ///
+    /// Parent cancellation propagates to the returned component. Cancelling the
+    /// child does not cancel this service or sibling components.
+    ///
+    /// # Errors
+    ///
+    /// Returns an unavailable runtime failure after this service starts
+    /// shutting down or becomes poisoned. Dynamically supplied names must be
+    /// validated with [`ScopeId::try_new`] before this call.
+    pub fn try_component(&self, scope: impl Into<ScopeId>) -> RuntimeResult<Self> {
+        Self::try_new(
+            scope.into(),
+            &self.task_group,
+            self.blocking_lanes.clone(),
+            self.diagnostics.clone(),
+            self.resources.clone(),
+        )
+    }
+
+    /// Returns the scheduled tasks.
+    pub fn scheduled_tasks(&self, scope: impl Into<ScopeId>) -> ScheduledTaskGroup {
+        let component = self.component(scope);
+        ScheduledTaskGroup::new(component.task_group)
+    }
+
+    /// Spawns the supplied task.
+    pub fn spawn<F>(&self, name: impl Into<crate::TaskName>, kind: TaskKind, future: F) -> RuntimeResult<TaskId>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.task_group.spawn(name, kind, future)
+    }
+
+    /// Spawns a service that owns its shutdown protocol.
+    ///
+    /// Use [`Self::spawn_cancellable_service`] when owner cancellation may
+    /// safely drop the service future immediately.
+    pub fn spawn_service<F>(&self, name: impl Into<crate::TaskName>, future: F) -> RuntimeResult<TaskId>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.task_group.spawn_service(name, future)
+    }
+
+    /// Spawns a service that exits when either its future completes or this context is cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this service context is shutting down or closed.
+    pub fn spawn_cancellable_service<F>(&self, name: impl Into<crate::TaskName>, future: F) -> RuntimeResult<TaskId>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.task_group.spawn_cancellable_service(name, future)
+    }
+
+    /// Spawns work whose panic is recorded as a critical failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this service context is shutting down or closed.
+    pub fn spawn_critical<F>(
+        &self,
+        name: impl Into<crate::TaskName>,
+        kind: TaskKind,
+        failures: CriticalFailureState,
+        future: F,
+    ) -> RuntimeResult<TaskId>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.task_group.spawn_critical(name, kind, failures, future)
+    }
+
+    /// Spawns a critical service that must run until this context is cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this service context is shutting down or closed.
+    pub fn spawn_critical_service<F>(
+        &self,
+        name: impl Into<crate::TaskName>,
+        failures: CriticalFailureState,
+        future: F,
+    ) -> RuntimeResult<TaskId>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.task_group.spawn_critical_service(name, failures, future)
+    }
+}

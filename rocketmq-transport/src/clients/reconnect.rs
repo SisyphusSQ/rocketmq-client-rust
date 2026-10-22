@@ -1,0 +1,260 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Circuit breaker for connection retry admission.
+//!
+//! This module prevents cascading connection failures while maintaining high availability.
+
+use std::time::Duration;
+use std::time::Instant;
+
+/// Circuit breaker pattern for preventing cascading failures.
+///
+/// # States
+///
+/// ```text
+/// ┌──────────┐      failure threshold       ┌──────────┐
+/// │  CLOSED  │ ─────────────────────────► │   OPEN   │
+/// └──────────┘                             └──────────┘
+///      ▲                                        │
+///      │                                        │ timeout
+///      │                                        ▼
+///      │         success threshold        ┌──────────┐
+///      └────────────────────────────────  │ HALF_OPEN│
+///                                         └──────────┘
+/// ```
+///
+/// - **CLOSED**: Normal operation, requests pass through
+/// - **OPEN**: Too many failures, reject requests immediately
+/// - **HALF_OPEN**: Testing if service recovered, allow limited requests
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    /// Normal operation, all requests allowed
+    Closed,
+
+    /// Service failing, reject requests to prevent overload
+    Open,
+
+    /// Testing recovery, allow probe requests
+    HalfOpen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CircuitAdmission {
+    Regular,
+    Probe,
+    Rejected,
+}
+
+/// Circuit breaker for connection management.
+#[derive(Debug, Clone)]
+pub struct CircuitBreaker {
+    /// Current circuit state
+    state: CircuitState,
+
+    /// Consecutive failure count in CLOSED state
+    failure_count: u32,
+
+    /// Failure threshold to trip circuit (CLOSED → OPEN)
+    failure_threshold: u32,
+
+    /// Success threshold to close circuit (HALF_OPEN → CLOSED)
+    success_threshold: u32,
+
+    /// Consecutive success count in HALF_OPEN state
+    success_count: u32,
+
+    /// Duration to wait before transitioning OPEN → HALF_OPEN
+    timeout: Duration,
+
+    /// Timestamp when circuit opened
+    opened_at: Option<Instant>,
+}
+
+impl CircuitBreaker {
+    /// Creates a new circuit breaker.
+    ///
+    /// # Arguments
+    ///
+    /// * `failure_threshold` - Failures to trip circuit (e.g., 5)
+    /// * `success_threshold` - Successes to close circuit (e.g., 2)
+    /// * `timeout` - Wait before retrying after open (e.g., 30s)
+    pub fn new(failure_threshold: u32, success_threshold: u32, timeout: Duration) -> Self {
+        Self {
+            state: CircuitState::Closed,
+            failure_count: 0,
+            failure_threshold,
+            success_threshold,
+            success_count: 0,
+            timeout,
+            opened_at: None,
+        }
+    }
+
+    /// Creates a default circuit breaker (5 failures, 2 successes, 30s timeout).
+    pub fn default_breaker() -> Self {
+        Self::new(5, 2, Duration::from_secs(30))
+    }
+
+    /// Checks if a request should be allowed.
+    ///
+    /// # Returns
+    ///
+    /// * `true` - Request allowed (CLOSED or HALF_OPEN)
+    /// * `false` - Request blocked (OPEN and timeout not elapsed)
+    pub fn allow_request(&mut self) -> bool {
+        self.connection_admission() != CircuitAdmission::Rejected
+    }
+
+    pub(crate) fn connection_admission(&mut self) -> CircuitAdmission {
+        match self.state {
+            CircuitState::Closed => CircuitAdmission::Regular,
+            CircuitState::HalfOpen => CircuitAdmission::Probe,
+            CircuitState::Open => {
+                // Check if timeout elapsed
+                if let Some(opened_at) = self.opened_at {
+                    if opened_at.elapsed() >= self.timeout {
+                        // Transition to HALF_OPEN
+                        self.state = CircuitState::HalfOpen;
+                        self.success_count = 0;
+                        self.failure_count = 0;
+                        CircuitAdmission::Probe
+                    } else {
+                        CircuitAdmission::Rejected
+                    }
+                } else {
+                    CircuitAdmission::Rejected
+                }
+            }
+        }
+    }
+
+    /// Records a successful request.
+    pub fn record_success(&mut self) {
+        match self.state {
+            CircuitState::Closed => {
+                // Reset failure counter
+                self.failure_count = 0;
+            }
+            CircuitState::HalfOpen => {
+                self.success_count += 1;
+                if self.success_count >= self.success_threshold {
+                    // Close circuit
+                    self.state = CircuitState::Closed;
+                    self.success_count = 0;
+                    self.failure_count = 0;
+                    self.opened_at = None;
+                }
+            }
+            CircuitState::Open => {
+                // Should not happen (requests blocked in OPEN)
+            }
+        }
+    }
+
+    /// Records a failed request.
+    pub fn record_failure(&mut self) {
+        match self.state {
+            CircuitState::Closed => {
+                self.failure_count += 1;
+                if self.failure_count >= self.failure_threshold {
+                    // Open circuit
+                    self.state = CircuitState::Open;
+                    self.opened_at = Some(Instant::now());
+                }
+            }
+            CircuitState::HalfOpen => {
+                // Any failure in HALF_OPEN reopens circuit
+                self.state = CircuitState::Open;
+                self.opened_at = Some(Instant::now());
+                self.success_count = 0;
+            }
+            CircuitState::Open => {
+                // Already open, update timestamp
+                self.opened_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Gets the current circuit state.
+    pub(crate) fn state(&self) -> CircuitState {
+        self.state
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_circuit_breaker_closed_to_open() {
+        let mut breaker = CircuitBreaker::new(3, 2, Duration::from_secs(1));
+
+        assert_eq!(breaker.state(), CircuitState::Closed);
+        assert!(breaker.allow_request());
+
+        // Record failures
+        breaker.record_failure();
+        assert_eq!(breaker.state(), CircuitState::Closed);
+
+        breaker.record_failure();
+        assert_eq!(breaker.state(), CircuitState::Closed);
+
+        breaker.record_failure();
+        assert_eq!(breaker.state(), CircuitState::Open);
+        assert!(!breaker.allow_request()); // Blocked
+    }
+
+    #[test]
+    fn test_circuit_breaker_half_open() {
+        let mut breaker = CircuitBreaker::new(2, 2, Duration::from_millis(10));
+
+        // Trip circuit
+        breaker.record_failure();
+        breaker.record_failure();
+        assert_eq!(breaker.state(), CircuitState::Open);
+
+        // Wait for timeout
+        std::thread::sleep(Duration::from_millis(15));
+
+        // Should transition to HALF_OPEN
+        assert!(breaker.allow_request());
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+
+        // Record successes to close
+        breaker.record_success();
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+
+        breaker.record_success();
+        assert_eq!(breaker.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_circuit_breaker_half_open_failure() {
+        let mut breaker = CircuitBreaker::new(2, 2, Duration::from_millis(10));
+
+        // Trip circuit
+        breaker.record_failure();
+        breaker.record_failure();
+
+        // Wait and transition to HALF_OPEN
+        std::thread::sleep(Duration::from_millis(15));
+        breaker.allow_request();
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+
+        // Failure in HALF_OPEN reopens circuit
+        breaker.record_failure();
+        assert_eq!(breaker.state(), CircuitState::Open);
+    }
+}

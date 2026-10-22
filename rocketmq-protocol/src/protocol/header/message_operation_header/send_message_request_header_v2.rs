@@ -1,0 +1,1149 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::HashMap;
+use std::str::FromStr;
+
+use bytes::BytesMut;
+use cheetah_string::CheetahString;
+use rocketmq_macros::RequestHeaderCodec;
+use serde::Deserialize;
+use serde::Serialize;
+
+use crate::protocol::command_custom_header::CommandCustomHeader;
+use crate::protocol::command_custom_header::FromMap;
+use crate::protocol::command_custom_header::HeaderEncodeCapability;
+use crate::protocol::header::message_operation_header::send_message_request_header::SendMessageRequestHeader;
+use crate::protocol::header::message_operation_header::TopicRequestHeaderTrait;
+use crate::protocol::header_codec::BinarySink;
+use crate::protocol::header_codec::HeaderCodec;
+use crate::protocol::header_codec::HeaderFieldContext;
+use crate::protocol::header_codec::HeaderFieldSource;
+use crate::protocol::header_codec::HeaderValue;
+use crate::protocol::header_codec::JsonSink;
+use crate::protocol::header_codec::MapSink;
+use crate::protocol::header_codec::ResolvedHeaderKey;
+use crate::rpc::rpc_request_header::RpcRequestHeader;
+use crate::rpc::topic_request_header::TopicRequestHeader;
+use crate::ProtocolContractViolation;
+
+// Field key constants to avoid repeated allocations
+const FIELD_A: &str = "a";
+const FIELD_B: &str = "b";
+const FIELD_C: &str = "c";
+const FIELD_D: &str = "d";
+const FIELD_E: &str = "e";
+const FIELD_F: &str = "f";
+const FIELD_G: &str = "g";
+const FIELD_H: &str = "h";
+const FIELD_I: &str = "i";
+const FIELD_J: &str = "j";
+const FIELD_K: &str = "k";
+const FIELD_L: &str = "l";
+const FIELD_M: &str = "m";
+const FIELD_N: &str = "n";
+const FIELD_BROKER_NAME: &str = "bname";
+const FIELD_NAMESPACE: &str = "ns";
+const FIELD_NAMESPACED: &str = "nsd";
+const FIELD_ONEWAY: &str = "oway";
+const FIELD_LO: &str = "lo";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, RequestHeaderCodec)]
+#[header(
+    type_id = "rocketmq_protocol::protocol::header::message_operation_header::send_message_request_header_v2::SendMessageRequestHeaderV2",
+    java_class = "org.apache.rocketmq.remoting.protocol.header.SendMessageRequestHeaderV2",
+    legacy_shim = "manual",
+    fast
+)]
+#[serde(rename_all = "camelCase")]
+pub struct SendMessageRequestHeaderV2 {
+    #[header(required)]
+    pub a: CheetahString, // producerGroup
+    #[header(required)]
+    pub b: CheetahString, // topic
+    #[header(required)]
+    pub c: CheetahString, // defaultTopic
+    #[header(required)]
+    pub d: i32, // defaultTopicQueueNums
+    #[header(required)]
+    pub e: i32, // queueId
+    #[header(required)]
+    pub f: i32, // sysFlag
+    #[header(required)]
+    pub g: i64, // bornTimestamp
+    #[header(required)]
+    pub h: i32, // flag
+    pub i: Option<CheetahString>, // properties
+    pub j: Option<i32>,           // reconsumeTimes
+    pub k: Option<bool>,          // unitMode
+    pub l: Option<i32>,           // consumeRetryTimes
+    pub m: Option<bool>,          // batch
+    pub n: Option<CheetahString>, // brokerName
+
+    #[serde(flatten)]
+    #[header(flatten, presence = "always")]
+    pub topic_request_header: Option<TopicRequestHeader>,
+}
+
+impl CommandCustomHeader for SendMessageRequestHeaderV2 {
+    fn check_fields(&self) -> rocketmq_error::Result<()> {
+        <Self as HeaderCodec>::validate_for_wire(self).map_err(crate::protocol::header_codec::into_error)
+    }
+
+    fn to_map(&self) -> Option<HashMap<CheetahString, CheetahString>> {
+        let mut map = HashMap::with_capacity(<Self as HeaderCodec>::FIELD_COUNT_HINT);
+        self.try_encode_into_map(&mut map).ok()?;
+        Some(map)
+    }
+
+    fn encode_into_map(&self, out: &mut HashMap<CheetahString, CheetahString>) {
+        let _ = self.try_encode_into_map(out);
+    }
+
+    fn try_encode_into_map(
+        &self,
+        out: &mut HashMap<CheetahString, CheetahString>,
+    ) -> Result<(), ProtocolContractViolation> {
+        out.reserve(<Self as HeaderCodec>::FIELD_COUNT_HINT);
+        let mut sink = MapSink::new(out);
+        <Self as HeaderCodec>::encode_into(self, &mut sink)
+    }
+
+    fn resolve_wire_key(&self, key: &str) -> Option<ResolvedHeaderKey> {
+        <Self as HeaderCodec>::resolve_wire_key(key)
+    }
+
+    fn canonical_wire_key(&self, key: &str) -> Option<&'static str> {
+        <Self as HeaderCodec>::canonical_wire_key(key)
+    }
+
+    fn contains_wire_key(&self, key: &str) -> bool {
+        <Self as HeaderCodec>::contains_wire_key(key)
+    }
+
+    fn encoded_len_hint(&self) -> usize {
+        <Self as HeaderCodec>::encoded_len_hint(self)
+    }
+
+    fn encode_capability(&self) -> HeaderEncodeCapability {
+        HeaderEncodeCapability::DirectBinary
+    }
+
+    fn encode_direct_binary(&self, out: &mut BytesMut) -> Result<(), ProtocolContractViolation> {
+        let checkpoint = out.len();
+        // Java's V2 fast codec writes only the compact a..n fields. Inherited
+        // topic/RPC fields remain available through the compatibility map.
+        let result = {
+            let mut sink = BinarySink::new(out);
+            self.__request_header_codec_encode_local(&mut sink)
+        };
+        if result.is_err() {
+            out.truncate(checkpoint);
+        }
+        result
+    }
+
+    fn supports_direct_json_fields(&self) -> bool {
+        true
+    }
+
+    fn encode_direct_json_fields(&self, out: &mut BytesMut) -> Result<(), ProtocolContractViolation> {
+        let checkpoint = out.len();
+        let result = {
+            let mut sink = JsonSink::new(out);
+            let result = <Self as HeaderCodec>::encode_into(self, &mut sink);
+            if result.is_ok() {
+                sink.finish();
+            }
+            result
+        };
+        if result.is_err() {
+            out.truncate(checkpoint);
+        }
+        result
+    }
+
+    fn decode_fast(&mut self, fields: &HashMap<CheetahString, CheetahString>) -> rocketmq_error::Result<()> {
+        #[derive(Default)]
+        struct BorrowedFields<'a> {
+            a: Option<&'a CheetahString>,
+            b: Option<&'a CheetahString>,
+            c: Option<&'a CheetahString>,
+            d: Option<&'a CheetahString>,
+            e: Option<&'a CheetahString>,
+            f: Option<&'a CheetahString>,
+            g: Option<&'a CheetahString>,
+            h: Option<&'a CheetahString>,
+            i: Option<&'a CheetahString>,
+            j: Option<&'a CheetahString>,
+            k: Option<&'a CheetahString>,
+            l: Option<&'a CheetahString>,
+            m: Option<&'a CheetahString>,
+            n: Option<&'a CheetahString>,
+            broker_name: Option<&'a CheetahString>,
+            broker_name_alias: Option<&'a CheetahString>,
+            namespace: Option<&'a CheetahString>,
+            namespace_alias: Option<&'a CheetahString>,
+            namespaced: Option<&'a CheetahString>,
+            namespaced_alias: Option<&'a CheetahString>,
+            oneway: Option<&'a CheetahString>,
+            oneway_alias: Option<&'a CheetahString>,
+            lo: Option<&'a CheetahString>,
+        }
+
+        #[inline(always)]
+        fn required<'a>(
+            value: Option<&'a CheetahString>,
+            field: &'static str,
+        ) -> rocketmq_error::Result<&'a CheetahString> {
+            value.ok_or_else(|| {
+                crate::error::serialization_decode_failed("header", format!("The field {field} is required."))
+            })
+        }
+
+        #[inline(always)]
+        fn parse_required<T: FromStr>(value: Option<&CheetahString>, field: &'static str) -> rocketmq_error::Result<T> {
+            required(value, field)?
+                .parse()
+                .map_err(|_| crate::error::serialization_decode_failed("header", format!("Parse field {field} error")))
+        }
+
+        #[inline(always)]
+        fn parse_optional<T: FromStr>(
+            value: Option<&CheetahString>,
+            field: &'static str,
+        ) -> rocketmq_error::Result<Option<T>> {
+            value
+                .map(|value| {
+                    value.parse().map_err(|_| {
+                        crate::error::serialization_decode_failed("header", format!("Parse field {field} error"))
+                    })
+                })
+                .transpose()
+        }
+
+        let mut slots = BorrowedFields::default();
+        for (key, value) in fields {
+            match key.as_str() {
+                FIELD_A => slots.a = Some(value),
+                FIELD_B => slots.b = Some(value),
+                FIELD_C => slots.c = Some(value),
+                FIELD_D => slots.d = Some(value),
+                FIELD_E => slots.e = Some(value),
+                FIELD_F => slots.f = Some(value),
+                FIELD_G => slots.g = Some(value),
+                FIELD_H => slots.h = Some(value),
+                FIELD_I => slots.i = Some(value),
+                FIELD_J => slots.j = Some(value),
+                FIELD_K => slots.k = Some(value),
+                FIELD_L => slots.l = Some(value),
+                FIELD_M => slots.m = Some(value),
+                FIELD_N => slots.n = Some(value),
+                FIELD_BROKER_NAME => slots.broker_name = Some(value),
+                "brokerName" => slots.broker_name_alias = Some(value),
+                FIELD_NAMESPACE => slots.namespace = Some(value),
+                "namespace" => slots.namespace_alias = Some(value),
+                FIELD_NAMESPACED => slots.namespaced = Some(value),
+                "namespaced" => slots.namespaced_alias = Some(value),
+                FIELD_ONEWAY => slots.oneway = Some(value),
+                "oneway" => slots.oneway_alias = Some(value),
+                FIELD_LO => slots.lo = Some(value),
+                _ => {}
+            }
+        }
+
+        self.a = required(slots.a, FIELD_A)?.clone();
+        self.b = required(slots.b, FIELD_B)?.clone();
+        self.c = required(slots.c, FIELD_C)?.clone();
+        self.d = parse_required(slots.d, FIELD_D)?;
+        self.e = parse_required(slots.e, FIELD_E)?;
+        self.f = parse_required(slots.f, FIELD_F)?;
+        self.g = parse_required(slots.g, FIELD_G)?;
+        self.h = parse_required(slots.h, FIELD_H)?;
+        self.i = slots.i.cloned();
+        self.j = parse_optional(slots.j, FIELD_J)?;
+        self.k = parse_optional(slots.k, FIELD_K)?;
+        self.l = parse_optional(slots.l, FIELD_L)?;
+        self.m = parse_optional(slots.m, FIELD_M)?;
+        self.n = slots.n.cloned();
+
+        let namespace = slots.namespace.or(slots.namespace_alias).cloned();
+        let namespaced = parse_optional(slots.namespaced.or(slots.namespaced_alias), FIELD_NAMESPACED)?;
+        let broker_name = slots.broker_name.or(slots.broker_name_alias).cloned();
+        let oneway = parse_optional(slots.oneway.or(slots.oneway_alias), FIELD_ONEWAY)?;
+        self.topic_request_header = Some(TopicRequestHeader {
+            rpc_request_header: Some(RpcRequestHeader {
+                namespace,
+                namespaced,
+                broker_name,
+                oneway,
+            }),
+            lo: parse_optional(slots.lo, FIELD_LO)?,
+        });
+        Ok(())
+    }
+
+    fn support_fast_codec(&self) -> bool {
+        true
+    }
+}
+
+impl FromMap for SendMessageRequestHeaderV2 {
+    type Error = rocketmq_error::Error;
+
+    type Target = Self;
+    const SUPPORTS_HEADER_FIELD_SOURCE: bool = true;
+
+    fn from(map: &HashMap<CheetahString, CheetahString>) -> Result<Self::Target, Self::Error> {
+        <Self as HeaderCodec>::decode_from_map(map).map_err(crate::protocol::header_codec::into_error)
+    }
+
+    fn from_field_source(source: &dyn HeaderFieldSource) -> Result<Self::Target, Self::Error> {
+        Self::decode_from_field_source(source).map_err(crate::protocol::header_codec::into_error)
+    }
+}
+
+impl SendMessageRequestHeaderV2 {
+    fn decode_from_field_source(source: &dyn HeaderFieldSource) -> Result<Self, ProtocolContractViolation> {
+        #[derive(Default)]
+        struct SourceFields<'a> {
+            a: Option<&'a str>,
+            b: Option<&'a str>,
+            c: Option<&'a str>,
+            d: Option<&'a str>,
+            e: Option<&'a str>,
+            f: Option<&'a str>,
+            g: Option<&'a str>,
+            h: Option<&'a str>,
+            i: Option<&'a str>,
+            j: Option<&'a str>,
+            k: Option<&'a str>,
+            l: Option<&'a str>,
+            m: Option<&'a str>,
+            n: Option<&'a str>,
+            broker_name: Option<&'a str>,
+            broker_name_alias: Option<&'a str>,
+            namespace: Option<&'a str>,
+            namespace_alias: Option<&'a str>,
+            namespaced: Option<&'a str>,
+            namespaced_alias: Option<&'a str>,
+            oneway: Option<&'a str>,
+            oneway_alias: Option<&'a str>,
+            lo: Option<&'a str>,
+        }
+
+        #[inline(always)]
+        fn required<T: HeaderValue>(
+            raw: Option<&str>,
+            header: &'static str,
+            key: &'static str,
+        ) -> Result<T, ProtocolContractViolation> {
+            let context = HeaderFieldContext::new(header, key, T::KIND, None);
+            T::decode(raw.ok_or(ProtocolContractViolation::Missing { header, key })?, context)
+        }
+
+        #[inline(always)]
+        fn optional<T: HeaderValue>(
+            raw: Option<&str>,
+            header: &'static str,
+            key: &'static str,
+        ) -> Result<Option<T>, ProtocolContractViolation> {
+            let context = HeaderFieldContext::new(header, key, T::KIND, None);
+            raw.map(|value| T::decode(value, context)).transpose()
+        }
+
+        let mut fields = SourceFields::default();
+        source.visit_fields_while(&mut |key, value| {
+            match key {
+                FIELD_A => fields.a = Some(value),
+                FIELD_B => fields.b = Some(value),
+                FIELD_C => fields.c = Some(value),
+                FIELD_D => fields.d = Some(value),
+                FIELD_E => fields.e = Some(value),
+                FIELD_F => fields.f = Some(value),
+                FIELD_G => fields.g = Some(value),
+                FIELD_H => fields.h = Some(value),
+                FIELD_I => fields.i = Some(value),
+                FIELD_J => fields.j = Some(value),
+                FIELD_K => fields.k = Some(value),
+                FIELD_L => fields.l = Some(value),
+                FIELD_M => fields.m = Some(value),
+                FIELD_N => fields.n = Some(value),
+                FIELD_BROKER_NAME => fields.broker_name = Some(value),
+                "brokerName" => fields.broker_name_alias = Some(value),
+                FIELD_NAMESPACE => fields.namespace = Some(value),
+                "namespace" => fields.namespace_alias = Some(value),
+                FIELD_NAMESPACED => fields.namespaced = Some(value),
+                "namespaced" => fields.namespaced_alias = Some(value),
+                FIELD_ONEWAY => fields.oneway = Some(value),
+                "oneway" => fields.oneway_alias = Some(value),
+                FIELD_LO => fields.lo = Some(value),
+                _ => {}
+            }
+            true
+        });
+
+        let header_type = <Self as HeaderCodec>::TYPE_ID;
+        let a = required(fields.a, header_type, FIELD_A)?;
+        let b = required(fields.b, header_type, FIELD_B)?;
+        let c = required(fields.c, header_type, FIELD_C)?;
+        let d = required(fields.d, header_type, FIELD_D)?;
+        let e = required(fields.e, header_type, FIELD_E)?;
+        let f = required(fields.f, header_type, FIELD_F)?;
+        let g = required(fields.g, header_type, FIELD_G)?;
+        let h = required(fields.h, header_type, FIELD_H)?;
+        let i = optional(fields.i, header_type, FIELD_I)?;
+        let j = optional(fields.j, header_type, FIELD_J)?;
+        let k = optional(fields.k, header_type, FIELD_K)?;
+        let l = optional(fields.l, header_type, FIELD_L)?;
+        let m = optional(fields.m, header_type, FIELD_M)?;
+        let n = optional(fields.n, header_type, FIELD_N)?;
+
+        let rpc_type = <RpcRequestHeader as HeaderCodec>::TYPE_ID;
+        let rpc_request_header = RpcRequestHeader {
+            namespace: optional(fields.namespace.or(fields.namespace_alias), rpc_type, FIELD_NAMESPACE)?,
+            namespaced: optional(
+                fields.namespaced.or(fields.namespaced_alias),
+                rpc_type,
+                FIELD_NAMESPACED,
+            )?,
+            broker_name: optional(
+                fields.broker_name.or(fields.broker_name_alias),
+                rpc_type,
+                FIELD_BROKER_NAME,
+            )?,
+            oneway: optional(fields.oneway.or(fields.oneway_alias), rpc_type, FIELD_ONEWAY)?,
+        };
+        <RpcRequestHeader as HeaderCodec>::validate_for_wire(&rpc_request_header)?;
+
+        let topic_type = <TopicRequestHeader as HeaderCodec>::TYPE_ID;
+        let topic_request_header = TopicRequestHeader {
+            rpc_request_header: Some(rpc_request_header),
+            lo: optional(fields.lo, topic_type, FIELD_LO)?,
+        };
+        <TopicRequestHeader as HeaderCodec>::validate_for_wire(&topic_request_header)?;
+
+        let header = Self {
+            a,
+            b,
+            c,
+            d,
+            e,
+            f,
+            g,
+            h,
+            i,
+            j,
+            k,
+            l,
+            m,
+            n,
+            topic_request_header: Some(topic_request_header),
+        };
+        <Self as HeaderCodec>::validate_for_wire(&header)?;
+        Ok(header)
+    }
+
+    pub fn create_send_message_request_header_v1(this: &Self) -> SendMessageRequestHeader {
+        let topic_request_header = this.n.as_ref().map(|broker_name| TopicRequestHeader {
+            rpc_request_header: Some(RpcRequestHeader {
+                broker_name: Some(broker_name.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        SendMessageRequestHeader {
+            producer_group: this.a.clone(),
+            topic: this.b.clone(),
+            default_topic: this.c.clone(),
+            default_topic_queue_nums: this.d,
+            queue_id: this.e,
+            sys_flag: this.f,
+            born_timestamp: this.g,
+            flag: this.h,
+            properties: this.i.as_ref().cloned(),
+            reconsume_times: this.j,
+            unit_mode: this.k,
+            batch: this.m,
+            max_reconsume_times: this.l,
+            topic_request_header,
+        }
+    }
+
+    pub fn create_send_message_request_header_v2(v1: &SendMessageRequestHeader) -> SendMessageRequestHeaderV2 {
+        SendMessageRequestHeaderV2 {
+            a: v1.producer_group.clone(),
+            b: v1.topic.clone(),
+            c: v1.default_topic.clone(),
+            d: v1.default_topic_queue_nums,
+            e: v1.queue_id,
+            f: v1.sys_flag,
+            g: v1.born_timestamp,
+            h: v1.flag,
+            i: v1.properties.clone(),
+            j: v1.reconsume_times,
+            k: v1.unit_mode,
+            l: v1.max_reconsume_times,
+            m: v1.batch,
+            n: v1
+                .topic_request_header
+                .as_ref()
+                .and_then(|v| v.get_broker_name().cloned()),
+            topic_request_header: v1.topic_request_header.clone(),
+        }
+    }
+
+    pub fn create_send_message_request_header_v2_with_move(v1: SendMessageRequestHeader) -> SendMessageRequestHeaderV2 {
+        SendMessageRequestHeaderV2 {
+            a: v1.producer_group,
+            b: v1.topic,
+            c: v1.default_topic,
+            d: v1.default_topic_queue_nums,
+            e: v1.queue_id,
+            f: v1.sys_flag,
+            g: v1.born_timestamp,
+            h: v1.flag,
+            i: v1.properties,
+            j: v1.reconsume_times,
+            k: v1.unit_mode,
+            l: v1.max_reconsume_times,
+            m: v1.batch,
+            n: v1
+                .topic_request_header
+                .as_ref()
+                .and_then(|v| v.get_broker_name().cloned()),
+            topic_request_header: v1.topic_request_header,
+        }
+    }
+
+    #[inline]
+    fn topic_request_header_mut(&mut self) -> &mut TopicRequestHeader {
+        self.topic_request_header
+            .get_or_insert_with(TopicRequestHeader::default)
+    }
+
+    #[inline]
+    fn rpc_request_header_mut(&mut self) -> &mut RpcRequestHeader {
+        self.topic_request_header_mut()
+            .rpc_request_header
+            .get_or_insert_with(RpcRequestHeader::default)
+    }
+}
+
+impl TopicRequestHeaderTrait for SendMessageRequestHeaderV2 {
+    fn set_lo(&mut self, lo: Option<bool>) {
+        self.topic_request_header_mut().lo = lo;
+    }
+
+    fn lo(&self) -> Option<bool> {
+        self.topic_request_header.as_ref().and_then(|h| h.lo)
+    }
+
+    fn set_topic(&mut self, topic: CheetahString) {
+        self.b = topic;
+    }
+
+    fn topic(&self) -> &CheetahString {
+        &self.b
+    }
+
+    fn broker_name(&self) -> Option<&CheetahString> {
+        self.topic_request_header
+            .as_ref()
+            .and_then(|header| header.rpc_request_header.as_ref())
+            .and_then(|rpc_header| rpc_header.broker_name.as_ref())
+            .or(self.n.as_ref())
+    }
+
+    fn set_broker_name(&mut self, broker_name: CheetahString) {
+        self.n = Some(broker_name.clone());
+        self.rpc_request_header_mut().broker_name = Some(broker_name);
+    }
+
+    fn namespace(&self) -> Option<&str> {
+        self.topic_request_header
+            .as_ref()?
+            .rpc_request_header
+            .as_ref()?
+            .namespace
+            .as_deref()
+    }
+
+    fn set_namespace(&mut self, namespace: CheetahString) {
+        self.rpc_request_header_mut().namespace = Some(namespace);
+    }
+
+    fn namespaced(&self) -> Option<bool> {
+        self.topic_request_header
+            .as_ref()?
+            .rpc_request_header
+            .as_ref()?
+            .namespaced
+            .as_ref()
+            .cloned()
+    }
+
+    fn set_namespaced(&mut self, namespaced: bool) {
+        self.rpc_request_header_mut().namespaced = Some(namespaced);
+    }
+
+    fn oneway(&self) -> Option<bool> {
+        self.topic_request_header
+            .as_ref()?
+            .rpc_request_header
+            .as_ref()?
+            .oneway
+            .as_ref()
+            .cloned()
+    }
+
+    fn set_oneway(&mut self, oneway: bool) {
+        self.rpc_request_header_mut().oneway = Some(oneway);
+    }
+
+    fn queue_id(&self) -> i32 {
+        self.e
+    }
+
+    fn set_queue_id(&mut self, queue_id: i32) {
+        self.e = queue_id;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use cheetah_string::CheetahString;
+
+    use super::*;
+
+    fn minimal_header_v2() -> SendMessageRequestHeaderV2 {
+        SendMessageRequestHeaderV2 {
+            a: CheetahString::from_static_str("test_producer_group"),
+            b: CheetahString::from_static_str("test_topic"),
+            c: CheetahString::from_static_str("test_default_topic"),
+            d: 8,
+            e: 1,
+            f: 0,
+            g: 1622547800000,
+            h: 0,
+            i: None,
+            j: None,
+            k: None,
+            l: None,
+            m: None,
+            n: None,
+            topic_request_header: None,
+        }
+    }
+
+    fn required_fast_fields() -> HashMap<CheetahString, CheetahString> {
+        HashMap::from([
+            (
+                CheetahString::from_static_str(FIELD_A),
+                CheetahString::from_static_str("producer"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_B),
+                CheetahString::from_static_str("topic"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_C),
+                CheetahString::from_static_str("TBW102"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_D),
+                CheetahString::from_static_str("4"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_E),
+                CheetahString::from_static_str("0"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_F),
+                CheetahString::from_static_str("0"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_G),
+                CheetahString::from_static_str("1"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_H),
+                CheetahString::from_static_str("0"),
+            ),
+        ])
+    }
+
+    fn decode_fast_fields(encoded: &[u8]) -> HashMap<CheetahString, CheetahString> {
+        let mut fields = HashMap::new();
+        let mut cursor = 0;
+        while cursor < encoded.len() {
+            let key_len = u16::from_be_bytes(encoded[cursor..cursor + 2].try_into().unwrap()) as usize;
+            cursor += 2;
+            let key = std::str::from_utf8(&encoded[cursor..cursor + key_len]).unwrap();
+            cursor += key_len;
+            let value_len = u32::from_be_bytes(encoded[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            let value = std::str::from_utf8(&encoded[cursor..cursor + value_len]).unwrap();
+            cursor += value_len;
+            fields.insert(key.into(), value.into());
+        }
+        fields
+    }
+
+    #[test]
+    fn send_message_request_header_v2_serializes_correctly() {
+        let header = SendMessageRequestHeaderV2 {
+            a: CheetahString::from_static_str("test_producer_group"),
+            b: CheetahString::from_static_str("test_topic"),
+            c: CheetahString::from_static_str("test_default_topic"),
+            d: 8,
+            e: 1,
+            f: 0,
+            g: 1622547800000,
+            h: 0,
+            i: Some(CheetahString::from_static_str("test_properties")),
+            j: Some(3),
+            k: Some(true),
+            l: Some(5),
+            m: Some(false),
+            n: Some(CheetahString::from_static_str("test_broker_name")),
+            topic_request_header: None,
+        };
+        let map = header.to_map().unwrap();
+        assert_eq!(
+            map.get(&CheetahString::from_static_str("a")).unwrap(),
+            "test_producer_group"
+        );
+        assert_eq!(map.get(&CheetahString::from_static_str("b")).unwrap(), "test_topic");
+        assert_eq!(
+            map.get(&CheetahString::from_static_str("c")).unwrap(),
+            "test_default_topic"
+        );
+        assert_eq!(map.get(&CheetahString::from_static_str("d")).unwrap(), "8");
+        assert_eq!(map.get(&CheetahString::from_static_str("e")).unwrap(), "1");
+        assert_eq!(map.get(&CheetahString::from_static_str("f")).unwrap(), "0");
+        assert_eq!(map.get(&CheetahString::from_static_str("g")).unwrap(), "1622547800000");
+        assert_eq!(map.get(&CheetahString::from_static_str("h")).unwrap(), "0");
+        assert_eq!(
+            map.get(&CheetahString::from_static_str("i")).unwrap(),
+            "test_properties"
+        );
+        assert_eq!(map.get(&CheetahString::from_static_str("j")).unwrap(), "3");
+        assert_eq!(map.get(&CheetahString::from_static_str("k")).unwrap(), "true");
+        assert_eq!(map.get(&CheetahString::from_static_str("l")).unwrap(), "5");
+        assert_eq!(map.get(&CheetahString::from_static_str("m")).unwrap(), "false");
+        assert_eq!(
+            map.get(&CheetahString::from_static_str("n")).unwrap(),
+            "test_broker_name"
+        );
+    }
+
+    #[test]
+    fn manual_header_shim_opts_into_direct_field_source_decode() {
+        let header = minimal_header_v2();
+        let fields = header.to_map().unwrap();
+
+        const { assert!(<SendMessageRequestHeaderV2 as FromMap>::SUPPORTS_HEADER_FIELD_SOURCE) };
+        let decoded = <SendMessageRequestHeaderV2 as FromMap>::from_field_source(&fields).unwrap();
+
+        assert_eq!(decoded.a, header.a);
+        assert_eq!(decoded.b, header.b);
+        assert_eq!(decoded.c, header.c);
+        assert_eq!(decoded.d, header.d);
+        assert_eq!(decoded.g, header.g);
+    }
+
+    #[test]
+    fn single_scan_field_source_decode_matches_generated_codec_semantics() {
+        let mut fields = required_fast_fields();
+        fields.extend([
+            (FIELD_I.into(), "properties".into()),
+            (FIELD_J.into(), "3".into()),
+            (FIELD_K.into(), "true".into()),
+            (FIELD_L.into(), "5".into()),
+            (FIELD_M.into(), "false".into()),
+            (FIELD_N.into(), "v2-broker".into()),
+            (FIELD_NAMESPACE.into(), "canonical-namespace".into()),
+            ("namespace".into(), "alias-namespace".into()),
+            (FIELD_NAMESPACED.into(), "true".into()),
+            ("namespaced".into(), "false".into()),
+            (FIELD_BROKER_NAME.into(), "canonical-broker".into()),
+            ("brokerName".into(), "alias-broker".into()),
+            (FIELD_ONEWAY.into(), "false".into()),
+            ("oneway".into(), "true".into()),
+            (FIELD_LO.into(), "true".into()),
+        ]);
+
+        let expected = <SendMessageRequestHeaderV2 as HeaderCodec>::decode_from_source(&fields).unwrap();
+        let actual = SendMessageRequestHeaderV2::decode_from_field_source(&fields).unwrap();
+
+        assert_eq!(actual.to_map(), expected.to_map());
+    }
+
+    #[test]
+    fn single_scan_field_source_decode_preserves_codec_error_classification() {
+        for (key, value) in [(FIELD_J, "invalid-i32"), (FIELD_NAMESPACED, "invalid-bool")] {
+            let mut fields = required_fast_fields();
+            fields.insert(key.into(), value.into());
+
+            let expected = <SendMessageRequestHeaderV2 as HeaderCodec>::decode_from_source(&fields)
+                .unwrap_err()
+                .to_string();
+            let actual = SendMessageRequestHeaderV2::decode_from_field_source(&fields)
+                .unwrap_err()
+                .to_string();
+
+            assert_eq!(actual, expected, "classification drifted for {key}");
+        }
+    }
+
+    #[test]
+    fn topic_request_header_setters_preserve_map_fields_without_expanding_java_v2_fast_fields() {
+        let mut header = minimal_header_v2();
+
+        header.set_lo(Some(true));
+        header.set_broker_name(CheetahString::from_static_str("broker-a"));
+        header.set_namespace(CheetahString::from_static_str("ns-a"));
+        header.set_namespaced(true);
+        header.set_oneway(true);
+
+        assert_eq!(header.lo(), Some(true));
+        assert_eq!(header.broker_name().map(CheetahString::as_str), Some("broker-a"));
+        assert_eq!(header.namespace(), Some("ns-a"));
+        assert_eq!(header.namespaced(), Some(true));
+        assert_eq!(header.oneway(), Some(true));
+
+        let map = header.to_map().expect("header should encode");
+        assert_eq!(map.get("n").map(CheetahString::as_str), Some("broker-a"));
+        assert_eq!(map.get("lo").map(CheetahString::as_str), Some("true"));
+        assert_eq!(map.get("bname").map(CheetahString::as_str), Some("broker-a"));
+        assert_eq!(map.get("ns").map(CheetahString::as_str), Some("ns-a"));
+        assert_eq!(map.get("nsd").map(CheetahString::as_str), Some("true"));
+        assert_eq!(map.get("oway").map(CheetahString::as_str), Some("true"));
+
+        let mut encoded = BytesMut::new();
+        header.encode_fast(&mut encoded);
+        let fast_fields = decode_fast_fields(&encoded);
+        assert_eq!(fast_fields.get("n").map(CheetahString::as_str), Some("broker-a"));
+        for inherited in ["bname", "ns", "nsd", "oway", "lo"] {
+            assert!(!fast_fields.contains_key(inherited));
+        }
+    }
+
+    #[test]
+    fn create_v1_preserves_java_v2_broker_name_field() {
+        let mut header = minimal_header_v2();
+        header.n = Some(CheetahString::from_static_str("broker-from-v2"));
+
+        let converted = SendMessageRequestHeaderV2::create_send_message_request_header_v1(&header);
+
+        assert_eq!(
+            converted.broker_name().map(CheetahString::as_str),
+            Some("broker-from-v2")
+        );
+    }
+
+    #[test]
+    fn send_message_request_header_v2_deserializes_correctly() {
+        let mut map = HashMap::new();
+        map.insert(
+            CheetahString::from_static_str("a"),
+            CheetahString::from_static_str("test_producer_group"),
+        );
+        map.insert(
+            CheetahString::from_static_str("b"),
+            CheetahString::from_static_str("test_topic"),
+        );
+        map.insert(
+            CheetahString::from_static_str("c"),
+            CheetahString::from_static_str("test_default_topic"),
+        );
+        map.insert(CheetahString::from_static_str("d"), CheetahString::from_static_str("8"));
+        map.insert(CheetahString::from_static_str("e"), CheetahString::from_static_str("1"));
+        map.insert(CheetahString::from_static_str("f"), CheetahString::from_static_str("0"));
+        map.insert(
+            CheetahString::from_static_str("g"),
+            CheetahString::from_static_str("1622547800000"),
+        );
+        map.insert(CheetahString::from_static_str("h"), CheetahString::from_static_str("0"));
+        map.insert(
+            CheetahString::from_static_str("i"),
+            CheetahString::from_static_str("test_properties"),
+        );
+        map.insert(CheetahString::from_static_str("j"), CheetahString::from_static_str("3"));
+        map.insert(
+            CheetahString::from_static_str("k"),
+            CheetahString::from_static_str("true"),
+        );
+        map.insert(CheetahString::from_static_str("l"), CheetahString::from_static_str("5"));
+        map.insert(
+            CheetahString::from_static_str("m"),
+            CheetahString::from_static_str("false"),
+        );
+        map.insert(
+            CheetahString::from_static_str("n"),
+            CheetahString::from_static_str("test_broker_name"),
+        );
+
+        let header = <SendMessageRequestHeaderV2 as FromMap>::from(&map).unwrap();
+        assert_eq!(header.a, "test_producer_group");
+        assert_eq!(header.b, "test_topic");
+        assert_eq!(header.c, "test_default_topic");
+        assert_eq!(header.d, 8);
+        assert_eq!(header.e, 1);
+        assert_eq!(header.f, 0);
+        assert_eq!(header.g, 1622547800000);
+        assert_eq!(header.h, 0);
+        assert_eq!(header.i.unwrap(), "test_properties");
+        assert_eq!(header.j.unwrap(), 3);
+        assert!(header.k.unwrap());
+        assert_eq!(header.l.unwrap(), 5);
+        assert!(!header.m.unwrap());
+        assert_eq!(header.n.unwrap(), "test_broker_name");
+    }
+
+    #[test]
+    fn send_message_request_header_v2_handles_missing_optional_fields() {
+        let mut map = HashMap::new();
+        map.insert(
+            CheetahString::from_static_str("a"),
+            CheetahString::from_static_str("test_producer_group"),
+        );
+        map.insert(
+            CheetahString::from_static_str("b"),
+            CheetahString::from_static_str("test_topic"),
+        );
+        map.insert(
+            CheetahString::from_static_str("c"),
+            CheetahString::from_static_str("test_default_topic"),
+        );
+        map.insert(CheetahString::from_static_str("d"), CheetahString::from_static_str("8"));
+        map.insert(CheetahString::from_static_str("e"), CheetahString::from_static_str("1"));
+        map.insert(CheetahString::from_static_str("f"), CheetahString::from_static_str("0"));
+        map.insert(
+            CheetahString::from_static_str("g"),
+            CheetahString::from_static_str("1622547800000"),
+        );
+        map.insert(CheetahString::from_static_str("h"), CheetahString::from_static_str("0"));
+
+        let header = <SendMessageRequestHeaderV2 as FromMap>::from(&map).unwrap();
+        assert_eq!(header.a, "test_producer_group");
+        assert_eq!(header.b, "test_topic");
+        assert_eq!(header.c, "test_default_topic");
+        assert_eq!(header.d, 8);
+        assert_eq!(header.e, 1);
+        assert_eq!(header.f, 0);
+        assert_eq!(header.g, 1622547800000);
+        assert_eq!(header.h, 0);
+        assert!(header.i.is_none());
+        assert!(header.j.is_none());
+        assert!(header.k.is_none());
+        assert!(header.l.is_none());
+        assert!(header.m.is_none());
+        assert!(header.n.is_none());
+    }
+
+    #[test]
+    fn send_message_request_header_v2_handles_invalid_data() {
+        let mut map = HashMap::new();
+        map.insert(
+            CheetahString::from_static_str("a"),
+            CheetahString::from_static_str("test_producer_group"),
+        );
+        map.insert(
+            CheetahString::from_static_str("b"),
+            CheetahString::from_static_str("test_topic"),
+        );
+        map.insert(
+            CheetahString::from_static_str("c"),
+            CheetahString::from_static_str("test_default_topic"),
+        );
+        map.insert(
+            CheetahString::from_static_str("d"),
+            CheetahString::from_static_str("invalid"),
+        );
+        map.insert(
+            CheetahString::from_static_str("e"),
+            CheetahString::from_static_str("invalid"),
+        );
+        map.insert(
+            CheetahString::from_static_str("f"),
+            CheetahString::from_static_str("invalid"),
+        );
+        map.insert(
+            CheetahString::from_static_str("g"),
+            CheetahString::from_static_str("invalid"),
+        );
+        map.insert(
+            CheetahString::from_static_str("h"),
+            CheetahString::from_static_str("invalid"),
+        );
+
+        let result = <SendMessageRequestHeaderV2 as FromMap>::from(&map);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_fast_rejects_invalid_optional_reconsume_times_without_panic() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            CheetahString::from_static_str("a"),
+            CheetahString::from_static_str("producer"),
+        );
+        fields.insert(
+            CheetahString::from_static_str("b"),
+            CheetahString::from_static_str("topic"),
+        );
+        fields.insert(
+            CheetahString::from_static_str("c"),
+            CheetahString::from_static_str("TBW102"),
+        );
+        fields.insert(CheetahString::from_static_str("d"), CheetahString::from_static_str("4"));
+        fields.insert(CheetahString::from_static_str("e"), CheetahString::from_static_str("0"));
+        fields.insert(CheetahString::from_static_str("f"), CheetahString::from_static_str("0"));
+        fields.insert(CheetahString::from_static_str("g"), CheetahString::from_static_str("1"));
+        fields.insert(CheetahString::from_static_str("h"), CheetahString::from_static_str("0"));
+        fields.insert(
+            CheetahString::from_static_str("j"),
+            CheetahString::from_static_str("bad"),
+        );
+
+        let mut header = minimal_header_v2();
+        let result = header.decode_fast(&fields);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_fast_single_scan_preserves_alias_precedence_and_clears_absent_optionals() {
+        let mut fields = required_fast_fields();
+        fields.extend([
+            (
+                CheetahString::from_static_str(FIELD_I),
+                CheetahString::from_static_str("properties"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_J),
+                CheetahString::from_static_str("3"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_K),
+                CheetahString::from_static_str("true"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_L),
+                CheetahString::from_static_str("5"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_M),
+                CheetahString::from_static_str("false"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_N),
+                CheetahString::from_static_str("legacy-broker"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_NAMESPACE),
+                CheetahString::from_static_str("canonical-namespace"),
+            ),
+            (
+                CheetahString::from_static_str("namespace"),
+                CheetahString::from_static_str("alias-namespace"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_BROKER_NAME),
+                CheetahString::from_static_str("canonical-broker"),
+            ),
+            (
+                CheetahString::from_static_str("brokerName"),
+                CheetahString::from_static_str("alias-broker"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_NAMESPACED),
+                CheetahString::from_static_str("true"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_ONEWAY),
+                CheetahString::from_static_str("false"),
+            ),
+            (
+                CheetahString::from_static_str(FIELD_LO),
+                CheetahString::from_static_str("true"),
+            ),
+        ]);
+
+        let mut header = SendMessageRequestHeaderV2::default();
+        header.decode_fast(&fields).expect("dense fast fields");
+        let topic = header.topic_request_header.as_ref().expect("topic header");
+        let rpc = topic.rpc_request_header.as_ref().expect("rpc header");
+        assert_eq!(rpc.namespace.as_deref(), Some("canonical-namespace"));
+        assert_eq!(rpc.broker_name.as_deref(), Some("canonical-broker"));
+        assert_eq!(rpc.namespaced, Some(true));
+        assert_eq!(rpc.oneway, Some(false));
+        assert_eq!(topic.lo, Some(true));
+        assert_eq!(header.i.as_deref(), Some("properties"));
+
+        header
+            .decode_fast(&required_fast_fields())
+            .expect("required-only fast fields");
+        assert!(header.i.is_none());
+        assert!(header.j.is_none());
+        assert!(header.k.is_none());
+        assert!(header.l.is_none());
+        assert!(header.m.is_none());
+        assert!(header.n.is_none());
+        let rpc = header
+            .topic_request_header
+            .as_ref()
+            .and_then(|topic| topic.rpc_request_header.as_ref())
+            .expect("rpc header remains structurally present");
+        assert_eq!(rpc.namespace, None);
+        assert_eq!(rpc.broker_name, None);
+        assert_eq!(rpc.namespaced, None);
+        assert_eq!(rpc.oneway, None);
+    }
+
+    #[test]
+    fn from_map_rejects_invalid_optional_reconsume_times() {
+        let mut map = HashMap::new();
+        map.insert(
+            CheetahString::from_static_str("a"),
+            CheetahString::from_static_str("producer"),
+        );
+        map.insert(
+            CheetahString::from_static_str("b"),
+            CheetahString::from_static_str("topic"),
+        );
+        map.insert(
+            CheetahString::from_static_str("c"),
+            CheetahString::from_static_str("TBW102"),
+        );
+        map.insert(CheetahString::from_static_str("d"), CheetahString::from_static_str("4"));
+        map.insert(CheetahString::from_static_str("e"), CheetahString::from_static_str("0"));
+        map.insert(CheetahString::from_static_str("f"), CheetahString::from_static_str("0"));
+        map.insert(CheetahString::from_static_str("g"), CheetahString::from_static_str("1"));
+        map.insert(CheetahString::from_static_str("h"), CheetahString::from_static_str("0"));
+        map.insert(
+            CheetahString::from_static_str("j"),
+            CheetahString::from_static_str("bad"),
+        );
+
+        let result = <SendMessageRequestHeaderV2 as FromMap>::from(&map);
+
+        assert!(result.is_err());
+    }
+}

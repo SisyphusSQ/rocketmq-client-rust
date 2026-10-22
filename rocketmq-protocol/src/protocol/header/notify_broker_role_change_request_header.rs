@@ -1,0 +1,65 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use rocketmq_macros::RequestHeaderCodec;
+use std::fmt::Display;
+
+use cheetah_string::CheetahString;
+use serde::Deserialize;
+use serde::Serialize;
+
+#[derive(Serialize, Deserialize, Debug, RequestHeaderCodec)]
+#[serde(rename_all = "camelCase")]
+#[header(
+    type_id = "rocketmq_protocol::protocol::header::notify_broker_role_change_request_header::NotifyBrokerRoleChangedRequestHeader",
+    java_class = "org.apache.rocketmq.remoting.protocol.header.NotifyBrokerRoleChangedRequestHeader"
+)]
+pub struct NotifyBrokerRoleChangedRequestHeader {
+    pub master_address: Option<CheetahString>,
+
+    pub master_epoch: Option<i32>,
+
+    pub sync_state_set_epoch: Option<i32>,
+
+    #[header(range = "i64")]
+    pub master_broker_id: Option<u64>,
+}
+
+impl Display for NotifyBrokerRoleChangedRequestHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "(master_address={:?}, master_epoch={:?}, sync_state_set_epoch={:?}, master_broker_id={:?})",
+            self.master_address, self.master_epoch, self.sync_state_set_epoch, self.master_broker_id
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notify_broker_role_changed_request_header_display() {
+        let header = NotifyBrokerRoleChangedRequestHeader {
+            master_address: Some(CheetahString::from("addr")),
+            master_epoch: Some(1),
+            sync_state_set_epoch: Some(2),
+            master_broker_id: Some(3),
+        };
+        let display = format!("{}", header);
+        let expected = r#"(master_address=Some("addr"), master_epoch=Some(1), sync_state_set_epoch=Some(2), master_broker_id=Some(3))"#;
+        assert_eq!(display, expected);
+    }
+}

@@ -1,0 +1,67 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use rocketmq_macros::RequestHeaderCodec;
+use serde::Deserialize;
+use serde::Serialize;
+
+use crate::rpc::rpc_request_header::RpcRequestHeader;
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default, RequestHeaderCodec)]
+#[header(
+    type_id = "rocketmq_protocol::protocol::header::lite_subscription_ctl_request_header::LiteSubscriptionCtlRequestHeader",
+    java_class = "org.apache.rocketmq.remoting.protocol.header.LiteSubscriptionCtlRequestHeader"
+)]
+#[serde(rename_all = "camelCase")]
+pub struct LiteSubscriptionCtlRequestHeader {
+    #[serde(flatten)]
+    #[header(flatten, presence = "always")]
+    pub rpc_request_header: Option<RpcRequestHeader>,
+}
+
+#[cfg(test)]
+mod tests {
+    use cheetah_string::CheetahString;
+
+    use super::*;
+    use crate::protocol::command_custom_header::CommandCustomHeader;
+    use crate::protocol::command_custom_header::FromMap;
+
+    #[test]
+    fn lite_subscription_ctl_request_header_maps_rpc_fields_like_java_header() {
+        let header = LiteSubscriptionCtlRequestHeader {
+            rpc_request_header: Some(RpcRequestHeader {
+                broker_name: Some(CheetahString::from_static_str("broker-a")),
+                namespace: Some(CheetahString::from_static_str("ns-a")),
+                namespaced: Some(false),
+                oneway: Some(true),
+            }),
+        };
+
+        let map = header.to_map().expect("header should encode");
+        assert_eq!(map.get("bname").map(|value| value.as_str()), Some("broker-a"));
+        assert_eq!(map.get("ns").map(|value| value.as_str()), Some("ns-a"));
+        assert_eq!(map.get("nsd").map(|value| value.as_str()), Some("false"));
+        assert_eq!(map.get("oway").map(|value| value.as_str()), Some("true"));
+
+        let decoded = <LiteSubscriptionCtlRequestHeader as FromMap>::from(&map).expect("header should decode");
+        let rpc = decoded
+            .rpc_request_header
+            .expect("flattened rpc request header should decode");
+        assert_eq!(rpc.broker_name.as_deref(), Some("broker-a"));
+        assert_eq!(rpc.namespace.as_deref(), Some("ns-a"));
+        assert_eq!(rpc.namespaced, Some(false));
+        assert_eq!(rpc.oneway, Some(true));
+    }
+}

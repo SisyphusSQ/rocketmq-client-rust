@@ -1,0 +1,186 @@
+// Copyright 2026 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Explicit test fixtures excluded from default production builds.
+
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use rocketmq_runtime::TaskGroup;
+
+use crate::base::pending_request_table::PendingRequestTable;
+use crate::error_helpers::TransportStage;
+use crate::net::channel::Channel;
+use crate::net::channel::ChannelInner;
+use crate::session_view::SessionId;
+
+mod embedded;
+pub use embedded::EmbeddedRequestHarness;
+
+pub use crate::client::connect_target_with_config_options_and_telemetry;
+pub use crate::client::connect_with_config;
+pub use crate::client::connect_with_config_and_telemetry;
+pub use crate::client::connect_with_config_options_and_telemetry;
+pub use crate::codec::remoting_command_codec::RemotingCommandCodec;
+pub use crate::connection::transport_io_snapshot;
+pub use crate::connection::Connection;
+pub use crate::server::run_connected_session;
+pub use crate::server::run_connected_session_with_io_policy;
+pub use crate::server::ConnectionHandler;
+pub use crate::server::SessionHandle;
+pub use crate::server::SessionIoPolicy;
+pub use crate::server::SessionProcessor;
+pub use crate::server::SessionTransportServer;
+pub use crate::server::SessionTransportServerConfig;
+pub use crate::server::TransportListener;
+#[cfg(not(feature = "tls"))]
+pub use crate::tls::tls_disabled_error;
+pub use crate::write_strategy::FrameWriteMode;
+pub use crate::write_strategy::FrameWriter;
+pub use crate::writer_runtime::MicroBatchConfig;
+pub use crate::writer_runtime::WriterQueueConfig;
+
+/// Creates a stable session identity for downstream behavior tests.
+///
+/// Production code cannot construct [`SessionId`] values; it receives them from the trusted
+/// transport boundary. This fixture is available only when the explicit `test-support` feature is
+/// enabled and rejects the sentinels excluded by the production allocator.
+#[must_use]
+pub fn session_id_for_test(owner_id: u64) -> SessionId {
+    assert!(
+        !matches!(owner_id, 0 | u64::MAX),
+        "test session owner must use a production-valid identity"
+    );
+    SessionId::from_session_owner(owner_id)
+}
+
+/// Owns both ends of a loopback connection for downstream channel lifecycle
+/// tests without constructing a processor or handler context.
+pub struct LocalChannelHarness {
+    channel: Channel,
+    _peer: Connection,
+}
+
+impl LocalChannelHarness {
+    /// Creates a connected loopback channel owned by `parent_task_group`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the loopback socket cannot be created or the
+    /// channel task cannot be registered with its lifecycle owner.
+    pub async fn new(parent_task_group: TaskGroup) -> Result<Self, rocketmq_error::SharedError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|source| crate::error_helpers::connection_failed(TransportStage::Connect, source))?;
+        let server_addr = listener
+            .local_addr()
+            .map_err(|source| crate::error_helpers::connection_failed(TransportStage::Connect, source))?;
+        let (client_stream, (server_stream, _)) =
+            tokio::try_join!(tokio::net::TcpStream::connect(server_addr), listener.accept())
+                .map_err(|source| crate::error_helpers::connection_failed(TransportStage::Connect, source))?;
+
+        let local_address = server_stream
+            .local_addr()
+            .map_err(|source| crate::error_helpers::connection_failed(TransportStage::Connect, source))?;
+        let remote_address = server_stream
+            .peer_addr()
+            .map_err(|source| crate::error_helpers::connection_failed(TransportStage::Connect, source))?;
+        let client_peer = client_stream
+            .peer_addr()
+            .map_err(|source| crate::error_helpers::connection_failed(TransportStage::Connect, source))?;
+        let client_local = client_stream
+            .local_addr()
+            .map_err(|source| crate::error_helpers::connection_failed(TransportStage::Connect, source))?;
+        debug_assert_eq!(local_address, client_peer);
+        debug_assert_eq!(remote_address, client_local);
+
+        let channel = TestChannelBuilder::new(Connection::new(server_stream), parent_task_group)
+            .addresses(local_address, remote_address)
+            .build()?;
+        Ok(Self {
+            channel,
+            _peer: Connection::new(client_stream),
+        })
+    }
+
+    #[must_use]
+    pub fn channel(&self) -> Channel {
+        self.channel.clone()
+    }
+
+    #[must_use]
+    pub fn local_address(&self) -> SocketAddr {
+        self.channel.local_address()
+    }
+
+    #[must_use]
+    pub fn remote_address(&self) -> SocketAddr {
+        self.channel.remote_address()
+    }
+}
+
+/// Builds a real transport-backed channel for downstream tests without
+/// exposing response-table or channel ownership internals.
+pub struct TestChannelBuilder {
+    connection: Connection,
+    task_group: TaskGroup,
+    local_address: SocketAddr,
+    remote_address: SocketAddr,
+}
+
+impl TestChannelBuilder {
+    #[must_use]
+    pub fn new(connection: Connection, task_group: TaskGroup) -> Self {
+        let unspecified = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        Self {
+            connection,
+            task_group,
+            local_address: unspecified,
+            remote_address: unspecified,
+        }
+    }
+
+    #[must_use]
+    pub fn addresses(mut self, local_address: SocketAddr, remote_address: SocketAddr) -> Self {
+        self.local_address = local_address;
+        self.remote_address = remote_address;
+        self
+    }
+
+    /// Installs a deterministic one-shot barrier immediately before the first
+    /// possible socket write.
+    #[must_use]
+    pub fn write_preflight_barrier(
+        mut self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.connection
+            .set_write_preflight_barrier(crate::write_strategy::WritePreflightBarrier::new(entered, release));
+        self
+    }
+
+    /// Creates the channel and registers its sole send task under the supplied task group.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lifecycle owner cannot register the send task.
+    pub fn build(self) -> Result<Channel, rocketmq_error::SharedError> {
+        let inner =
+            ChannelInner::try_new_with_pending_requests(self.connection, PendingRequestTable::new(), self.task_group)?;
+        Ok(Channel::new(Arc::new(inner), self.local_address, self.remote_address))
+    }
+}

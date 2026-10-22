@@ -1,0 +1,2716 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::BinaryHeap;
+use std::collections::HashSet;
+use std::future::Future;
+use std::hash::Hash;
+use std::hash::Hasher;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::MutexGuard as StdMutexGuard;
+use std::time::Duration;
+use std::time::Instant;
+
+use crate::ClientError;
+use cheetah_string::CheetahString;
+use dashmap::DashMap;
+use rocketmq_model::common::message::message_batch::MessageBatch;
+use rocketmq_model::common::message::message_queue::MessageQueue;
+use rocketmq_model::common::message::message_single::Message;
+use rocketmq_model::common::message::MessageConst;
+use rocketmq_model::common::message::MessageTrait;
+use rocketmq_runtime::common::time_utils::current_millis;
+use rocketmq_runtime::BudgetLimit;
+use rocketmq_runtime::BudgetedItem;
+use rocketmq_runtime::BudgetedQueue;
+use rocketmq_runtime::ChildServiceContext;
+use rocketmq_runtime::FullPolicy;
+use rocketmq_runtime::RateLimit;
+use rocketmq_runtime::ResourceBudget;
+use rocketmq_runtime::ResourcePermit;
+use serde::Serialize;
+use tokio::sync::watch;
+use tokio::sync::Mutex;
+
+use crate::producer::default_mq_producer::DefaultMQProducer;
+use crate::producer::send_callback::ArcSendCallback;
+use crate::producer::send_result::SendResult;
+use crate::runtime::spawn_client_tracked_task_with_context;
+use crate::runtime::ClientTrackedTaskHandle;
+
+const GUARD_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+type BatchMap = Arc<DashMap<AggregateKey, Arc<Mutex<MessageAccumulation>>>>;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProduceAccumulatorGuardLifecycleProbe {
+    pub task_count_before_shutdown: usize,
+    pub task_count_after_shutdown: usize,
+    pub shutdown_elapsed_us: u128,
+    pub guard_metrics: ProduceAccumulatorGuardMetricsSnapshot,
+    pub healthy: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct ProduceAccumulatorGuardMetricsSnapshot {
+    pub sync: BatchGuardMetricsSnapshot,
+    pub async_send: BatchGuardMetricsSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct BatchGuardMetricsSnapshot {
+    pub wakeup_count: u64,
+    pub flush_count: u64,
+    pub idle_wakeup_count: u64,
+    pub scheduled_count: usize,
+    pub retained_bytes: usize,
+    pub oldest_queued_age_ms: u64,
+    pub throttled_count: u64,
+    pub rejected_count: u64,
+    pub dropped_count: u64,
+}
+
+#[derive(Default)]
+struct BatchGuardMetrics {
+    wakeup_count: AtomicU64,
+    flush_count: AtomicU64,
+    idle_wakeup_count: AtomicU64,
+}
+
+impl BatchGuardMetrics {
+    fn record_wakeup(&self) {
+        self.wakeup_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_flush(&self) {
+        self.flush_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_idle(&self) {
+        self.idle_wakeup_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> BatchGuardMetricsSnapshot {
+        BatchGuardMetricsSnapshot {
+            wakeup_count: self.wakeup_count.load(Ordering::Relaxed),
+            flush_count: self.flush_count.load(Ordering::Relaxed),
+            idle_wakeup_count: self.idle_wakeup_count.load(Ordering::Relaxed),
+            scheduled_count: 0,
+            retained_bytes: 0,
+            oldest_queued_age_ms: 0,
+            throttled_count: 0,
+            rejected_count: 0,
+            dropped_count: 0,
+        }
+    }
+}
+
+pub struct ProduceAccumulator {
+    total_hold_size: AtomicUsize,
+    hold_size: AtomicUsize,
+    hold_ms: AtomicU32,
+    lifecycle: StdMutex<AccumulatorLifecycleState>,
+    message_budget: ResourceBudget,
+    guard_thread_for_sync_send: GuardForSyncSendService,
+    guard_thread_for_async_send: GuardForAsyncSendService,
+    currently_hold_size: Arc<AtomicU64>,
+    sync_send_batchs: Arc<DashMap<AggregateKey, Arc<Mutex<MessageAccumulation>>>>,
+    async_send_batchs: Arc<DashMap<AggregateKey, Arc<Mutex<MessageAccumulation>>>>,
+}
+
+#[derive(Default)]
+struct AccumulatorLifecycleState {
+    started: bool,
+    stopping: bool,
+}
+
+struct AccumulatorStoppingReset<'a> {
+    lifecycle: &'a StdMutex<AccumulatorLifecycleState>,
+}
+
+impl Drop for AccumulatorStoppingReset<'_> {
+    fn drop(&mut self) {
+        let mut lifecycle = match self.lifecycle.lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(poisoned) => {
+                tracing::warn!("ProduceAccumulator lifecycle lock was poisoned");
+                poisoned.into_inner()
+            }
+        };
+        lifecycle.stopping = false;
+    }
+}
+
+impl ProduceAccumulator {
+    fn lifecycle(&self) -> StdMutexGuard<'_, AccumulatorLifecycleState> {
+        match self.lifecycle.lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(poisoned) => {
+                tracing::warn!("ProduceAccumulator lifecycle lock was poisoned");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    pub fn new(service_context: ChildServiceContext, instance_name: &str) -> Self {
+        let resource_budget = crate::runtime::build_client_resource_budget(
+            &crate::runtime::ClientRuntimeConfig::default(),
+            &service_context.process_budget(),
+        )
+        .expect("service-context produce accumulator resource budget must be valid");
+        Self::with_resource_budget(service_context, instance_name, resource_budget)
+    }
+
+    pub(crate) fn with_resource_budget(
+        service_context: ChildServiceContext,
+        instance_name: &str,
+        resource_budget: ResourceBudget,
+    ) -> Self {
+        const ACCUMULATED_MESSAGE_LIMIT: usize = 262_144;
+        let parent_capacity = resource_budget.limit().capacity;
+        let message_count = ACCUMULATED_MESSAGE_LIMIT.min(parent_capacity.count).max(1);
+        let message_rate = u64::try_from(message_count).unwrap_or(u64::MAX).max(1);
+        let message_budget = resource_budget
+            .child(
+                "accumulated-messages",
+                BudgetLimit::new(message_count, parent_capacity.bytes.max(1), FullPolicy::Reject)
+                    .with_rate(RateLimit::new(message_rate, message_rate))
+                    .with_max_age(Duration::from_secs(60)),
+            )
+            .expect("clamped accumulated-message limits fit the client resource root");
+        Self {
+            total_hold_size: AtomicUsize::new(1024 * 1024 * 32),
+            hold_size: AtomicUsize::new(1024 * 32),
+            hold_ms: AtomicU32::new(10),
+            lifecycle: StdMutex::new(AccumulatorLifecycleState::default()),
+            message_budget,
+            guard_thread_for_async_send: GuardForAsyncSendService::new(
+                service_context.component("async-batch-guard"),
+                instance_name,
+                resource_budget.clone(),
+            ),
+            guard_thread_for_sync_send: GuardForSyncSendService::new(
+                service_context.component("sync-batch-guard"),
+                instance_name,
+                resource_budget,
+            ),
+            currently_hold_size: Arc::new(AtomicU64::new(0)),
+            sync_send_batchs: Arc::new(DashMap::new()),
+            async_send_batchs: Arc::new(DashMap::new()),
+        }
+    }
+}
+
+impl ProduceAccumulator {
+    pub fn batch_max_delay_ms(&self) -> u32 {
+        self.hold_ms.load(Ordering::Acquire)
+    }
+
+    pub fn set_batch_max_delay_ms(&self, hold_ms: u32) -> crate::ClientResult<()> {
+        if hold_ms == 0 || hold_ms > 30_000 {
+            return Err(crate::mq_client_err!(format!(
+                "batchMaxDelayMs expect between 1ms and 30s, but get {hold_ms}!"
+            )));
+        }
+        self.hold_ms.store(hold_ms, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn batch_max_bytes(&self) -> usize {
+        self.hold_size.load(Ordering::Acquire)
+    }
+
+    pub fn set_batch_max_bytes(&self, hold_size: u64) -> crate::ClientResult<()> {
+        if hold_size == 0 || hold_size > 2 * 1024 * 1024 {
+            return Err(crate::mq_client_err!(format!(
+                "batchMaxBytes expect between 1B and 2MB, but get {hold_size}!"
+            )));
+        }
+        self.hold_size.store(hold_size as usize, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn total_batch_max_bytes(&self) -> usize {
+        self.total_hold_size.load(Ordering::Acquire)
+    }
+
+    pub fn set_total_batch_max_bytes(&self, total_hold_size: u64) -> crate::ClientResult<()> {
+        if total_hold_size == 0 {
+            return Err(crate::mq_client_err!(format!(
+                "totalBatchMaxBytes must bigger then 0, but get {total_hold_size}!"
+            )));
+        }
+        self.total_hold_size.store(total_hold_size as usize, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn start(&self) -> crate::ClientResult<()> {
+        let mut lifecycle = self.lifecycle();
+        if lifecycle.stopping {
+            tracing::warn!("ProduceAccumulator is stopping");
+            return Ok(());
+        }
+        if lifecycle.started && self.guard_task_count() == 2 {
+            tracing::warn!("ProduceAccumulator is already started");
+            return Ok(());
+        }
+
+        let hold_ms = self.batch_max_delay_ms();
+        let hold_size = self.batch_max_bytes();
+        self.guard_thread_for_sync_send
+            .start(self.sync_send_batchs.clone(), hold_ms)?;
+        if let Err(error) = self.guard_thread_for_async_send.start(
+            self.async_send_batchs.clone(),
+            self.currently_hold_size.clone(),
+            hold_size,
+            hold_ms,
+        ) {
+            self.guard_thread_for_sync_send.shutdown();
+            return Err(error);
+        }
+        lifecycle.started = self.guard_task_count() == 2;
+        if lifecycle.started {
+            Ok(())
+        } else {
+            Err(crate::mq_client_err!(
+                "ProduceAccumulator guard services failed to start"
+            ))
+        }
+    }
+    pub fn shutdown(&self) {
+        {
+            let mut lifecycle = self.lifecycle();
+            if lifecycle.stopping {
+                return;
+            }
+            lifecycle.started = false;
+            lifecycle.stopping = true;
+        }
+        let _stopping_reset = AccumulatorStoppingReset {
+            lifecycle: &self.lifecycle,
+        };
+
+        self.guard_thread_for_sync_send.shutdown();
+        self.guard_thread_for_async_send.shutdown();
+        self.release_pending_batches_on_shutdown();
+    }
+
+    pub async fn shutdown_async(&self) {
+        {
+            let mut lifecycle = self.lifecycle();
+            if lifecycle.stopping {
+                return;
+            }
+            lifecycle.started = false;
+            lifecycle.stopping = true;
+        }
+        let _stopping_reset = AccumulatorStoppingReset {
+            lifecycle: &self.lifecycle,
+        };
+
+        self.guard_thread_for_sync_send.shutdown_async().await;
+        self.guard_thread_for_async_send.shutdown_async().await;
+        self.release_pending_batches_on_shutdown_async().await;
+    }
+
+    fn guard_task_count(&self) -> usize {
+        self.guard_thread_for_sync_send.task_count() + self.guard_thread_for_async_send.task_count()
+    }
+
+    pub fn guard_metrics_snapshot(&self) -> ProduceAccumulatorGuardMetricsSnapshot {
+        ProduceAccumulatorGuardMetricsSnapshot {
+            sync: self.guard_thread_for_sync_send.metrics_snapshot(),
+            async_send: self.guard_thread_for_async_send.metrics_snapshot(),
+        }
+    }
+
+    pub(crate) fn try_add_message<T: MessageTrait>(&self, message: &T) -> bool {
+        let body_size = message.get_body().map_or(0, |body| body.len()) as u64;
+        if body_size == 0 {
+            return true;
+        }
+        self.currently_hold_size
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                let next = current.checked_add(body_size)?;
+                (next <= self.total_batch_max_bytes() as u64).then_some(next)
+            })
+            .is_ok()
+    }
+
+    fn release_hold_size(&self, size: u64) {
+        release_hold_size(&self.currently_hold_size, size);
+    }
+
+    fn release_pending_batches_on_shutdown(&self) {
+        let error_message = "ProduceAccumulator is shutdown";
+        let sync_batches = self
+            .sync_send_batchs
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        self.sync_send_batchs.clear();
+        for batch in sync_batches {
+            match batch.try_lock() {
+                Ok(mut batch_guard) => {
+                    close_pending_batch(&mut batch_guard, &self.currently_hold_size, error_message, false);
+                }
+                Err(_) => tracing::warn!("skip locked sync batch during ProduceAccumulator shutdown"),
+            }
+        }
+
+        let async_batches = self
+            .async_send_batchs
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        self.async_send_batchs.clear();
+        for batch in async_batches {
+            match batch.try_lock() {
+                Ok(mut batch_guard) => {
+                    close_pending_batch(&mut batch_guard, &self.currently_hold_size, error_message, true);
+                }
+                Err(_) => tracing::warn!("skip locked async batch during ProduceAccumulator shutdown"),
+            }
+        }
+    }
+
+    async fn release_pending_batches_on_shutdown_async(&self) {
+        let error_message = "ProduceAccumulator is shutdown";
+        let sync_batches = self
+            .sync_send_batchs
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        self.sync_send_batchs.clear();
+        for batch in sync_batches {
+            let mut batch_guard = batch.lock().await;
+            close_pending_batch(&mut batch_guard, &self.currently_hold_size, error_message, false);
+        }
+
+        let async_batches = self
+            .async_send_batchs
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        self.async_send_batchs.clear();
+        for batch in async_batches {
+            let mut batch_guard = batch.lock().await;
+            close_pending_batch(&mut batch_guard, &self.currently_hold_size, error_message, true);
+        }
+    }
+
+    pub(crate) async fn send<M: MessageTrait + Send + Sync + 'static>(
+        &self,
+        message: M,
+        mq: Option<MessageQueue>,
+        default_mq_producer: DefaultMQProducer,
+    ) -> crate::ClientResult<Option<SendResult>> {
+        let partition_key = AggregateKey::new_from_message_queue(&message, mq);
+        let hold_size = self.batch_max_bytes();
+        let hold_ms = self.batch_max_delay_ms();
+        let reserved_size = message.get_body().map_or(0, |body| body.len()) as u64;
+        let resource_permit = match self
+            .message_budget
+            .try_acquire_data(estimated_message_retained_bytes(&message))
+        {
+            Ok(permit) => permit,
+            Err(_rejection) => {
+                self.release_hold_size(reserved_size);
+                return Err(crate::mq_client_err!("producer accumulation capacity is exhausted"));
+            }
+        };
+
+        let batch = match self
+            .get_or_create_sync_send_batch(partition_key.clone(), &default_mq_producer, hold_ms)
+            .await
+        {
+            Ok(batch) => batch,
+            Err(error) => {
+                self.release_hold_size(reserved_size);
+                return Err(error);
+            }
+        };
+
+        // Lock the batch for exclusive access and add message
+        let add_result = {
+            let mut batch_guard = batch.lock().await;
+            batch_guard.add_with_resource_permit(message, None, hold_size, hold_ms as u64, resource_permit)
+        };
+        let add_outcome = match add_result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.release_hold_size(reserved_size);
+                return Err(error);
+            }
+        };
+
+        // Check if add failed (batch closed)
+        let Some(add_outcome) = add_outcome else {
+            // Batch is closed, cannot retry because message is already consumed
+            remove_batch_if_same(&self.sync_send_batchs, &partition_key, &batch);
+            self.release_hold_size(reserved_size);
+            return Err(crate::mq_client_err!("Batch is closed, cannot add message"));
+        };
+
+        let msg_index = add_outcome.index;
+        let notify = add_outcome.notify;
+        if add_outcome.should_flush {
+            let batch_to_send = remove_batch_if_same(&self.sync_send_batchs, &partition_key, &batch);
+            if let Some(batch_arc) = batch_to_send {
+                self.send_batch_sync(batch_arc).await?;
+            }
+        }
+
+        // Wait for batch to be ready and sent
+        loop {
+            // Check if batch is closed (sent)
+            let (state, should_send) = {
+                let batch_guard = batch.lock().await;
+                let state = batch_guard.state();
+                let should_send = batch_guard.ready_to_send(hold_size, hold_ms as u64);
+                (state, should_send)
+            };
+
+            if state == BatchState::Closed {
+                // Batch has been sent, get result
+                let (error, result) = {
+                    let batch_guard = batch.lock().await;
+                    (
+                        batch_guard.send_error.clone(),
+                        batch_guard
+                            .send_results
+                            .as_ref()
+                            .and_then(|results| results.get(msg_index).cloned()),
+                    )
+                };
+
+                if let Some(error) = error {
+                    return Err(error);
+                }
+                return Ok(result);
+            }
+
+            if state == BatchState::Open && should_send {
+                // Try to remove and send the batch
+                let batch_to_send = remove_batch_if_same(&self.sync_send_batchs, &partition_key, &batch);
+
+                if let Some(batch_arc) = batch_to_send {
+                    // Send the batch (without holding the lock)
+                    self.send_batch_sync(batch_arc).await?;
+                    // Continue to wait loop to get result
+                    continue;
+                }
+            }
+
+            // Wait for notification instead of polling
+            notify.notified().await;
+        }
+    }
+
+    pub(crate) async fn send_callback<M>(
+        &self,
+        message: M,
+        mq: Option<MessageQueue>,
+        send_callback: Option<ArcSendCallback>,
+        default_mq_producer: DefaultMQProducer,
+    ) -> crate::ClientResult<()>
+    where
+        M: MessageTrait + Send + Sync + 'static,
+    {
+        let partition_key = AggregateKey::new_from_message_queue(&message, mq);
+        let hold_size = self.batch_max_bytes();
+        let hold_ms = self.batch_max_delay_ms();
+        let reserved_size = message.get_body().map_or(0, |body| body.len()) as u64;
+        let resource_permit = match self
+            .message_budget
+            .try_acquire_data(estimated_message_retained_bytes(&message))
+        {
+            Ok(permit) => permit,
+            Err(_rejection) => {
+                self.release_hold_size(reserved_size);
+                return Err(crate::mq_client_err!("producer accumulation capacity is exhausted"));
+            }
+        };
+
+        let batch = match self
+            .get_or_create_async_send_batch(partition_key.clone(), &default_mq_producer, hold_ms)
+            .await
+        {
+            Ok(batch) => batch,
+            Err(error) => {
+                self.release_hold_size(reserved_size);
+                return Err(error);
+            }
+        };
+
+        // Lock the batch for exclusive access
+        let add_result = {
+            let mut batch_guard = batch.lock().await;
+            batch_guard.add_with_resource_permit(message, send_callback, hold_size, hold_ms as u64, resource_permit)
+        };
+        let add_outcome = match add_result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.release_hold_size(reserved_size);
+                return Err(error);
+            }
+        };
+
+        // Try to add message to batch
+        match add_outcome {
+            Some(add_outcome) => {
+                // Message added successfully, check if ready to send
+                if add_outcome.should_flush {
+                    // Remove batch from map
+                    let batch_to_send = remove_batch_if_same(&self.async_send_batchs, &partition_key, &batch);
+
+                    if let Some(batch_arc) = batch_to_send {
+                        // Send the batch (without holding the lock)
+                        self.send_batch_async(batch_arc).await?;
+                    }
+                }
+                Ok(())
+            }
+            None => {
+                // Batch is closed, remove it and return error
+                remove_batch_if_same(&self.async_send_batchs, &partition_key, &batch);
+                self.release_hold_size(reserved_size);
+                Err(crate::mq_client_err!("Batch is closed, please retry"))
+            }
+        }
+    }
+
+    async fn get_or_create_sync_send_batch(
+        &self,
+        aggregate_key: AggregateKey,
+        default_mq_producer: &DefaultMQProducer,
+        hold_ms: u32,
+    ) -> crate::ClientResult<Arc<Mutex<MessageAccumulation>>> {
+        match self.sync_send_batchs.entry(aggregate_key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => Ok(entry.get().clone()),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let accumulation = MessageAccumulation::new(aggregate_key.clone(), default_mq_producer.clone());
+                let create_time = accumulation.create_time;
+                let deadline_ms = accumulation.deadline_ms(hold_ms as u64);
+                let batch = Arc::new(Mutex::new(accumulation));
+                // Keep the DashMap shard exclusively borrowed until the
+                // deadline command is accepted. Concurrent senders must never
+                // observe a batch that has no scheduler ownership.
+                let inserted = entry.insert(batch.clone());
+                if let Err(error) =
+                    self.guard_thread_for_sync_send
+                        .schedule_batch(aggregate_key.clone(), create_time, deadline_ms)
+                {
+                    {
+                        let mut accumulation = batch
+                            .try_lock()
+                            .expect("new sync accumulation is inaccessible while its map shard is locked");
+                        accumulation.send_error = Some(error.clone());
+                        accumulation.mark_closed();
+                        accumulation.completion_notify.notify_waiters();
+                    }
+                    drop(inserted);
+                    remove_batch_if_same(&self.sync_send_batchs, &aggregate_key, &batch);
+                    return Err(error);
+                }
+                drop(inserted);
+                Ok(batch)
+            }
+        }
+    }
+
+    async fn get_or_create_async_send_batch(
+        &self,
+        aggregate_key: AggregateKey,
+        default_mq_producer: &DefaultMQProducer,
+        hold_ms: u32,
+    ) -> crate::ClientResult<Arc<Mutex<MessageAccumulation>>> {
+        match self.async_send_batchs.entry(aggregate_key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => Ok(entry.get().clone()),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let accumulation = MessageAccumulation::new(aggregate_key.clone(), default_mq_producer.clone());
+                let create_time = accumulation.create_time;
+                let deadline_ms = accumulation.deadline_ms(hold_ms as u64);
+                let batch = Arc::new(Mutex::new(accumulation));
+                // Keep the DashMap shard exclusively borrowed until the
+                // deadline command is accepted. Concurrent senders must never
+                // observe a batch that has no scheduler ownership.
+                let inserted = entry.insert(batch.clone());
+                if let Err(error) =
+                    self.guard_thread_for_async_send
+                        .schedule_batch(aggregate_key.clone(), create_time, deadline_ms)
+                {
+                    {
+                        let mut accumulation = batch
+                            .try_lock()
+                            .expect("new async accumulation is inaccessible while its map shard is locked");
+                        accumulation.send_error = Some(error.clone());
+                        accumulation.mark_closed();
+                        accumulation.completion_notify.notify_waiters();
+                    }
+                    drop(inserted);
+                    remove_batch_if_same(&self.async_send_batchs, &aggregate_key, &batch);
+                    return Err(error);
+                }
+                drop(inserted);
+                Ok(batch)
+            }
+        }
+    }
+
+    /// Send a batch synchronously (extracted to avoid holding lock across await)
+    async fn send_batch_sync(&self, batch: Arc<Mutex<MessageAccumulation>>) -> crate::ClientResult<()> {
+        // Extract all data from the batch without holding the lock across await
+        let (messages, resource_permits, mq, producer, total_size, count, notify, aggregate_key, keys) = {
+            let mut batch_guard = batch.lock().await;
+            if !batch_guard.try_mark_closing() {
+                return Ok(());
+            }
+            let notify = batch_guard.completion_notify.clone();
+
+            if batch_guard.messages.is_empty() {
+                let error = crate::mq_client_err!("No messages to send");
+                batch_guard.send_error = Some(error.clone());
+                batch_guard.mark_closed();
+                notify.notify_waiters();
+                return Err(error);
+            }
+
+            let total_size = batch_guard.messages_size.load(Ordering::Acquire) as u64;
+            let messages = std::mem::take(&mut batch_guard.messages);
+            let resource_permits = std::mem::take(&mut batch_guard.resource_permits);
+            let mq = batch_guard.aggregate_key.mq.clone();
+            let producer = batch_guard.default_mq_producer.clone();
+            let count = batch_guard.count;
+            let aggregate_key = batch_guard.aggregate_key.clone();
+            let keys = batch_guard.keys.clone();
+
+            (
+                messages,
+                resource_permits,
+                mq,
+                producer,
+                total_size,
+                count,
+                notify,
+                aggregate_key,
+                keys,
+            )
+        }; // Lock released here
+        let _resource_permits = resource_permits;
+
+        let batch_msg = match build_message_batch(messages, &aggregate_key, &keys) {
+            Ok(batch_msg) => batch_msg,
+            Err(error) => {
+                self.release_hold_size(total_size);
+                let mut batch_guard = batch.lock().await;
+                batch_guard.send_error = Some(error.clone());
+                batch_guard.mark_closed();
+                notify.notify_waiters();
+                return Err(error);
+            }
+        };
+
+        // Send without holding any locks
+        let send_result = match producer.send_direct(batch_msg, mq, None).await {
+            Ok(result) => result,
+            Err(error) => {
+                self.release_hold_size(total_size);
+                let mut batch_guard = batch.lock().await;
+                batch_guard.send_error = Some(error.clone());
+                batch_guard.mark_closed();
+                notify.notify_waiters();
+                return Err(error);
+            }
+        };
+
+        // Decrement currently_hold_size
+        self.release_hold_size(total_size);
+
+        // Store results in batch for waiting threads to retrieve
+        if let Some(result) = send_result {
+            let send_results = match split_send_results(&result, count) {
+                Ok(results) => results,
+                Err(error) => {
+                    let mut batch_guard = batch.lock().await;
+                    batch_guard.send_error = Some(error.clone());
+                    batch_guard.mark_closed();
+                    notify.notify_waiters();
+                    return Err(error);
+                }
+            };
+            let mut batch_guard = batch.lock().await;
+            batch_guard.send_results = Some(send_results);
+            batch_guard.mark_closed();
+        } else {
+            let batch_guard = batch.lock().await;
+            batch_guard.mark_closed();
+        }
+
+        // Notify all waiting threads
+        notify.notify_waiters();
+
+        Ok(())
+    }
+
+    /// Send a batch asynchronously (extracted to avoid holding lock across await)
+    async fn send_batch_async(&self, batch: Arc<Mutex<MessageAccumulation>>) -> crate::ClientResult<()> {
+        // Extract all data from the batch without holding the lock across await
+        let (messages, resource_permits, mq, producer, total_size, callbacks, aggregate_key, keys, notify) = {
+            let mut batch_guard = batch.lock().await;
+            if !batch_guard.try_mark_closing() {
+                return Ok(());
+            }
+            let notify = batch_guard.completion_notify.clone();
+
+            if batch_guard.messages.is_empty() {
+                let error = crate::mq_client_err!("No messages to send");
+                batch_guard.send_error = Some(error.clone());
+                batch_guard.mark_closed();
+                notify.notify_waiters();
+                return Err(error);
+            }
+
+            let total_size = batch_guard.messages_size.load(Ordering::Acquire) as u64;
+            let messages = std::mem::take(&mut batch_guard.messages);
+            let resource_permits = std::mem::take(&mut batch_guard.resource_permits);
+            let callbacks = std::mem::take(&mut batch_guard.send_callbacks);
+            let mq = batch_guard.aggregate_key.mq.clone();
+            let producer = batch_guard.default_mq_producer.clone();
+            let aggregate_key = batch_guard.aggregate_key.clone();
+            let keys = batch_guard.keys.clone();
+
+            (
+                messages,
+                resource_permits,
+                mq,
+                producer,
+                total_size,
+                callbacks,
+                aggregate_key,
+                keys,
+                notify,
+            )
+        }; // Lock released here
+
+        let batch_msg = match build_message_batch(messages, &aggregate_key, &keys) {
+            Ok(batch_msg) => batch_msg,
+            Err(error) => {
+                self.release_hold_size(total_size);
+                let mut batch_guard = batch.lock().await;
+                batch_guard.send_error = Some(error.clone());
+                batch_guard.mark_closed();
+                notify.notify_waiters();
+                for callback in &callbacks {
+                    callback.on_exception(&error);
+                }
+                return Err(error);
+            }
+        };
+
+        let currently_hold_size = self.currently_hold_size.clone();
+        let callback_currently_hold_size = currently_hold_size.clone();
+        let callbacks = Arc::new(callbacks);
+        let callbacks_for_send_error = callbacks.clone();
+        let permit_owner = Arc::new(StdMutex::new(Some(resource_permits)));
+        let callback_permit_owner = Arc::clone(&permit_owner);
+
+        // Create combined callback
+        let combined_callback = move |result: Option<&SendResult>, error: Option<&ClientError>| {
+            release_resource_permits(&callback_permit_owner);
+            release_hold_size(&callback_currently_hold_size, total_size);
+            // Invoke all registered callbacks
+            if let Some(result) = result {
+                match split_send_results(result, callbacks.len()) {
+                    Ok(send_results) => {
+                        for (callback, result) in callbacks.iter().zip(send_results.iter()) {
+                            callback.on_success(result);
+                        }
+                    }
+                    Err(error) => {
+                        for callback in callbacks.iter() {
+                            callback.on_exception(&error);
+                        }
+                    }
+                }
+            } else if let Some(error) = error {
+                for callback in callbacks.iter() {
+                    callback.on_exception(error);
+                }
+            }
+        };
+
+        // Send without holding any locks
+        let send_result = producer
+            .send_direct(batch_msg, mq, Some(Arc::new(combined_callback)))
+            .await;
+
+        if let Err(error) = &send_result {
+            release_resource_permits(&permit_owner);
+            release_hold_size(&currently_hold_size, total_size);
+            let mut batch_guard = batch.lock().await;
+            batch_guard.send_error = Some(error.clone());
+            batch_guard.mark_closed();
+            notify.notify_waiters();
+            for callback in callbacks_for_send_error.iter() {
+                callback.on_exception(error);
+            }
+        } else {
+            let batch_guard = batch.lock().await;
+            batch_guard.mark_closed();
+            notify.notify_waiters();
+        }
+
+        send_result.map(|_| ())
+    }
+}
+
+fn release_hold_size(currently_hold_size: &AtomicU64, size: u64) {
+    if size == 0 {
+        return;
+    }
+    let _ = currently_hold_size.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_sub(size))
+    });
+}
+
+fn release_resource_permits(permit_owner: &StdMutex<Option<Vec<ResourcePermit>>>) {
+    match permit_owner.lock() {
+        Ok(mut permits) => {
+            permits.take();
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().take();
+        }
+    }
+}
+
+fn estimated_message_retained_bytes(message: &impl MessageTrait) -> usize {
+    let property_bytes = message.get_properties().iter().fold(0usize, |total, (key, value)| {
+        total
+            .saturating_add(std::mem::size_of::<(CheetahString, CheetahString)>())
+            .saturating_add(key.len())
+            .saturating_add(value.len())
+    });
+    std::mem::size_of_val(message)
+        .saturating_add(message.topic().len())
+        .saturating_add(message.get_body().map_or(0, bytes::Bytes::len))
+        .saturating_add(message.get_compressed_body().map_or(0, bytes::Bytes::len))
+        .saturating_add(message.transaction_id().map_or(0, CheetahString::len))
+        .saturating_add(property_bytes)
+}
+
+fn close_pending_batch(
+    batch: &mut MessageAccumulation,
+    currently_hold_size: &AtomicU64,
+    error_message: &str,
+    notify_callbacks: bool,
+) {
+    if !batch.try_mark_closing() {
+        return;
+    }
+
+    let total_size = batch.messages_size.load(Ordering::Acquire) as u64;
+    release_hold_size(currently_hold_size, total_size);
+    batch.resource_permits.clear();
+    let error = crate::mq_client_err!(error_message.to_string());
+    batch.send_error = Some(error.clone());
+    batch.mark_closed();
+    batch.completion_notify.notify_waiters();
+
+    if notify_callbacks {
+        for callback in &batch.send_callbacks {
+            callback.on_exception(&error);
+        }
+    }
+}
+
+fn split_send_results(send_result: &SendResult, count: usize) -> crate::ClientResult<Vec<SendResult>> {
+    let Some(msg_id) = send_result.msg_id.as_ref() else {
+        return Err(crate::mq_client_err!("sendResult is illegal"));
+    };
+
+    if !msg_id.as_str().contains(',') {
+        return Ok(vec![send_result.clone(); count]);
+    }
+
+    let Some(offset_msg_id) = send_result.offset_msg_id.as_ref() else {
+        return Err(crate::mq_client_err!("sendResult is illegal"));
+    };
+
+    let msg_ids = msg_id.as_str().split(',').collect::<Vec<_>>();
+    let offset_msg_ids = offset_msg_id.split(',').collect::<Vec<_>>();
+    if msg_ids.len() != count || offset_msg_ids.len() != count {
+        return Err(crate::mq_client_err!("sendResult is illegal"));
+    }
+
+    Ok((0..count)
+        .map(|index| {
+            let mut result = send_result.clone();
+            result.msg_id = Some(CheetahString::from_slice(msg_ids[index]));
+            result.offset_msg_id = Some(offset_msg_ids[index].to_string());
+            result.queue_offset += index as u64;
+            result
+        })
+        .collect())
+}
+
+fn build_message_batch(
+    messages: Vec<Message>,
+    aggregate_key: &AggregateKey,
+    keys: &HashSet<String>,
+) -> crate::ClientResult<MessageBatch> {
+    let mut batch = MessageBatch::generate_from_messages(messages)?;
+    batch.set_topic(aggregate_key.topic.clone());
+    batch.set_wait_store_msg_ok(aggregate_key.wait_store_msg_ok);
+    if let Some(tag) = aggregate_key.tag.as_ref() {
+        batch.set_tags(tag.clone());
+    }
+    if !keys.is_empty() {
+        let mut sorted_keys = keys.iter().map(String::as_str).collect::<Vec<_>>();
+        sorted_keys.sort_unstable();
+        batch.set_keys(CheetahString::from_string(
+            sorted_keys.join(MessageConst::KEY_SEPARATOR),
+        ));
+    }
+    Ok(batch)
+}
+
+#[doc(hidden)]
+pub async fn run_produce_accumulator_guard_lifecycle_probe(
+    service_context: ChildServiceContext,
+) -> ProduceAccumulatorGuardLifecycleProbe {
+    let accumulator = ProduceAccumulator::new(service_context, "produce_accumulator_guard_probe");
+    let started = accumulator.start().is_ok();
+
+    let mut task_count_before_shutdown = accumulator.guard_task_count();
+    for _ in 0..100 {
+        if task_count_before_shutdown == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        task_count_before_shutdown = accumulator.guard_task_count();
+    }
+
+    let shutdown_started_at = Instant::now();
+    accumulator.shutdown_async().await;
+    let shutdown_elapsed_us = shutdown_started_at.elapsed().as_micros();
+    let task_count_after_shutdown = accumulator.guard_task_count();
+    let guard_metrics = accumulator.guard_metrics_snapshot();
+    let healthy = started && task_count_before_shutdown == 2 && task_count_after_shutdown == 0;
+
+    ProduceAccumulatorGuardLifecycleProbe {
+        task_count_before_shutdown,
+        task_count_after_shutdown,
+        shutdown_elapsed_us,
+        guard_metrics,
+        healthy,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::error_assertions::client_exception;
+    use std::future::pending;
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    fn test_context() -> ChildServiceContext {
+        crate::runtime::test_service_context("produce-accumulator-test")
+    }
+
+    #[test]
+    fn try_add_message_counts_body_size() {
+        let accumulator = ProduceAccumulator::new(test_context(), "test");
+        let message = Message::builder()
+            .topic("test-topic")
+            .body_slice(b"hello")
+            .build_unchecked();
+
+        assert!(accumulator.try_add_message(&message));
+        assert_eq!(accumulator.currently_hold_size.load(Ordering::Acquire), 5);
+    }
+
+    #[test]
+    fn try_add_message_allows_missing_body_without_accounting() {
+        let accumulator = ProduceAccumulator::new(test_context(), "test");
+        let mut message = Message::builder()
+            .topic("test-topic")
+            .body_slice(b"hello")
+            .build_unchecked();
+        assert_eq!(message.take_body().as_deref(), Some(&b"hello"[..]));
+
+        assert!(accumulator.try_add_message(&message));
+        assert_eq!(accumulator.currently_hold_size.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn try_add_message_rejects_when_total_hold_size_reaches_limit_like_java() {
+        let accumulator = ProduceAccumulator::new(test_context(), "test");
+        accumulator.set_total_batch_max_bytes(5).unwrap();
+        let message = Message::builder()
+            .topic("test-topic")
+            .body_slice(b"hello")
+            .build_unchecked();
+
+        assert!(accumulator.try_add_message(&message));
+        assert_eq!(accumulator.currently_hold_size.load(Ordering::Acquire), 5);
+        assert!(!accumulator.try_add_message(&message));
+    }
+
+    #[test]
+    fn try_add_message_concurrent_capacity_reservation_does_not_exceed_limit() {
+        let accumulator = ProduceAccumulator::new(test_context(), "test");
+        accumulator.set_total_batch_max_bytes(64).unwrap();
+        let accumulator = Arc::new(accumulator);
+        let successes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let message = Message::builder()
+            .topic("test-topic")
+            .body_slice(b"x")
+            .build_unchecked();
+
+        let threads = (0..16)
+            .map(|_| {
+                let accumulator = accumulator.clone();
+                let successes = successes.clone();
+                let message = message.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..16 {
+                        if accumulator.try_add_message(&message) {
+                            successes.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for thread in threads {
+            thread.join().expect("capacity reservation thread should finish");
+        }
+
+        assert!(successes.load(Ordering::Acquire) <= 64);
+        assert!(accumulator.currently_hold_size.load(Ordering::Acquire) <= 64);
+    }
+
+    #[test]
+    fn accumulated_message_owns_its_parent_budget_permit_until_drop() {
+        let tree = rocketmq_runtime::ResourceBudgetTree::new(
+            "client-accumulator-permit-test",
+            BudgetLimit::new(1, 1024, FullPolicy::Reject),
+        )
+        .expect("root budget");
+        let budget = tree
+            .root()
+            .child(
+                "accumulated-messages",
+                BudgetLimit::new(1, 1024, FullPolicy::Reject)
+                    .with_rate(RateLimit::new(1, 1))
+                    .with_max_age(Duration::from_secs(60)),
+            )
+            .expect("message budget");
+        let permit = budget.try_acquire_data(5).expect("message permit");
+        let mut accumulation = MessageAccumulation::new(
+            AggregateKey::new(CheetahString::from("test-topic"), None, true, None),
+            DefaultMQProducer::unbound(),
+        );
+        let message = Message::builder()
+            .topic("test-topic")
+            .body_slice(b"hello")
+            .build_unchecked();
+
+        assert!(accumulation
+            .add_with_resource_permit(message, None, usize::MAX, 30_000, permit)
+            .expect("add message")
+            .is_some());
+        assert_eq!(budget.snapshot().current_count, 1);
+        assert_eq!(budget.snapshot().current_bytes, 5);
+
+        drop(accumulation);
+        assert_eq!(budget.snapshot().current_count, 0);
+        assert_eq!(budget.snapshot().current_bytes, 0);
+    }
+
+    #[test]
+    fn message_accumulation_ready_to_send_requires_size_over_hold_size_like_java() {
+        let producer = DefaultMQProducer::unbound();
+        let aggregate_key = AggregateKey::new(CheetahString::from("test-topic"), None, true, None);
+        let mut accumulation = MessageAccumulation::new(aggregate_key, producer);
+        let message = Message::builder()
+            .topic("test-topic")
+            .body_slice(b"hello")
+            .build_unchecked();
+
+        assert!(accumulation.add(message, None, 5, 30_000).unwrap().is_some());
+
+        assert!(!accumulation.ready_to_send(5, 30_000));
+        assert!(accumulation.ready_to_send(4, 30_000));
+    }
+
+    #[test]
+    fn message_accumulation_add_returns_index_and_flush_decision() {
+        let producer = DefaultMQProducer::unbound();
+        let aggregate_key = AggregateKey::new(CheetahString::from("test-topic"), None, true, None);
+        let mut accumulation = MessageAccumulation::new(aggregate_key, producer);
+        let first = Message::builder()
+            .topic("test-topic")
+            .body_slice(b"abc")
+            .build_unchecked();
+        let second = Message::builder()
+            .topic("test-topic")
+            .body_slice(b"def")
+            .build_unchecked();
+
+        let first_outcome = accumulation
+            .add(first, None, 5, 30_000)
+            .unwrap()
+            .expect("first message should be added");
+        let second_outcome = accumulation
+            .add(second, None, 5, 30_000)
+            .unwrap()
+            .expect("second message should be added");
+
+        assert_eq!(first_outcome.index, 0);
+        assert!(!first_outcome.should_flush);
+        assert_eq!(second_outcome.index, 1);
+        assert!(second_outcome.should_flush);
+    }
+
+    #[test]
+    fn message_accumulation_closing_state_is_claimed_once() {
+        let producer = DefaultMQProducer::unbound();
+        let aggregate_key = AggregateKey::new(CheetahString::from("test-topic"), None, true, None);
+        let accumulation = MessageAccumulation::new(aggregate_key, producer);
+
+        assert_eq!(accumulation.state(), BatchState::Open);
+        assert!(accumulation.try_mark_closing());
+        assert_eq!(accumulation.state(), BatchState::Closing);
+        assert!(!accumulation.try_mark_closing());
+        accumulation.mark_closed();
+        assert_eq!(accumulation.state(), BatchState::Closed);
+    }
+
+    #[test]
+    fn message_accumulation_preserves_typed_send_error() {
+        let producer = DefaultMQProducer::unbound();
+        let aggregate_key = AggregateKey::new(CheetahString::from("test-topic"), None, true, None);
+        let mut accumulation = MessageAccumulation::new(aggregate_key, producer);
+        let error = ClientError::internal(
+            "send accumulated messages",
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "broker disconnected"),
+        );
+
+        accumulation.send_error = Some(error.clone());
+
+        let stored = accumulation.send_error.clone().expect("stored send error");
+        assert_eq!(stored.descriptor().code(), error.descriptor().code());
+        assert_eq!(
+            stored.source_ref::<std::io::Error>().expect("typed I/O source").kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+    }
+
+    #[test]
+    fn close_pending_batch_does_not_release_batch_already_claimed_for_send() {
+        let producer = DefaultMQProducer::unbound();
+        let aggregate_key = AggregateKey::new(CheetahString::from("test-topic"), None, true, None);
+        let mut accumulation = MessageAccumulation::new(aggregate_key, producer);
+        let message = Message::builder()
+            .topic("test-topic")
+            .body_slice(b"hello")
+            .build_unchecked();
+        assert!(accumulation.add(message, None, usize::MAX, 30_000).unwrap().is_some());
+        assert!(accumulation.try_mark_closing());
+
+        let currently_hold_size = AtomicU64::new(5);
+        close_pending_batch(
+            &mut accumulation,
+            &currently_hold_size,
+            "ProduceAccumulator is shutdown",
+            false,
+        );
+
+        assert_eq!(accumulation.state(), BatchState::Closing);
+        assert_eq!(currently_hold_size.load(Ordering::Acquire), 5);
+    }
+
+    #[test]
+    fn message_accumulation_batch_sets_java_accumulator_keys_and_tags() {
+        let producer = DefaultMQProducer::unbound();
+        let aggregate_key = AggregateKey::new(
+            CheetahString::from("test-topic"),
+            None,
+            true,
+            Some(CheetahString::from("TagA")),
+        );
+        let mut accumulation = MessageAccumulation::new(aggregate_key, producer);
+        let first = Message::builder()
+            .topic("test-topic")
+            .tags("TagA")
+            .keys(vec!["key-b".to_string(), "key-a".to_string()])
+            .body_slice(b"hello")
+            .build_unchecked();
+        let second = Message::builder()
+            .topic("test-topic")
+            .tags("TagA")
+            .keys(vec!["key-c".to_string(), "key-a".to_string()])
+            .body_slice(b"world")
+            .build_unchecked();
+
+        assert!(accumulation.add(first, None, usize::MAX, 30_000).unwrap().is_some());
+        assert!(accumulation.add(second, None, usize::MAX, 30_000).unwrap().is_some());
+
+        let messages = std::mem::take(&mut accumulation.messages);
+        let batch = build_message_batch(messages, &accumulation.aggregate_key, &accumulation.keys).unwrap();
+
+        assert_eq!(batch.topic().as_str(), "test-topic");
+        assert!(batch.is_wait_store_msg_ok());
+        assert_eq!(batch.tags().as_deref(), Some("TagA"));
+        assert_eq!(batch.get_keys().as_deref(), Some("key-a key-b key-c"));
+    }
+
+    #[test]
+    fn batch_config_setters_match_java_validation() {
+        let accumulator = ProduceAccumulator::new(test_context(), "test");
+
+        accumulator.set_batch_max_delay_ms(1).unwrap();
+        accumulator.set_batch_max_bytes(1).unwrap();
+        accumulator.set_total_batch_max_bytes(1).unwrap();
+
+        assert_eq!(accumulator.batch_max_delay_ms(), 1);
+        assert_eq!(accumulator.batch_max_bytes(), 1);
+        assert_eq!(accumulator.total_batch_max_bytes(), 1);
+        assert!(accumulator.set_batch_max_delay_ms(0).is_err());
+        assert!(accumulator.set_batch_max_delay_ms(30_001).is_err());
+        assert!(accumulator.set_batch_max_bytes(0).is_err());
+        assert!(accumulator.set_batch_max_bytes(2 * 1024 * 1024 + 1).is_err());
+        assert!(accumulator.set_total_batch_max_bytes(0).is_err());
+    }
+
+    #[test]
+    fn batch_config_updates_are_visible_through_shared_ownership() {
+        let accumulator = Arc::new(ProduceAccumulator::new(test_context(), "shared-config-test"));
+        let shared = accumulator.clone();
+
+        std::thread::spawn(move || {
+            shared.set_batch_max_delay_ms(25).unwrap();
+            shared.set_batch_max_bytes(4096).unwrap();
+            shared.set_total_batch_max_bytes(65_536).unwrap();
+        })
+        .join()
+        .expect("shared accumulator configuration thread should finish");
+
+        assert_eq!(accumulator.batch_max_delay_ms(), 25);
+        assert_eq!(accumulator.batch_max_bytes(), 4096);
+        assert_eq!(accumulator.total_batch_max_bytes(), 65_536);
+    }
+
+    #[test]
+    fn start_without_tokio_runtime_does_not_spawn_panic() {
+        let accumulator = ProduceAccumulator::new(test_context(), "accumulator-explicit-runtime-test");
+
+        accumulator.start().expect("start accumulator");
+        accumulator.start().expect("idempotent accumulator start");
+        assert_eq!(accumulator.guard_thread_for_sync_send.task_count(), 1);
+        assert_eq!(accumulator.guard_thread_for_async_send.task_count(), 1);
+
+        accumulator.shutdown();
+        accumulator.shutdown();
+        assert_eq!(accumulator.guard_thread_for_sync_send.task_count(), 0);
+        assert_eq!(accumulator.guard_thread_for_async_send.task_count(), 0);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    #[test]
+    fn start_does_not_restart_guards_during_shutdown_transition() {
+        let accumulator = ProduceAccumulator::new(test_context(), "accumulator-stopping-test");
+        accumulator.lifecycle().stopping = true;
+
+        accumulator.start().expect("start accumulator");
+
+        assert_eq!(accumulator.guard_task_count(), 0);
+        accumulator.lifecycle().stopping = false;
+    }
+
+    #[tokio::test]
+    async fn shutdown_async_stops_guard_tasks() {
+        let accumulator = ProduceAccumulator::new(test_context(), "accumulator-async-shutdown-test");
+
+        accumulator.start().expect("start accumulator");
+        assert_eq!(accumulator.guard_thread_for_sync_send.task_count(), 1);
+        assert_eq!(accumulator.guard_thread_for_async_send.task_count(), 1);
+
+        accumulator.shutdown_async().await;
+        accumulator.shutdown_async().await;
+
+        assert_eq!(accumulator.guard_thread_for_sync_send.task_count(), 0);
+        assert_eq!(accumulator.guard_thread_for_async_send.task_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_async_releases_pending_async_batch_hold_size_and_callbacks() {
+        let accumulator = ProduceAccumulator::new(test_context(), "accumulator-shutdown-release-test");
+        let aggregate_key = AggregateKey::new(CheetahString::from("test-topic"), None, true, None);
+        let mut accumulation = MessageAccumulation::new(aggregate_key.clone(), DefaultMQProducer::unbound());
+        let callback_invoked = Arc::new(AtomicBool::new(false));
+        let callback_invoked_for_callback = callback_invoked.clone();
+        let callback: ArcSendCallback = Arc::new(move |_result: Option<&SendResult>, error: Option<&ClientError>| {
+            assert!(error.is_some());
+            callback_invoked_for_callback.store(true, Ordering::Release);
+        });
+        let message = Message::builder()
+            .topic("test-topic")
+            .body_slice(b"hello")
+            .build_unchecked();
+        assert!(accumulation
+            .add(message, Some(callback), usize::MAX, 30_000)
+            .unwrap()
+            .is_some());
+        accumulator.currently_hold_size.store(5, Ordering::Release);
+        accumulator
+            .async_send_batchs
+            .insert(aggregate_key, Arc::new(Mutex::new(accumulation)));
+
+        accumulator.release_pending_batches_on_shutdown_async().await;
+
+        assert_eq!(accumulator.currently_hold_size.load(Ordering::Acquire), 0);
+        assert!(callback_invoked.load(Ordering::Acquire));
+        assert!(accumulator.async_send_batchs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_guard_notifies_batch_at_deadline() {
+        let accumulator = ProduceAccumulator::new(test_context(), "accumulator-sync-deadline-test");
+        accumulator.set_batch_max_delay_ms(100).unwrap();
+        accumulator.start().expect("start accumulator");
+
+        let aggregate_key = AggregateKey::new(CheetahString::from("test-topic"), None, true, None);
+        let batch = accumulator
+            .get_or_create_sync_send_batch(aggregate_key, &DefaultMQProducer::unbound(), 100)
+            .await
+            .expect("schedule sync batch");
+        let notify = {
+            let mut batch_guard = batch.lock().await;
+            let message = Message::builder()
+                .topic("test-topic")
+                .body_slice(b"hello")
+                .build_unchecked();
+            assert!(batch_guard.add(message, None, usize::MAX, 100).unwrap().is_some());
+            batch_guard.completion_notify.clone()
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("sync guard should notify when the batch deadline expires");
+
+        let metrics = accumulator.guard_metrics_snapshot();
+        assert!(metrics.sync.wakeup_count >= 1);
+        assert_eq!(metrics.sync.flush_count, 1);
+
+        accumulator.shutdown_async().await;
+    }
+
+    #[tokio::test]
+    async fn guard_deadline_queue_lazily_ignores_removed_batch() {
+        let accumulator = ProduceAccumulator::new(test_context(), "accumulator-stale-deadline-test");
+        accumulator.set_batch_max_delay_ms(30).unwrap();
+        accumulator.start().expect("start accumulator");
+
+        let aggregate_key = AggregateKey::new(CheetahString::from("test-topic"), None, true, None);
+        let batch = accumulator
+            .get_or_create_sync_send_batch(aggregate_key.clone(), &DefaultMQProducer::unbound(), 30)
+            .await
+            .expect("schedule sync batch");
+        {
+            let mut batch_guard = batch.lock().await;
+            let message = Message::builder()
+                .topic("test-topic")
+                .body_slice(b"hello")
+                .build_unchecked();
+            assert!(batch_guard.add(message, None, usize::MAX, 30).unwrap().is_some());
+        }
+        accumulator.sync_send_batchs.remove(&aggregate_key);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let metrics = accumulator.guard_metrics_snapshot();
+        assert!(metrics.sync.wakeup_count >= 1);
+        assert_eq!(metrics.sync.flush_count, 0);
+        assert!(metrics.sync.idle_wakeup_count >= 1);
+
+        accumulator.shutdown_async().await;
+    }
+
+    #[tokio::test]
+    async fn batch_creation_rolls_back_when_deadline_schedulers_are_not_running() {
+        let accumulator = ProduceAccumulator::new(test_context(), "accumulator-schedule-rollback-test");
+        let producer = DefaultMQProducer::unbound();
+        let sync_key = AggregateKey::new(CheetahString::from("sync-topic"), None, true, None);
+        let async_key = AggregateKey::new(CheetahString::from("async-topic"), None, false, None);
+
+        assert!(accumulator
+            .get_or_create_sync_send_batch(sync_key.clone(), &producer, 10)
+            .await
+            .is_err());
+        assert!(!accumulator.sync_send_batchs.contains_key(&sync_key));
+
+        assert!(accumulator
+            .get_or_create_async_send_batch(async_key.clone(), &producer, 10)
+            .await
+            .is_err());
+        assert!(!accumulator.async_send_batchs.contains_key(&async_key));
+    }
+
+    #[test]
+    fn conditional_batch_removal_never_deletes_a_replacement() {
+        let batches = DashMap::new();
+        let key = AggregateKey::new(CheetahString::from("test-topic"), None, true, None);
+        let original = Arc::new(Mutex::new(MessageAccumulation::new(
+            key.clone(),
+            DefaultMQProducer::unbound(),
+        )));
+        let replacement = Arc::new(Mutex::new(MessageAccumulation::new(
+            key.clone(),
+            DefaultMQProducer::unbound(),
+        )));
+        batches.insert(key.clone(), replacement.clone());
+
+        assert!(remove_batch_if_same(&batches, &key, &original).is_none());
+        let current = batches.get(&key).expect("replacement remains registered");
+        assert!(Arc::ptr_eq(current.value(), &replacement));
+    }
+
+    #[tokio::test]
+    async fn produce_accumulator_guard_lifecycle_probe_reports_clean_shutdown() {
+        let probe = run_produce_accumulator_guard_lifecycle_probe(test_context()).await;
+
+        assert!(probe.healthy, "{probe:?}");
+        assert_eq!(probe.task_count_before_shutdown, 2, "{probe:?}");
+        assert_eq!(probe.task_count_after_shutdown, 0, "{probe:?}");
+    }
+
+    #[tokio::test]
+    async fn guard_task_shutdown_waits_for_worker_completion() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_in_task = completed.clone();
+        let task = spawn_guard_task(
+            &test_context(),
+            "rocketmq-client-batch-guard-test",
+            shutdown_tx,
+            async move {
+                let _ = shutdown_rx.changed().await;
+                completed_in_task.store(true, Ordering::Release);
+            },
+        )
+        .expect("test task should spawn");
+
+        assert!(task.shutdown_async(Duration::from_secs(1)).await);
+        assert!(completed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn guard_task_shutdown_aborts_after_timeout() {
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_task = dropped.clone();
+        let task = spawn_guard_task(
+            &test_context(),
+            "rocketmq-client-batch-guard-test",
+            shutdown_tx,
+            async move {
+                let _drop_flag = DropFlag(dropped_in_task);
+                pending::<()>().await;
+            },
+        )
+        .expect("test task should spawn");
+
+        assert!(!task.shutdown_async(Duration::from_millis(20)).await);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn split_send_results_matches_java_batch_success_shape() {
+        let send_result = SendResult::new(
+            crate::producer::send_status::SendStatus::SendOk,
+            Some(CheetahString::from("msg-a,msg-b")),
+            Some("offset-a,offset-b".to_string()),
+            None,
+            17,
+        );
+
+        let split = split_send_results(&send_result, 2).expect("valid per-message batch result");
+
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].msg_id.as_ref().unwrap().as_str(), "msg-a");
+        assert_eq!(split[0].offset_msg_id.as_deref(), Some("offset-a"));
+        assert_eq!(split[0].queue_offset, 17);
+        assert_eq!(split[1].msg_id.as_ref().unwrap().as_str(), "msg-b");
+        assert_eq!(split[1].offset_msg_id.as_deref(), Some("offset-b"));
+        assert_eq!(split[1].queue_offset, 18);
+    }
+
+    #[test]
+    fn split_send_results_keeps_original_when_ids_are_not_per_message_like_java() {
+        let send_result = SendResult::new(
+            crate::producer::send_status::SendStatus::SendOk,
+            Some(CheetahString::from("single-msg-id")),
+            Some("offset-a,offset-b".to_string()),
+            None,
+            17,
+        );
+
+        let split = split_send_results(&send_result, 2).expect("single msg id keeps Java batch-queue result");
+
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].msg_id.as_ref().unwrap().as_str(), "single-msg-id");
+        assert_eq!(split[0].offset_msg_id.as_deref(), Some("offset-a,offset-b"));
+        assert_eq!(split[0].queue_offset, 17);
+        assert_eq!(split[1].msg_id.as_ref().unwrap().as_str(), "single-msg-id");
+        assert_eq!(split[1].offset_msg_id.as_deref(), Some("offset-a,offset-b"));
+        assert_eq!(split[1].queue_offset, 17);
+    }
+
+    #[test]
+    fn split_send_results_rejects_mismatched_comma_msg_ids_like_java() {
+        let send_result = SendResult::new(
+            crate::producer::send_status::SendStatus::SendOk,
+            Some(CheetahString::from("msg-a,msg-b")),
+            Some("offset-a".to_string()),
+            None,
+            17,
+        );
+
+        let error = split_send_results(&send_result, 2).expect_err("mismatched per-message ids are illegal");
+
+        assert!(client_exception(&error).to_string().contains("sendResult is illegal"));
+    }
+
+    #[test]
+    fn split_send_results_rejects_missing_offset_msg_id_for_comma_msg_ids_like_java() {
+        let send_result = SendResult::new(
+            crate::producer::send_status::SendStatus::SendOk,
+            Some(CheetahString::from("msg-a,msg-b")),
+            None,
+            None,
+            17,
+        );
+
+        let error = split_send_results(&send_result, 2).expect_err("per-message msg id requires offset msg id");
+
+        assert!(client_exception(&error).to_string().contains("sendResult is illegal"));
+    }
+
+    #[test]
+    fn split_send_results_rejects_missing_msg_id_with_typed_error() {
+        let send_result = SendResult::new(
+            crate::producer::send_status::SendStatus::SendOk,
+            None,
+            Some("offset-a,offset-b".to_string()),
+            None,
+            17,
+        );
+
+        let error = split_send_results(&send_result, 2).expect_err("missing msg id is illegal");
+
+        assert!(client_exception(&error).to_string().contains("sendResult is illegal"));
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AggregateKey {
+    pub topic: CheetahString,
+    pub mq: Option<MessageQueue>,
+    pub wait_store_msg_ok: bool,
+    pub tag: Option<CheetahString>,
+}
+
+impl AggregateKey {
+    pub fn new_from_message<M: MessageTrait>(message: &M) -> Self {
+        Self {
+            topic: message.topic().clone(),
+            mq: None,
+            wait_store_msg_ok: message.is_wait_store_msg_ok(),
+            tag: message.tags(),
+        }
+    }
+
+    pub fn new_from_message_queue<M: MessageTrait>(message: &M, mq: Option<MessageQueue>) -> Self {
+        Self {
+            topic: message.topic().clone(),
+            mq,
+            wait_store_msg_ok: message.is_wait_store_msg_ok(),
+            tag: message.tags(),
+        }
+    }
+
+    pub fn new(
+        topic: CheetahString,
+        mq: Option<MessageQueue>,
+        wait_store_msg_ok: bool,
+        tag: Option<CheetahString>,
+    ) -> Self {
+        Self {
+            topic,
+            mq,
+            wait_store_msg_ok,
+            tag,
+        }
+    }
+}
+
+impl PartialEq for AggregateKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.wait_store_msg_ok == other.wait_store_msg_ok
+            && self.topic == other.topic
+            && self.mq == other.mq
+            && self.tag == other.tag
+    }
+}
+
+impl Eq for AggregateKey {}
+
+impl Hash for AggregateKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.topic.hash(state);
+        self.mq.hash(state);
+        self.wait_store_msg_ok.hash(state);
+        self.tag.hash(state);
+    }
+}
+
+struct MessageAccumulation {
+    default_mq_producer: DefaultMQProducer,
+    messages: Vec<Message>,
+    resource_permits: Vec<ResourcePermit>,
+    send_callbacks: Vec<ArcSendCallback>,
+    keys: HashSet<String>,
+    state: AtomicU8,
+    send_results: Option<Vec<SendResult>>, // Stores results for sync send
+    send_error: Option<ClientError>,
+    aggregate_key: AggregateKey,
+    messages_size: Arc<AtomicI32>,
+    count: usize,
+    create_time: u64,
+    completion_notify: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Clone)]
+struct AddOutcome {
+    index: usize,
+    should_flush: bool,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchState {
+    Open = 0,
+    Closing = 1,
+    Closed = 2,
+}
+
+impl BatchState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Open,
+            1 => Self::Closing,
+            _ => Self::Closed,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GuardScheduleCommand {
+    aggregate_key: AggregateKey,
+    create_time: u64,
+    deadline_ms: u64,
+}
+
+impl GuardScheduleCommand {
+    fn retained_bytes(&self) -> usize {
+        let queue_bytes = self
+            .aggregate_key
+            .mq
+            .as_ref()
+            .map_or(0, |queue| queue.topic().len().saturating_add(queue.broker_name().len()));
+        std::mem::size_of::<Self>()
+            .saturating_add(self.aggregate_key.topic.len())
+            .saturating_add(self.aggregate_key.tag.as_ref().map_or(0, CheetahString::len))
+            .saturating_add(queue_bytes)
+    }
+}
+
+struct GuardDeadline {
+    aggregate_key: AggregateKey,
+    create_time: u64,
+    deadline_ms: u64,
+    sequence: u64,
+    _permit: ResourcePermit,
+}
+
+impl PartialEq for GuardDeadline {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline_ms == other.deadline_ms
+            && self.sequence == other.sequence
+            && self.create_time == other.create_time
+            && self.aggregate_key == other.aggregate_key
+    }
+}
+
+impl Eq for GuardDeadline {}
+
+impl Ord for GuardDeadline {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .deadline_ms
+            .cmp(&self.deadline_ms)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+
+impl PartialOrd for GuardDeadline {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl MessageAccumulation {
+    pub fn new(aggregate_key: AggregateKey, default_mq_producer: DefaultMQProducer) -> Self {
+        Self {
+            default_mq_producer,
+            messages: vec![],
+            resource_permits: vec![],
+            send_callbacks: vec![],
+            keys: HashSet::new(),
+            state: AtomicU8::new(BatchState::Open as u8),
+            send_results: None,
+            send_error: None,
+            aggregate_key,
+            messages_size: Arc::new(AtomicI32::new(0)),
+            count: 0,
+            create_time: current_millis(),
+            completion_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn deadline_ms(&self, hold_ms: u64) -> u64 {
+        self.create_time.saturating_add(hold_ms)
+    }
+
+    fn state(&self) -> BatchState {
+        BatchState::from_u8(self.state.load(Ordering::Acquire))
+    }
+
+    fn try_mark_closing(&self) -> bool {
+        self.state
+            .compare_exchange(
+                BatchState::Open as u8,
+                BatchState::Closing as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn mark_closed(&self) {
+        self.state.store(BatchState::Closed as u8, Ordering::Release);
+    }
+
+    /// Check if batch is ready to send based on size or time thresholds
+    fn ready_to_send(&self, hold_size: usize, hold_ms: u64) -> bool {
+        // Condition 1: Size threshold
+        let current_size = self.messages_size.load(Ordering::Acquire);
+        if current_size > hold_size as i32 {
+            return true;
+        }
+
+        // Condition 2: Time threshold
+        let elapsed = current_millis() - self.create_time;
+        if elapsed >= hold_ms {
+            return true;
+        }
+
+        false
+    }
+
+    pub fn add<M: MessageTrait + Send + Sync + 'static>(
+        &mut self,
+        msg: M,
+        send_callback: Option<ArcSendCallback>,
+        hold_size: usize,
+        hold_ms: u64,
+    ) -> crate::ClientResult<Option<AddOutcome>> {
+        self.add_inner(msg, send_callback, hold_size, hold_ms, None)
+    }
+
+    fn add_with_resource_permit<M: MessageTrait + Send + Sync + 'static>(
+        &mut self,
+        msg: M,
+        send_callback: Option<ArcSendCallback>,
+        hold_size: usize,
+        hold_ms: u64,
+        resource_permit: ResourcePermit,
+    ) -> crate::ClientResult<Option<AddOutcome>> {
+        self.add_inner(msg, send_callback, hold_size, hold_ms, Some(resource_permit))
+    }
+
+    fn add_inner<M: MessageTrait + Send + Sync + 'static>(
+        &mut self,
+        msg: M,
+        send_callback: Option<ArcSendCallback>,
+        hold_size: usize,
+        hold_ms: u64,
+        resource_permit: Option<ResourcePermit>,
+    ) -> crate::ClientResult<Option<AddOutcome>> {
+        // Check if batch is already closed
+        if self.state() != BatchState::Open {
+            return Ok(None);
+        }
+
+        // Calculate message body size
+        let body_size = msg.get_body().map(|b| b.len()).unwrap_or(0) as i32;
+        if let Some(keys) = msg.get_keys_ref() {
+            self.keys.extend(
+                keys.as_str()
+                    .split(MessageConst::KEY_SEPARATOR)
+                    .filter(|key| !key.is_empty())
+                    .map(ToOwned::to_owned),
+            );
+        }
+
+        // Add message to batch
+        self.messages.push(msg.into_message());
+        if let Some(resource_permit) = resource_permit {
+            self.resource_permits.push(resource_permit);
+        }
+
+        // Add callback if provided
+        if let Some(callback) = send_callback {
+            self.send_callbacks.push(callback);
+        }
+
+        // Update message size counter
+        if body_size > 0 {
+            self.messages_size.fetch_add(body_size, Ordering::AcqRel);
+        }
+
+        // Increment count
+        let index = self.count;
+        self.count += 1;
+
+        Ok(Some(AddOutcome {
+            index,
+            should_flush: self.ready_to_send(hold_size, hold_ms),
+            notify: self.completion_notify.clone(),
+        }))
+    }
+}
+
+struct GuardForSyncSendService {
+    service_context: ChildServiceContext,
+    service_name: String,
+    resource_budget: ResourceBudget,
+    stopped: Arc<AtomicBool>,
+    state: StdMutex<GuardServiceState>,
+    metrics: Arc<BatchGuardMetrics>,
+}
+
+#[derive(Default)]
+struct GuardServiceState {
+    task_handle: Option<GuardTaskHandle>,
+    schedule_queue: Option<BudgetedQueue<GuardScheduleCommand>>,
+    stopping: bool,
+}
+
+struct GuardStoppingReset<'a> {
+    state: &'a StdMutex<GuardServiceState>,
+    service_name: &'a str,
+}
+
+impl Drop for GuardStoppingReset<'_> {
+    fn drop(&mut self) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                tracing::warn!("{} batch guard lifecycle lock was poisoned", self.service_name);
+                poisoned.into_inner()
+            }
+        };
+        state.stopping = false;
+    }
+}
+
+enum GuardTaskHandle {
+    Tracked {
+        shutdown_tx: watch::Sender<bool>,
+        handle: ClientTrackedTaskHandle,
+    },
+}
+
+impl GuardTaskHandle {
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Tracked { handle, .. } => handle.task_count() == 0,
+        }
+    }
+
+    async fn shutdown_async(self, timeout: Duration) -> bool {
+        match self {
+            Self::Tracked { shutdown_tx, handle } => {
+                let _ = shutdown_tx.send(true);
+                let report = handle.shutdown(timeout).await;
+                if !report.is_healthy() {
+                    tracing::warn!(report = %report.to_json(), "batch guard task shutdown report is unhealthy");
+                }
+                report.is_healthy()
+            }
+        }
+    }
+
+    fn shutdown_blocking(self, timeout: Duration) -> bool {
+        match self {
+            Self::Tracked { shutdown_tx, handle } => {
+                let _ = shutdown_tx.send(true);
+                let (report, completed) = handle.shutdown_blocking(timeout);
+                if !completed || !report.is_healthy() {
+                    tracing::warn!(
+                        completed_before_timeout = completed,
+                        report = %report.to_json(),
+                        "batch guard task blocking shutdown report is unhealthy"
+                    );
+                }
+                completed && report.is_healthy()
+            }
+        }
+    }
+
+    fn task_count(&self) -> usize {
+        match self {
+            Self::Tracked { handle, .. } => handle.task_count(),
+        }
+    }
+}
+
+fn spawn_guard_task<F>(
+    service_context: &ChildServiceContext,
+    thread_name: &'static str,
+    shutdown_tx: watch::Sender<bool>,
+    task: F,
+) -> Option<GuardTaskHandle>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    match spawn_client_tracked_task_with_context(service_context, thread_name, Box::pin(task)) {
+        Ok(handle) => Some(GuardTaskHandle::Tracked { shutdown_tx, handle }),
+        Err(error) => {
+            tracing::error!("Failed to spawn {} background task: {}", thread_name, error);
+            None
+        }
+    }
+}
+
+enum GuardWakeEvent {
+    Deadline,
+    Schedule(Box<BudgetedItem<GuardScheduleCommand>>),
+    Shutdown,
+}
+
+fn push_guard_deadline(
+    deadlines: &mut BinaryHeap<GuardDeadline>,
+    command: BudgetedItem<GuardScheduleCommand>,
+    sequence: &mut u64,
+) {
+    let (command, permit, _) = command.into_parts();
+    deadlines.push(GuardDeadline {
+        aggregate_key: command.aggregate_key,
+        create_time: command.create_time,
+        deadline_ms: command.deadline_ms,
+        sequence: *sequence,
+        _permit: permit,
+    });
+    *sequence = sequence.wrapping_add(1);
+}
+
+async fn wait_guard_deadline_or_schedule(
+    shutdown_rx: &mut watch::Receiver<bool>,
+    schedule_queue: &BudgetedQueue<GuardScheduleCommand>,
+    next_deadline_ms: Option<u64>,
+) -> GuardWakeEvent {
+    if *shutdown_rx.borrow() {
+        return GuardWakeEvent::Shutdown;
+    }
+
+    if let Some(deadline_ms) = next_deadline_ms {
+        let delay = Duration::from_millis(deadline_ms.saturating_sub(current_millis()));
+        if delay.is_zero() {
+            return GuardWakeEvent::Deadline;
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => GuardWakeEvent::Deadline,
+            command = schedule_queue.recv_budgeted() => {
+                command.map_or(GuardWakeEvent::Shutdown, |command| GuardWakeEvent::Schedule(Box::new(command)))
+            }
+            _ = shutdown_rx.changed() => GuardWakeEvent::Shutdown,
+        }
+    } else {
+        tokio::select! {
+            command = schedule_queue.recv_budgeted() => {
+                command.map_or(GuardWakeEvent::Shutdown, |command| GuardWakeEvent::Schedule(Box::new(command)))
+            }
+            _ = shutdown_rx.changed() => GuardWakeEvent::Shutdown,
+        }
+    }
+}
+
+fn build_guard_schedule_queue(
+    parent_budget: &ResourceBudget,
+    queue_name: &'static str,
+) -> crate::ClientResult<BudgetedQueue<GuardScheduleCommand>> {
+    const SCHEDULE_CAPACITY: usize = 65_536;
+    let queue_bytes = (parent_budget.limit().capacity.bytes / 64).max(1);
+    let budget = parent_budget
+        .child(
+            queue_name,
+            BudgetLimit::new(SCHEDULE_CAPACITY, queue_bytes, FullPolicy::Reject)
+                .with_rate(RateLimit::new(SCHEDULE_CAPACITY as u64, SCHEDULE_CAPACITY as u64))
+                .with_max_age(Duration::from_secs(300)),
+        )
+        .map_err(|error| ClientError::config_invalid_source("client.producer.accumulatorScheduleQueue", true, error))?;
+    Ok(BudgetedQueue::new(budget))
+}
+
+fn guard_metrics_snapshot(
+    metrics: &BatchGuardMetrics,
+    schedule_queue: Option<&BudgetedQueue<GuardScheduleCommand>>,
+) -> BatchGuardMetricsSnapshot {
+    let mut snapshot = metrics.snapshot();
+    if let Some(queue) = schedule_queue {
+        let queue = queue.snapshot();
+        snapshot.scheduled_count = queue.reserved_count;
+        snapshot.retained_bytes = queue.retained_bytes;
+        snapshot.oldest_queued_age_ms = queue
+            .oldest_age
+            .and_then(|age| u64::try_from(age.as_millis()).ok())
+            .unwrap_or(0);
+        snapshot.throttled_count = queue.throttled_count;
+        snapshot.rejected_count = queue.rejected_count;
+        snapshot.dropped_count = queue.dropped_count;
+    }
+    snapshot
+}
+
+fn remove_batch_if_same(
+    batches: &DashMap<AggregateKey, Arc<Mutex<MessageAccumulation>>>,
+    key: &AggregateKey,
+    expected: &Arc<Mutex<MessageAccumulation>>,
+) -> Option<Arc<Mutex<MessageAccumulation>>> {
+    batches
+        .remove_if(key, |_, current| Arc::ptr_eq(current, expected))
+        .map(|(_, batch)| batch)
+}
+
+async fn drain_due_sync_batches(
+    deadlines: &mut BinaryHeap<GuardDeadline>,
+    batches: &DashMap<AggregateKey, Arc<Mutex<MessageAccumulation>>>,
+    hold_ms: u64,
+    metrics: &BatchGuardMetrics,
+) {
+    let now = current_millis();
+    while deadlines.peek().is_some_and(|deadline| deadline.deadline_ms <= now) {
+        let deadline = deadlines.pop().expect("deadline should exist after peek");
+        let Some(batch) = batches.get(&deadline.aggregate_key).map(|entry| entry.value().clone()) else {
+            metrics.record_idle();
+            continue;
+        };
+
+        let mut remove_empty = false;
+        let mut notify = None;
+        {
+            let batch_guard = batch.lock().await;
+            if batch_guard.create_time != deadline.create_time || batch_guard.state() != BatchState::Open {
+                metrics.record_idle();
+                continue;
+            }
+
+            if batch_guard.messages_size.load(Ordering::Acquire) == 0 {
+                batch_guard.mark_closed();
+                remove_empty = true;
+            } else if batch_guard.deadline_ms(hold_ms) <= now {
+                notify = Some(batch_guard.completion_notify.clone());
+            } else {
+                metrics.record_idle();
+            }
+        }
+
+        if remove_empty {
+            remove_batch_if_same(batches, &deadline.aggregate_key, &batch);
+            metrics.record_idle();
+        } else if let Some(notify) = notify {
+            metrics.record_flush();
+            notify.notify_waiters();
+        }
+    }
+}
+
+async fn drain_due_async_batches(
+    deadlines: &mut BinaryHeap<GuardDeadline>,
+    batches: &DashMap<AggregateKey, Arc<Mutex<MessageAccumulation>>>,
+    currently_hold_size: &Arc<AtomicU64>,
+    hold_size: usize,
+    hold_ms: u64,
+    metrics: &BatchGuardMetrics,
+) {
+    let now = current_millis();
+    while deadlines.peek().is_some_and(|deadline| deadline.deadline_ms <= now) {
+        let deadline = deadlines.pop().expect("deadline should exist after peek");
+        let Some(batch) = batches.get(&deadline.aggregate_key).map(|entry| entry.value().clone()) else {
+            metrics.record_idle();
+            continue;
+        };
+
+        let mut remove_empty = false;
+        let mut should_send = false;
+        {
+            let batch_guard = batch.lock().await;
+            if batch_guard.create_time != deadline.create_time || batch_guard.state() != BatchState::Open {
+                metrics.record_idle();
+                continue;
+            }
+
+            if batch_guard.messages_size.load(Ordering::Acquire) == 0 {
+                batch_guard.mark_closed();
+                remove_empty = true;
+            } else if batch_guard.ready_to_send(hold_size, hold_ms) {
+                should_send = true;
+            } else {
+                metrics.record_idle();
+            }
+        }
+
+        if remove_empty {
+            remove_batch_if_same(batches, &deadline.aggregate_key, &batch);
+            metrics.record_idle();
+            continue;
+        }
+
+        if should_send {
+            if let Some(batch) = remove_batch_if_same(batches, &deadline.aggregate_key, &batch) {
+                metrics.record_flush();
+                if let Err(error) =
+                    GuardForAsyncSendService::send_batch_async_internal(batch, currently_hold_size.clone()).await
+                {
+                    tracing::error!("Failed to send batch via guard thread: {:?}", error);
+                }
+            } else {
+                metrics.record_idle();
+            }
+        }
+    }
+}
+
+impl GuardForSyncSendService {
+    pub fn new(service_context: ChildServiceContext, service_name: &str, resource_budget: ResourceBudget) -> Self {
+        Self {
+            service_context,
+            service_name: service_name.to_string(),
+            resource_budget,
+            stopped: Arc::new(AtomicBool::new(false)),
+            state: StdMutex::new(GuardServiceState::default()),
+            metrics: Arc::new(BatchGuardMetrics::default()),
+        }
+    }
+
+    fn state(&self) -> StdMutexGuard<'_, GuardServiceState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                tracing::warn!("{} sync batch guard lifecycle lock was poisoned", self.service_name);
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    pub fn start(&self, batches: BatchMap, hold_ms: u32) -> crate::ClientResult<()> {
+        let mut state = self.state();
+        if state.stopping {
+            return Err(crate::mq_client_err!("sync batch guard is stopping"));
+        }
+        if state.task_handle.as_ref().is_some_and(|handle| !handle.is_finished()) {
+            tracing::warn!("{} sync batch guard already started", self.service_name);
+            return Ok(());
+        }
+
+        let service_name = self.service_name.clone();
+        let stopped = self.stopped.clone();
+        let metrics = self.metrics.clone();
+        let schedule_queue = build_guard_schedule_queue(&self.resource_budget, "sync-batch-deadlines")?;
+        let task_schedule_queue = schedule_queue.clone();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        self.stopped.store(false, Ordering::Release);
+
+        let task_handle = spawn_guard_task(
+            &self.service_context,
+            "rocketmq-client-sync-batch-guard",
+            shutdown_tx,
+            async move {
+                tracing::info!("{} service started", service_name);
+
+                let mut deadlines = BinaryHeap::new();
+                let mut sequence = 0u64;
+
+                loop {
+                    if stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    let next_deadline_ms = deadlines.peek().map(|deadline: &GuardDeadline| deadline.deadline_ms);
+                    match wait_guard_deadline_or_schedule(&mut shutdown_rx, &task_schedule_queue, next_deadline_ms)
+                        .await
+                    {
+                        GuardWakeEvent::Schedule(command) => {
+                            push_guard_deadline(&mut deadlines, *command, &mut sequence);
+                        }
+                        GuardWakeEvent::Deadline => {
+                            metrics.record_wakeup();
+                            drain_due_sync_batches(&mut deadlines, &batches, hold_ms as u64, &metrics).await;
+                        }
+                        GuardWakeEvent::Shutdown => break,
+                    }
+                }
+
+                tracing::info!("{} service ended", service_name);
+            },
+        );
+        let task_handle = task_handle.ok_or_else(|| crate::mq_client_err!("failed to spawn sync batch guard"))?;
+        state.schedule_queue = Some(schedule_queue);
+        state.task_handle = Some(task_handle);
+        Ok(())
+    }
+
+    fn schedule_batch(
+        &self,
+        aggregate_key: AggregateKey,
+        create_time: u64,
+        deadline_ms: u64,
+    ) -> crate::ClientResult<()> {
+        let schedule_queue = self.state().schedule_queue.clone();
+        let Some(schedule_queue) = schedule_queue else {
+            return Err(crate::mq_client_err!("sync batch deadline scheduler is not running"));
+        };
+        let command = GuardScheduleCommand {
+            aggregate_key,
+            create_time,
+            deadline_ms,
+        };
+        let retained_bytes = command.retained_bytes();
+        match schedule_queue.try_push_data(command, retained_bytes) {
+            rocketmq_runtime::QueuePushOutcome::Rejected { .. } => {
+                Err(crate::mq_client_err!("sync batch deadline queue is full"))
+            }
+            rocketmq_runtime::QueuePushOutcome::Enqueued
+            | rocketmq_runtime::QueuePushOutcome::Coalesced { .. }
+            | rocketmq_runtime::QueuePushOutcome::DroppedStale { .. } => Ok(()),
+        }
+    }
+
+    fn metrics_snapshot(&self) -> BatchGuardMetricsSnapshot {
+        guard_metrics_snapshot(&self.metrics, self.state().schedule_queue.as_ref())
+    }
+
+    pub fn shutdown(&self) {
+        self.stopped.store(true, Ordering::Release);
+        let handle = {
+            let mut state = self.state();
+            if state.stopping {
+                return;
+            }
+            state.stopping = true;
+            if let Some(queue) = state.schedule_queue.take() {
+                queue.close();
+            }
+            state.task_handle.take()
+        };
+        let _stopping_reset = GuardStoppingReset {
+            state: &self.state,
+            service_name: &self.service_name,
+        };
+        if let Some(handle) = handle {
+            if !handle.shutdown_blocking(GUARD_TASK_SHUTDOWN_TIMEOUT) {
+                tracing::warn!(
+                    "{} sync batch guard did not stop before timeout; aborted",
+                    self.service_name
+                );
+            }
+        }
+    }
+
+    pub async fn shutdown_async(&self) {
+        self.stopped.store(true, Ordering::Release);
+        let handle = {
+            let mut state = self.state();
+            if state.stopping {
+                return;
+            }
+            state.stopping = true;
+            if let Some(queue) = state.schedule_queue.take() {
+                queue.close();
+            }
+            state.task_handle.take()
+        };
+        let _stopping_reset = GuardStoppingReset {
+            state: &self.state,
+            service_name: &self.service_name,
+        };
+        if let Some(handle) = handle {
+            if !handle.shutdown_async(GUARD_TASK_SHUTDOWN_TIMEOUT).await {
+                tracing::warn!(
+                    "{} sync batch guard did not stop before timeout; aborted",
+                    self.service_name
+                );
+            }
+        }
+    }
+
+    fn task_count(&self) -> usize {
+        self.state()
+            .task_handle
+            .as_ref()
+            .map(GuardTaskHandle::task_count)
+            .unwrap_or_default()
+    }
+}
+
+struct GuardForAsyncSendService {
+    service_context: ChildServiceContext,
+    service_name: String,
+    resource_budget: ResourceBudget,
+    stopped: Arc<AtomicBool>,
+    state: StdMutex<GuardServiceState>,
+    metrics: Arc<BatchGuardMetrics>,
+}
+
+impl GuardForAsyncSendService {
+    pub fn new(service_context: ChildServiceContext, service_name: &str, resource_budget: ResourceBudget) -> Self {
+        Self {
+            service_context,
+            service_name: service_name.to_string(),
+            resource_budget,
+            stopped: Arc::new(AtomicBool::new(false)),
+            state: StdMutex::new(GuardServiceState::default()),
+            metrics: Arc::new(BatchGuardMetrics::default()),
+        }
+    }
+
+    fn state(&self) -> StdMutexGuard<'_, GuardServiceState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                tracing::warn!("{} async batch guard lifecycle lock was poisoned", self.service_name);
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    pub fn start(
+        &self,
+        batches: BatchMap,
+        currently_hold_size: Arc<AtomicU64>,
+        hold_size: usize,
+        hold_ms: u32,
+    ) -> crate::ClientResult<()> {
+        let mut state = self.state();
+        if state.stopping {
+            return Err(crate::mq_client_err!("async batch guard is stopping"));
+        }
+        if state.task_handle.as_ref().is_some_and(|handle| !handle.is_finished()) {
+            tracing::warn!("{} async batch guard already started", self.service_name);
+            return Ok(());
+        }
+
+        let service_name = self.service_name.clone();
+        let stopped = self.stopped.clone();
+        let metrics = self.metrics.clone();
+        let schedule_queue = build_guard_schedule_queue(&self.resource_budget, "async-batch-deadlines")?;
+        let task_schedule_queue = schedule_queue.clone();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        self.stopped.store(false, Ordering::Release);
+
+        let task_handle = spawn_guard_task(
+            &self.service_context,
+            "rocketmq-client-async-batch-guard",
+            shutdown_tx,
+            async move {
+                tracing::info!("{} service started", service_name);
+
+                let mut deadlines = BinaryHeap::new();
+                let mut sequence = 0u64;
+
+                loop {
+                    if stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    let next_deadline_ms = deadlines.peek().map(|deadline: &GuardDeadline| deadline.deadline_ms);
+                    match wait_guard_deadline_or_schedule(&mut shutdown_rx, &task_schedule_queue, next_deadline_ms)
+                        .await
+                    {
+                        GuardWakeEvent::Schedule(command) => {
+                            push_guard_deadline(&mut deadlines, *command, &mut sequence);
+                        }
+                        GuardWakeEvent::Deadline => {
+                            metrics.record_wakeup();
+                            drain_due_async_batches(
+                                &mut deadlines,
+                                &batches,
+                                &currently_hold_size,
+                                hold_size,
+                                hold_ms as u64,
+                                &metrics,
+                            )
+                            .await;
+                        }
+                        GuardWakeEvent::Shutdown => break,
+                    }
+                }
+
+                tracing::info!("{} service ended", service_name);
+            },
+        );
+        let task_handle = task_handle.ok_or_else(|| crate::mq_client_err!("failed to spawn async batch guard"))?;
+        state.schedule_queue = Some(schedule_queue);
+        state.task_handle = Some(task_handle);
+        Ok(())
+    }
+
+    fn schedule_batch(
+        &self,
+        aggregate_key: AggregateKey,
+        create_time: u64,
+        deadline_ms: u64,
+    ) -> crate::ClientResult<()> {
+        let schedule_queue = self.state().schedule_queue.clone();
+        let Some(schedule_queue) = schedule_queue else {
+            return Err(crate::mq_client_err!("async batch deadline scheduler is not running"));
+        };
+        let command = GuardScheduleCommand {
+            aggregate_key,
+            create_time,
+            deadline_ms,
+        };
+        let retained_bytes = command.retained_bytes();
+        match schedule_queue.try_push_data(command, retained_bytes) {
+            rocketmq_runtime::QueuePushOutcome::Rejected { .. } => {
+                Err(crate::mq_client_err!("async batch deadline queue is full"))
+            }
+            rocketmq_runtime::QueuePushOutcome::Enqueued
+            | rocketmq_runtime::QueuePushOutcome::Coalesced { .. }
+            | rocketmq_runtime::QueuePushOutcome::DroppedStale { .. } => Ok(()),
+        }
+    }
+
+    fn metrics_snapshot(&self) -> BatchGuardMetricsSnapshot {
+        guard_metrics_snapshot(&self.metrics, self.state().schedule_queue.as_ref())
+    }
+
+    /// Internal method to send batch (used by guard thread)
+    async fn send_batch_async_internal(
+        batch: Arc<Mutex<MessageAccumulation>>,
+        currently_hold_size: Arc<AtomicU64>,
+    ) -> crate::ClientResult<()> {
+        // Extract all data from the batch without holding the lock across await
+        let (messages, resource_permits, mq, producer, total_size, callbacks, aggregate_key, keys, notify) = {
+            let mut batch_guard = batch.lock().await;
+            if !batch_guard.try_mark_closing() {
+                return Ok(());
+            }
+            let notify = batch_guard.completion_notify.clone();
+
+            if batch_guard.messages.is_empty() {
+                let error = crate::mq_client_err!("No messages to send");
+                batch_guard.send_error = Some(error.clone());
+                batch_guard.mark_closed();
+                notify.notify_waiters();
+                return Err(error);
+            }
+
+            let total_size = batch_guard.messages_size.load(Ordering::Acquire) as u64;
+            let messages = std::mem::take(&mut batch_guard.messages);
+            let resource_permits = std::mem::take(&mut batch_guard.resource_permits);
+            let callbacks = std::mem::take(&mut batch_guard.send_callbacks);
+            let mq = batch_guard.aggregate_key.mq.clone();
+            let producer = batch_guard.default_mq_producer.clone();
+            let aggregate_key = batch_guard.aggregate_key.clone();
+            let keys = batch_guard.keys.clone();
+
+            (
+                messages,
+                resource_permits,
+                mq,
+                producer,
+                total_size,
+                callbacks,
+                aggregate_key,
+                keys,
+                notify,
+            )
+        }; // Lock released here
+
+        let batch_msg = match build_message_batch(messages, &aggregate_key, &keys) {
+            Ok(batch_msg) => batch_msg,
+            Err(error) => {
+                release_hold_size(&currently_hold_size, total_size);
+                let mut batch_guard = batch.lock().await;
+                batch_guard.send_error = Some(error.clone());
+                batch_guard.mark_closed();
+                notify.notify_waiters();
+                for callback in &callbacks {
+                    callback.on_exception(&error);
+                }
+                return Err(error);
+            }
+        };
+
+        let callback_currently_hold_size = currently_hold_size.clone();
+        let callbacks = Arc::new(callbacks);
+        let callbacks_for_send_error = callbacks.clone();
+        let permit_owner = Arc::new(StdMutex::new(Some(resource_permits)));
+        let callback_permit_owner = Arc::clone(&permit_owner);
+
+        // Create combined callback
+        let combined_callback = move |result: Option<&SendResult>, error: Option<&ClientError>| {
+            release_resource_permits(&callback_permit_owner);
+            release_hold_size(&callback_currently_hold_size, total_size);
+            if let Some(result) = result {
+                match split_send_results(result, callbacks.len()) {
+                    Ok(send_results) => {
+                        for (callback, result) in callbacks.iter().zip(send_results.iter()) {
+                            callback.on_success(result);
+                        }
+                    }
+                    Err(error) => {
+                        for callback in callbacks.iter() {
+                            callback.on_exception(&error);
+                        }
+                    }
+                }
+            } else if let Some(error) = error {
+                for callback in callbacks.iter() {
+                    callback.on_exception(error);
+                }
+            }
+        };
+
+        // Send without holding any locks
+        let send_result = producer
+            .send_direct(batch_msg, mq, Some(Arc::new(combined_callback)))
+            .await;
+
+        if let Err(error) = &send_result {
+            release_resource_permits(&permit_owner);
+            release_hold_size(&currently_hold_size, total_size);
+            let mut batch_guard = batch.lock().await;
+            batch_guard.send_error = Some(error.clone());
+            batch_guard.mark_closed();
+            notify.notify_waiters();
+            for callback in callbacks_for_send_error.iter() {
+                callback.on_exception(error);
+            }
+        } else {
+            let batch_guard = batch.lock().await;
+            batch_guard.mark_closed();
+            notify.notify_waiters();
+        }
+
+        send_result.map(|_| ())
+    }
+
+    pub fn shutdown(&self) {
+        self.stopped.store(true, Ordering::Release);
+        let handle = {
+            let mut state = self.state();
+            if state.stopping {
+                return;
+            }
+            state.stopping = true;
+            if let Some(queue) = state.schedule_queue.take() {
+                queue.close();
+            }
+            state.task_handle.take()
+        };
+        let _stopping_reset = GuardStoppingReset {
+            state: &self.state,
+            service_name: &self.service_name,
+        };
+        if let Some(handle) = handle {
+            if !handle.shutdown_blocking(GUARD_TASK_SHUTDOWN_TIMEOUT) {
+                tracing::warn!(
+                    "{} async batch guard did not stop before timeout; aborted",
+                    self.service_name
+                );
+            }
+        }
+    }
+
+    pub async fn shutdown_async(&self) {
+        self.stopped.store(true, Ordering::Release);
+        let handle = {
+            let mut state = self.state();
+            if state.stopping {
+                return;
+            }
+            state.stopping = true;
+            if let Some(queue) = state.schedule_queue.take() {
+                queue.close();
+            }
+            state.task_handle.take()
+        };
+        let _stopping_reset = GuardStoppingReset {
+            state: &self.state,
+            service_name: &self.service_name,
+        };
+        if let Some(handle) = handle {
+            if !handle.shutdown_async(GUARD_TASK_SHUTDOWN_TIMEOUT).await {
+                tracing::warn!(
+                    "{} async batch guard did not stop before timeout; aborted",
+                    self.service_name
+                );
+            }
+        }
+    }
+
+    fn task_count(&self) -> usize {
+        self.state()
+            .task_handle
+            .as_ref()
+            .map(GuardTaskHandle::task_count)
+            .unwrap_or_default()
+    }
+}

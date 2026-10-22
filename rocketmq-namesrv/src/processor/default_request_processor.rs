@@ -1,0 +1,1085 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use core::str;
+use std::collections::HashMap;
+use std::time::Duration;
+use std::time::Instant;
+
+use cheetah_string::CheetahString;
+use rocketmq_error::PublicErrorView;
+use rocketmq_error::AUTH_PERMISSION_DENIED;
+use rocketmq_error::CORE_ARGUMENT_INVALID;
+use rocketmq_error::CORE_INTERNAL_FAILURE;
+use rocketmq_error::PROTOCOL_REQUEST_UNSUPPORTED;
+use rocketmq_model::common::mix_all;
+use rocketmq_model::common::mix_all::string_to_properties;
+use rocketmq_model::utils::crc32_utils;
+use rocketmq_model::version::RocketMqVersion;
+use rocketmq_protocol::code::request_code::RequestCode;
+use rocketmq_protocol::code::response_code::RemotingSysResponseCode;
+use rocketmq_protocol::code::response_code::ResponseCode;
+use rocketmq_protocol::protocol::body::broker_body::broker_member_group::GetBrokerMemberGroupResponseBody;
+use rocketmq_protocol::protocol::body::broker_body::register_broker_body::RegisterBrokerBody;
+use rocketmq_protocol::protocol::body::topic::topic_list::TopicList;
+use rocketmq_protocol::protocol::body::topic_info_wrapper::topic_config_wrapper::TopicConfigAndMappingSerializeWrapper;
+use rocketmq_protocol::protocol::header::namesrv::broker_request::BrokerHeartbeatRequestHeader;
+use rocketmq_protocol::protocol::header::namesrv::broker_request::GetBrokerMemberGroupRequestHeader;
+use rocketmq_protocol::protocol::header::namesrv::broker_request::UnRegisterBrokerRequestHeader;
+use rocketmq_protocol::protocol::header::namesrv::config_header::GetNamesrvConfigRequestHeader;
+use rocketmq_protocol::protocol::header::namesrv::kv_config_header::DeleteKVConfigRequestHeader;
+use rocketmq_protocol::protocol::header::namesrv::kv_config_header::GetKVConfigRequestHeader;
+use rocketmq_protocol::protocol::header::namesrv::kv_config_header::GetKVConfigResponseHeader;
+use rocketmq_protocol::protocol::header::namesrv::kv_config_header::GetKVListByNamespaceRequestHeader;
+use rocketmq_protocol::protocol::header::namesrv::kv_config_header::PutKVConfigRequestHeader;
+use rocketmq_protocol::protocol::header::namesrv::perm_broker_header::AddWritePermOfBrokerRequestHeader;
+use rocketmq_protocol::protocol::header::namesrv::perm_broker_header::AddWritePermOfBrokerResponseHeader;
+use rocketmq_protocol::protocol::header::namesrv::perm_broker_header::WipeWritePermOfBrokerRequestHeader;
+use rocketmq_protocol::protocol::header::namesrv::perm_broker_header::WipeWritePermOfBrokerResponseHeader;
+use rocketmq_protocol::protocol::header::namesrv::query_data_version_header::QueryDataVersionRequestHeader;
+use rocketmq_protocol::protocol::header::namesrv::query_data_version_header::QueryDataVersionResponseHeader;
+use rocketmq_protocol::protocol::header::namesrv::register_broker_header::RegisterBrokerRequestHeader;
+use rocketmq_protocol::protocol::header::namesrv::register_broker_header::RegisterBrokerResponseHeader;
+use rocketmq_protocol::protocol::header::namesrv::topic_operation_header::DeleteTopicFromNamesrvRequestHeader;
+use rocketmq_protocol::protocol::header::namesrv::topic_operation_header::GetTopicsByClusterRequestHeader;
+use rocketmq_protocol::protocol::header::namesrv::topic_operation_header::RegisterTopicRequestHeader;
+use rocketmq_protocol::protocol::remoting_command::RemotingCommand;
+use rocketmq_protocol::protocol::remoting_command_defaults::RemotingCommandFactory;
+use rocketmq_protocol::protocol::route::topic_route_data::TopicRouteData;
+use rocketmq_protocol::protocol::DataVersion;
+use rocketmq_protocol::protocol::RemotingDeserializable;
+use rocketmq_protocol::protocol::RemotingSerializable;
+use rocketmq_runtime::MetadataDeadline;
+use rocketmq_transport::api::error_response;
+use rocketmq_transport::api::RemotingErrorTarget;
+use rocketmq_transport::api::RemotingRequest;
+use rocketmq_transport::api::RequestProcessor;
+use rocketmq_transport::api::ResponseAction;
+use rocketmq_transport::api::SessionView;
+use tracing::debug;
+use tracing::warn;
+
+use crate::bootstrap::NameServerRuntimeHandle;
+use crate::processor::NAMESPACE_ORDER_TOPIC_CONFIG;
+use crate::route::types::BrokerSession;
+use crate::NamesrvConfig;
+
+pub struct DefaultRequestProcessor {
+    name_server_runtime_inner: NameServerRuntimeHandle,
+    command_factory: RemotingCommandFactory,
+}
+
+impl RequestProcessor for DefaultRequestProcessor {
+    async fn process(&mut self, request: &mut RemotingRequest) -> crate::NameServerResult<ResponseAction> {
+        let response = self.handle_request(request).await?;
+        crate::processor::response_outcome(response)
+    }
+}
+
+impl DefaultRequestProcessor {
+    pub(crate) async fn handle_request(
+        &self,
+        request: &mut RemotingRequest,
+    ) -> crate::NameServerResult<Option<RemotingCommand>> {
+        let broker_session = if matches!(
+            RequestCode::from(request.command().code()),
+            RequestCode::RegisterBroker | RequestCode::BrokerHeartbeat
+        ) {
+            Some(broker_session_from_request(request)?)
+        } else {
+            None
+        };
+        self.handle_command(request.command_mut(), broker_session).await
+    }
+
+    pub(crate) async fn handle_command(
+        &self,
+        request: &mut RemotingCommand,
+        broker_session: Option<BrokerSession>,
+    ) -> crate::NameServerResult<Option<RemotingCommand>> {
+        let _runtime_guard = self
+            .name_server_runtime_inner
+            .upgrade()
+            .ok_or_else(|| crate::namesrv_error::not_initialized("namesrv-runtime"))?;
+        let request_code = RequestCode::from(request.code());
+        debug!(
+            "Name server DefaultRequestProcessor Received request code: {:?}",
+            request_code
+        );
+        self.process_request_inner(broker_session, request_code, request).await
+    }
+}
+
+impl DefaultRequestProcessor {
+    pub(crate) async fn process_request_inner(
+        &self,
+        broker_session: Option<BrokerSession>,
+        request_code: RequestCode,
+        request: &mut RemotingCommand,
+    ) -> crate::NameServerResult<Option<RemotingCommand>> {
+        let response = match request_code {
+            RequestCode::PutKvConfig => self.put_kv_config(request).await,
+            RequestCode::GetKvConfig => self.get_kv_config(request),
+            RequestCode::DeleteKvConfig => self.delete_kv_config(request).await,
+            RequestCode::QueryDataVersion => self.query_broker_topic_config(request),
+            //handle register broker
+            RequestCode::RegisterBroker => self.process_register_broker(
+                broker_session
+                    .ok_or_else(|| crate::namesrv_error::invariant("namesrv.register_broker.session_missing"))?,
+                request,
+            ),
+            RequestCode::UnregisterBroker => self.process_unregister_broker(request),
+            RequestCode::BrokerHeartbeat => self.process_broker_heartbeat(
+                broker_session
+                    .ok_or_else(|| crate::namesrv_error::invariant("namesrv.broker_heartbeat.session_missing"))?,
+                request,
+            ),
+            RequestCode::GetBrokerMemberGroup => self.get_broker_member_group(request),
+            //handle get broker cluster info
+            RequestCode::GetBrokerClusterInfo => self.get_broker_cluster_info(request),
+            RequestCode::WipeWritePermOfBroker => self.wipe_write_perm_of_broker(request),
+            RequestCode::AddWritePermOfBroker => self.add_write_perm_of_broker(request),
+            RequestCode::GetAllTopicListFromNameserver => self.get_all_topic_list_from_nameserver(request),
+            RequestCode::DeleteTopicInNamesrv => self.delete_topic_in_name_srv(request),
+            RequestCode::RegisterTopicInNamesrv => self.register_topic_to_name_srv(request),
+            RequestCode::GetKvlistByNamespace => self.get_kv_list_by_namespace(request),
+            RequestCode::GetTopicsByCluster => self.get_topics_by_cluster(request),
+            RequestCode::GetSystemTopicListFromNs => self.get_system_topic_list_from_ns(request),
+            RequestCode::GetUnitTopicList => self.get_unit_topic_list(request),
+            RequestCode::GetHasUnitSubTopicList => self.get_has_unit_sub_topic_list(request),
+            RequestCode::GetHasUnitSubUnunitTopicList => self.get_has_unit_sub_un_unit_topic_list(request),
+            RequestCode::UpdateNamesrvConfig => self.update_config(request).await,
+            RequestCode::GetNamesrvConfig => self.get_config(request),
+            _ => Ok(error_response(
+                PublicErrorView::descriptor_only(&PROTOCOL_REQUEST_UNSUPPORTED),
+                RemotingErrorTarget::Fresh(&self.command_factory),
+            )),
+        }?;
+        Ok(Some(response))
+    }
+}
+
+///implementation put KV config
+impl DefaultRequestProcessor {
+    async fn put_kv_config(&self, request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        let request_header = request
+            .decode_command_custom_header::<PutKVConfigRequestHeader>()
+            .map_err(crate::namesrv_error::from_error)?;
+        //check namespace and key, need?
+        if request_header.namespace.is_empty() || request_header.key.is_empty() {
+            return Ok(error_response(
+                PublicErrorView::descriptor_only(&CORE_ARGUMENT_INVALID),
+                RemotingErrorTarget::Fresh(&self.command_factory),
+            ));
+        }
+
+        self.name_server_runtime_inner
+            .kvconfig_manager()
+            .put_kv_config(
+                request_header.namespace,
+                request_header.key,
+                request_header.value,
+                MetadataDeadline::after(Duration::from_secs(5)),
+            )
+            .await?;
+        Ok(self.command_factory.create_success_response_command())
+    }
+
+    fn get_kv_config(&self, request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        let request_header = request
+            .decode_command_custom_header::<GetKVConfigRequestHeader>()
+            .map_err(crate::namesrv_error::from_error)?;
+
+        let value = self
+            .name_server_runtime_inner
+            .kvconfig_manager()
+            .get_kvconfig(&request_header.namespace, &request_header.key);
+
+        if value.is_some() {
+            return Ok(self
+                .command_factory
+                .create_success_response_command_with_header(GetKVConfigResponseHeader::new(value)));
+        }
+        Ok(self.command_factory.create_response_command_with_code_remark(
+            ResponseCode::QueryNotFound,
+            "NameServer KV configuration was not found",
+        ))
+    }
+
+    async fn delete_kv_config(&self, request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        let request_header = request
+            .decode_command_custom_header::<DeleteKVConfigRequestHeader>()
+            .map_err(crate::namesrv_error::from_error)?;
+
+        self.name_server_runtime_inner
+            .kvconfig_manager()
+            .delete_kv_config(
+                &request_header.namespace,
+                &request_header.key,
+                MetadataDeadline::after(Duration::from_secs(5)),
+            )
+            .await?;
+        Ok(self.command_factory.create_success_response_command())
+    }
+
+    fn query_broker_topic_config(&self, request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        let request_header = request
+            .decode_command_custom_header::<QueryDataVersionRequestHeader>()
+            .map_err(crate::namesrv_error::from_error)?;
+
+        let body = request
+            .get_body()
+            .ok_or_else(|| crate::namesrv_error::request_body_invalid("decode-data-version"))?;
+
+        let data_version = DataVersion::decode(body)
+            .map_err(|error| crate::namesrv_error::request_body_source("decode-data-version", error))?;
+
+        // Check if broker topic config has changed
+        let changed = self
+            .name_server_runtime_inner
+            .route_info_manager()
+            .is_broker_topic_config_changed(&request_header.cluster_name, &request_header.broker_addr, &data_version);
+
+        // Update broker timestamp
+        self.name_server_runtime_inner
+            .route_info_manager()
+            .update_broker_info_update_timestamp(
+                request_header.cluster_name.clone(),
+                request_header.broker_addr.clone(),
+            );
+
+        // Build response with changed flag
+        let mut command = self
+            .command_factory
+            .create_success_response_command_with_header(QueryDataVersionResponseHeader::new(changed));
+
+        // Query and attach broker topic config if available
+        if let Some(topic_config) = self
+            .name_server_runtime_inner
+            .route_info_manager()
+            .query_broker_topic_config(request_header.cluster_name, request_header.broker_addr)
+        {
+            let body = topic_config
+                .encode()
+                .map_err(|error| crate::namesrv_error::response_source("encode-data-version", error))?;
+            command = command.set_body(body);
+        }
+
+        Ok(command)
+    }
+}
+
+#[allow(clippy::new_without_default)]
+impl DefaultRequestProcessor {
+    pub(crate) fn new(name_server_runtime_inner: NameServerRuntimeHandle) -> Self {
+        let command_factory = name_server_runtime_inner.remoting_command_factory();
+        Self {
+            name_server_runtime_inner,
+            command_factory,
+        }
+    }
+}
+impl DefaultRequestProcessor {
+    fn process_register_broker(
+        &self,
+        broker_session: BrokerSession,
+        request: &mut RemotingCommand,
+    ) -> crate::NameServerResult<RemotingCommand> {
+        let request_header = request
+            .decode_command_custom_header::<RegisterBrokerRequestHeader>()
+            .map_err(crate::namesrv_error::from_error)?;
+        if !check_sum_crc32(request, &request_header) {
+            return Ok(error_response(
+                PublicErrorView::descriptor_only(&CORE_ARGUMENT_INVALID),
+                RemotingErrorTarget::Fresh(&self.command_factory),
+            ));
+        }
+
+        let mut response_command = self.command_factory.create_success_response_command();
+        let broker_version = RocketMqVersion::try_from(request.version() as u32)?;
+        let decode_started = Instant::now();
+        let wire_bytes = request.body().map_or(0, bytes::Bytes::len);
+        let topic_config_wrapper;
+        let mut filter_server_list = Vec::new();
+        if broker_version >= RocketMqVersion::V3_0_11 {
+            let decode_limits = self
+                .name_server_runtime_inner
+                .name_server_config()
+                .register_broker_decode_limits();
+            let register_broker_body =
+                extract_register_broker_body_from_request(request, &request_header, decode_limits)?;
+            topic_config_wrapper = register_broker_body.topic_config_serialize_wrapper;
+            filter_server_list = register_broker_body.filter_server_list;
+        } else {
+            topic_config_wrapper = extract_register_topic_config_from_request(request)?;
+        }
+        self.name_server_runtime_inner
+            .route_info_manager()
+            .record_registration_decode(
+                wire_bytes,
+                (!request_header.compressed).then_some(wire_bytes),
+                decode_started.elapsed(),
+            );
+        let heartbeat_timeout_millis = request_header
+            .heartbeat_timeout_millis
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| crate::namesrv_error::invalid_configuration("heartbeatTimeoutMillis"))?;
+        let register_broker_result = self
+            .name_server_runtime_inner
+            .route_info_manager()
+            .register_broker_session(
+                request_header.cluster_name,
+                request_header.broker_addr,
+                request_header.broker_name,
+                request_header.broker_id,
+                request_header.ha_server_addr,
+                request
+                    .ext_fields()
+                    .and_then(|map| map.get(mix_all::ZONE_NAME).cloned()),
+                heartbeat_timeout_millis,
+                request_header.enable_acting_master,
+                topic_config_wrapper,
+                filter_server_list,
+                broker_session,
+            )?;
+        if self
+            .name_server_runtime_inner
+            .name_server_config()
+            .return_order_topic_config_to_broker
+        {
+            if let Some(value) = self
+                .name_server_runtime_inner
+                .kvconfig_manager()
+                .get_kv_list_by_namespace(&CheetahString::from_static_str(NAMESPACE_ORDER_TOPIC_CONFIG))
+            {
+                response_command = response_command.set_body(value);
+            }
+        }
+        Ok(response_command
+            .set_code(RemotingSysResponseCode::Success)
+            .set_command_custom_header(RegisterBrokerResponseHeader::new(
+                Some(register_broker_result.ha_server_addr),
+                Some(register_broker_result.master_addr),
+            )))
+    }
+
+    fn process_unregister_broker(&self, request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        let request_header = request
+            .decode_command_custom_header::<UnRegisterBrokerRequestHeader>()
+            .map_err(crate::namesrv_error::from_error)?;
+        if !self
+            .name_server_runtime_inner
+            .route_info_manager()
+            .submit_unregister_broker_request(request_header)
+        {
+            warn!("Couldn't submit the unregister broker request to handler");
+            return Ok(error_response(
+                PublicErrorView::descriptor_only(&CORE_INTERNAL_FAILURE),
+                RemotingErrorTarget::Fresh(&self.command_factory),
+            ));
+        }
+        Ok(self.command_factory.create_success_response_command())
+    }
+}
+
+pub(crate) fn broker_session_from_request(request: &RemotingRequest) -> crate::NameServerResult<BrokerSession> {
+    let SessionView::Network {
+        id, remote_addr, state, ..
+    } = request.session()
+    else {
+        return Err(crate::namesrv_error::invariant(
+            "namesrv.broker_control.network_session",
+        ));
+    };
+    Ok(BrokerSession::new(
+        *id,
+        CheetahString::from_string(format!(
+            "transport-session-{}",
+            request.original_identity().request_id().owner_id()
+        )),
+        *remote_addr,
+        state.clone(),
+    ))
+}
+
+impl DefaultRequestProcessor {
+    fn process_broker_heartbeat(
+        &self,
+        broker_session: BrokerSession,
+        request: &mut RemotingCommand,
+    ) -> crate::NameServerResult<RemotingCommand> {
+        let request_header = request
+            .decode_command_custom_header::<BrokerHeartbeatRequestHeader>()
+            .map_err(crate::namesrv_error::from_error)?;
+        self.name_server_runtime_inner
+            .route_info_manager()
+            .update_broker_info_update_timestamp_for_session(
+                request_header.cluster_name,
+                request_header.broker_addr,
+                broker_session.id,
+            );
+        Ok(self.command_factory.create_success_response_command())
+    }
+
+    fn get_broker_member_group(&self, request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        let request_header = request
+            .decode_command_custom_header::<GetBrokerMemberGroupRequestHeader>()
+            .map_err(crate::namesrv_error::from_error)?;
+
+        let broker_member_group = self
+            .name_server_runtime_inner
+            .route_info_manager()
+            .get_broker_member_group(request_header.cluster_name, request_header.broker_name);
+        let response_body = GetBrokerMemberGroupResponseBody { broker_member_group };
+        let body = response_body.encode().map_err(crate::namesrv_error::from_error)?;
+        Ok(self.command_factory.create_success_response_command().set_body(body))
+    }
+
+    fn get_broker_cluster_info(&self, _request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        let vec = self
+            .name_server_runtime_inner
+            .route_info_manager()
+            .get_all_cluster_info()
+            .encode()
+            .map_err(crate::namesrv_error::from_error)?;
+        Ok(self
+            .command_factory
+            .create_response_command_with_code(RemotingSysResponseCode::Success)
+            .set_body(vec))
+    }
+
+    fn wipe_write_perm_of_broker(&self, request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        let request_header = request
+            .decode_command_custom_header::<WipeWritePermOfBrokerRequestHeader>()
+            .map_err(crate::namesrv_error::from_error)?;
+        let wipe_topic_cnt = self
+            .name_server_runtime_inner
+            .route_info_manager()
+            .wipe_write_perm_of_broker_by_lock(request_header.broker_name.to_string());
+        Ok(self
+            .command_factory
+            .create_success_response_command_with_header(WipeWritePermOfBrokerResponseHeader::new(wipe_topic_cnt)))
+    }
+
+    fn add_write_perm_of_broker(&self, request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        let request_header = request
+            .decode_command_custom_header::<AddWritePermOfBrokerRequestHeader>()
+            .map_err(crate::namesrv_error::from_error)?;
+        let add_topic_cnt = self
+            .name_server_runtime_inner
+            .route_info_manager()
+            .add_write_perm_of_broker_by_lock(request_header.broker_name.to_string());
+        Ok(self
+            .command_factory
+            .create_success_response_command_with_header(AddWritePermOfBrokerResponseHeader::new(add_topic_cnt)))
+    }
+
+    fn get_all_topic_list_from_nameserver(
+        &self,
+        _request: &mut RemotingCommand,
+    ) -> crate::NameServerResult<RemotingCommand> {
+        if self
+            .name_server_runtime_inner
+            .name_server_config()
+            .enable_all_topic_list
+        {
+            let topics = TopicList {
+                topic_list: self.name_server_runtime_inner.route_info_manager().get_all_topics(),
+                broker_addr: None,
+            };
+            let body = topics.encode().map_err(crate::namesrv_error::from_error)?;
+            return Ok(self.command_factory.create_success_response_command().set_body(body));
+        }
+        Ok(error_response(
+            PublicErrorView::descriptor_only(&CORE_INTERNAL_FAILURE),
+            RemotingErrorTarget::Fresh(&self.command_factory),
+        ))
+    }
+
+    fn delete_topic_in_name_srv(&self, request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        let request_header = request
+            .decode_command_custom_header::<DeleteTopicFromNamesrvRequestHeader>()
+            .map_err(crate::namesrv_error::from_error)?;
+        self.name_server_runtime_inner
+            .route_info_manager()
+            .delete_topic(request_header.topic, request_header.cluster_name);
+        Ok(self.command_factory.create_success_response_command())
+    }
+
+    fn register_topic_to_name_srv(&self, request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        let request_header = request
+            .decode_command_custom_header::<RegisterTopicRequestHeader>()
+            .map_err(crate::namesrv_error::from_error)?;
+        if let Some(body) = request.body() {
+            let topic_route_data = TopicRouteData::decode(body)
+                .map_err(|error| crate::namesrv_error::request_body_source("decode-topic-route", error))?;
+            if !topic_route_data.queue_datas.is_empty() {
+                self.name_server_runtime_inner
+                    .route_info_manager()
+                    .register_topic(request_header.topic, topic_route_data.queue_datas)
+            }
+        }
+        Ok(self.command_factory.create_success_response_command())
+    }
+
+    fn get_kv_list_by_namespace(&self, request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        let request_header = request
+            .decode_command_custom_header::<GetKVListByNamespaceRequestHeader>()
+            .map_err(crate::namesrv_error::from_error)?;
+        let value = self
+            .name_server_runtime_inner
+            .kvconfig_manager()
+            .get_kv_list_by_namespace(&request_header.namespace);
+        if let Some(value) = value {
+            return Ok(self.command_factory.create_success_response_command().set_body(value));
+        }
+        Ok(self.command_factory.create_response_command_with_code_remark(
+            ResponseCode::QueryNotFound,
+            "NameServer KV namespace was not found",
+        ))
+    }
+
+    fn get_topics_by_cluster(&self, request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        if !self.name_server_runtime_inner.name_server_config().enable_topic_list {
+            return Ok(error_response(
+                PublicErrorView::descriptor_only(&CORE_INTERNAL_FAILURE),
+                RemotingErrorTarget::Fresh(&self.command_factory),
+            ));
+        }
+
+        let request_header = request
+            .decode_command_custom_header::<GetTopicsByClusterRequestHeader>()
+            .map_err(crate::namesrv_error::from_error)?;
+        let topics_by_cluster = TopicList {
+            topic_list: self
+                .name_server_runtime_inner
+                .route_info_manager()
+                .get_topics_by_cluster(request_header.cluster.as_str())?,
+            broker_addr: None,
+        };
+        let body = topics_by_cluster.encode().map_err(crate::namesrv_error::from_error)?;
+        Ok(self.command_factory.create_success_response_command().set_body(body))
+    }
+
+    fn get_system_topic_list_from_ns(
+        &self,
+        _request: &mut RemotingCommand,
+    ) -> crate::NameServerResult<RemotingCommand> {
+        let topic_list = self
+            .name_server_runtime_inner
+            .route_info_manager()
+            .get_system_topic_list();
+        let body = topic_list.encode().map_err(crate::namesrv_error::from_error)?;
+        Ok(self.command_factory.create_success_response_command().set_body(body))
+    }
+
+    fn get_unit_topic_list(&self, _request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        if self.name_server_runtime_inner.name_server_config().enable_topic_list {
+            let topic_list = self.name_server_runtime_inner.route_info_manager().get_unit_topics();
+            let body = topic_list.encode().map_err(crate::namesrv_error::from_error)?;
+            return Ok(self.command_factory.create_success_response_command().set_body(body));
+        }
+        Ok(error_response(
+            PublicErrorView::descriptor_only(&CORE_INTERNAL_FAILURE),
+            RemotingErrorTarget::Fresh(&self.command_factory),
+        ))
+    }
+
+    fn get_has_unit_sub_topic_list(&self, _request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        if self.name_server_runtime_inner.name_server_config().enable_topic_list {
+            let topic_list = self
+                .name_server_runtime_inner
+                .route_info_manager()
+                .get_has_unit_sub_topic_list();
+            let body = topic_list.encode().map_err(crate::namesrv_error::from_error)?;
+            return Ok(self.command_factory.create_success_response_command().set_body(body));
+        }
+        Ok(error_response(
+            PublicErrorView::descriptor_only(&CORE_INTERNAL_FAILURE),
+            RemotingErrorTarget::Fresh(&self.command_factory),
+        ))
+    }
+
+    fn get_has_unit_sub_un_unit_topic_list(
+        &self,
+        _request: &mut RemotingCommand,
+    ) -> crate::NameServerResult<RemotingCommand> {
+        if self.name_server_runtime_inner.name_server_config().enable_topic_list {
+            let topic_list = self
+                .name_server_runtime_inner
+                .route_info_manager()
+                .get_has_unit_sub_ununit_topic_list();
+            return Ok(self
+                .command_factory
+                .create_success_response_command()
+                .set_body(topic_list.encode().map_err(crate::namesrv_error::from_error)?));
+        }
+        Ok(error_response(
+            PublicErrorView::descriptor_only(&CORE_INTERNAL_FAILURE),
+            RemotingErrorTarget::Fresh(&self.command_factory),
+        ))
+    }
+
+    async fn update_config(&self, request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        let mut apply_outcome = None;
+        if let Some(body) = request.body() {
+            let body_str = match str::from_utf8(body) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(error = ?e, "NameServer configuration body is not UTF-8");
+                    return Ok(error_response(
+                        PublicErrorView::descriptor_only(&CORE_ARGUMENT_INVALID),
+                        RemotingErrorTarget::Fresh(&self.command_factory),
+                    ));
+                }
+            };
+
+            let properties = match string_to_properties(body_str) {
+                Some(props) => props,
+                None => {
+                    return Ok(error_response(
+                        PublicErrorView::descriptor_only(&CORE_ARGUMENT_INVALID),
+                        RemotingErrorTarget::Fresh(&self.command_factory),
+                    ));
+                }
+            };
+            if validate_blacklist_config_exist(
+                &properties,
+                &build_effective_config_blacklist(&self.name_server_runtime_inner.name_server_config()),
+            ) {
+                return Ok(error_response(
+                    PublicErrorView::descriptor_only(&AUTH_PERMISSION_DENIED),
+                    RemotingErrorTarget::Fresh(&self.command_factory),
+                ));
+            }
+
+            apply_outcome = Some(self.name_server_runtime_inner.update_runtime_config(properties).await?);
+        }
+
+        let mut response = self
+            .command_factory
+            .create_response_command_with_code(RemotingSysResponseCode::Success);
+        response.ensure_ext_fields_initialized();
+        if let Some(outcome) = apply_outcome {
+            response.add_ext_field("desiredGeneration", outcome.desired_generation.to_string());
+            response.add_ext_field("durableGeneration", outcome.durable_generation.to_string());
+            response.add_ext_field("effectiveGeneration", outcome.effective_generation.to_string());
+            response.add_ext_field("appliedKeys", outcome.applied_keys.join(","));
+            response.add_ext_field("restartRequiredKeys", outcome.restart_required_keys.join(","));
+            if outcome.restart_required_keys.is_empty() {
+                response.set_remark_mut(CheetahString::empty());
+            } else {
+                response.set_remark_mut(format!(
+                    "configuration persisted; restart required for: {}",
+                    outcome.restart_required_keys.join(",")
+                ));
+            }
+        } else {
+            response.set_remark_mut(CheetahString::empty());
+        }
+        Ok(response)
+    }
+
+    fn get_config(&self, request: &mut RemotingCommand) -> crate::NameServerResult<RemotingCommand> {
+        if is_probe_only_namesrv_config_request(request) {
+            return Ok(create_namesrv_config_success_response(&self.command_factory, None));
+        }
+
+        let result = match self.name_server_runtime_inner.get_all_configs_format_string() {
+            Ok(content) => create_namesrv_config_success_response(&self.command_factory, Some(content.into_bytes())),
+            Err(source) => {
+                let error = crate::namesrv_error::io("encode-namesrv-configuration", std::io::Error::other(source));
+                let view = PublicErrorView::try_new(error.descriptor(), error.context())
+                    .unwrap_or_else(|_| PublicErrorView::descriptor_only(error.descriptor()));
+                error_response(view, RemotingErrorTarget::Fresh(&self.command_factory))
+            }
+        };
+        Ok(result)
+    }
+}
+
+fn extract_register_topic_config_from_request(
+    request: &RemotingCommand,
+) -> crate::NameServerResult<TopicConfigAndMappingSerializeWrapper> {
+    if let Some(body_inner) = request.body() {
+        if !body_inner.is_empty() {
+            return TopicConfigAndMappingSerializeWrapper::decode(body_inner.as_ref())
+                .inspect_err(|e| {
+                    warn!("Failed to decode TopicConfigAndMappingSerializeWrapper: {:?}", e);
+                })
+                .map_err(crate::namesrv_error::from_error);
+        }
+    }
+
+    // When body is empty or None, create default wrapper with explicitly initialized DataVersion
+    let mut topic_config_wrapper = TopicConfigAndMappingSerializeWrapper::default();
+    topic_config_wrapper
+        .topic_config_serialize_wrapper
+        .data_version
+        .set_counter(0);
+    topic_config_wrapper
+        .topic_config_serialize_wrapper
+        .data_version
+        .set_timestamp(0);
+    topic_config_wrapper
+        .topic_config_serialize_wrapper
+        .data_version
+        .set_state_version(0);
+
+    Ok(topic_config_wrapper)
+}
+
+fn extract_register_broker_body_from_request(
+    request: &RemotingCommand,
+    request_header: &RegisterBrokerRequestHeader,
+    limits: rocketmq_protocol::protocol::body::broker_body::register_broker_body::RegisterBrokerDecodeLimits,
+) -> crate::NameServerResult<RegisterBrokerBody> {
+    if let Some(body_inner) = request.body() {
+        if !body_inner.is_empty() {
+            let version = request.rocketmq_version();
+            return RegisterBrokerBody::decode_with_limits(body_inner, request_header.compressed, version, limits)
+                .inspect_err(|e| {
+                    warn!("Failed to decode RegisterBrokerBody: {:?}", e);
+                })
+                .map_err(crate::namesrv_error::from_error);
+        }
+    }
+    let mut register_broker_body = RegisterBrokerBody::default();
+    register_broker_body
+        .topic_config_serialize_wrapper
+        .mapping_data_version
+        .set_counter(0);
+    register_broker_body
+        .topic_config_serialize_wrapper
+        .mapping_data_version
+        .set_timestamp(0);
+    register_broker_body
+        .topic_config_serialize_wrapper
+        .mapping_data_version
+        .set_state_version(0);
+
+    Ok(register_broker_body)
+}
+
+fn check_sum_crc32(request: &RemotingCommand, request_header: &RegisterBrokerRequestHeader) -> bool {
+    if request_header.body_crc32 != 0 {
+        let crc_32 = crc32_utils::crc32_bytes(request.get_body());
+        if crc_32 != request_header.body_crc32 {
+            warn!(
+                "receive registerBroker request,crc32 not match,origin:{}, cal:{}",
+                request_header.body_crc32, crc_32,
+            );
+            return false;
+        }
+    }
+    true
+}
+
+fn validate_blacklist_config_exist(
+    properties: &HashMap<CheetahString, CheetahString>,
+    config_blacklist: &[CheetahString],
+) -> bool {
+    for black_config in config_blacklist {
+        if properties.contains_key(black_config.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn build_effective_config_blacklist(config: &NamesrvConfig) -> Vec<CheetahString> {
+    let mut blacklist = vec![
+        CheetahString::from_static_str("configBlackList"),
+        CheetahString::from_static_str("configStorePath"),
+        CheetahString::from_static_str("kvConfigPath"),
+        CheetahString::from_static_str("rocketmqHome"),
+    ];
+
+    for configured in config.get_config_blacklist() {
+        if !blacklist.iter().any(|item| item == &configured) {
+            blacklist.push(configured);
+        }
+    }
+
+    blacklist
+}
+
+fn is_probe_only_namesrv_config_request(request: &RemotingCommand) -> bool {
+    let Some(_) = request.ext_fields() else {
+        return false;
+    };
+
+    request
+        .decode_command_custom_header_fast::<GetNamesrvConfigRequestHeader>()
+        .map(|header| header.probe_only.unwrap_or(false))
+        .unwrap_or_else(|error| {
+            warn!("Failed to decode GetNamesrvConfigRequestHeader: {:?}", error);
+            false
+        })
+}
+
+fn create_namesrv_config_success_response(
+    command_factory: &RemotingCommandFactory,
+    body: Option<Vec<u8>>,
+) -> RemotingCommand {
+    let response = command_factory
+        .create_response_command_with_code_remark(RemotingSysResponseCode::Success, CheetahString::empty());
+
+    match body {
+        Some(body) => response.set_body(body),
+        None => response,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rocketmq_protocol::code::request_code::RequestCode;
+    use rocketmq_protocol::code::response_code::ResponseCode;
+    use rocketmq_protocol::protocol::header::namesrv::config_header::GetNamesrvConfigRequestHeader;
+    use rocketmq_protocol::protocol::header::namesrv::register_broker_header::RegisterBrokerRequestHeader;
+
+    use super::*;
+
+    #[test]
+    fn extract_register_topic_config_from_request_with_body() {
+        // Use invalid JSON data that will cause decode to fail
+        let body = vec![0xFF, 0xFE, 0xFD, 0xFC]; // Invalid JSON bytes
+        let request = RemotingCommand::create_remoting_command(RequestCode::RegisterTopicInNamesrv).set_body(body);
+
+        // Should return error since body is invalid JSON
+        let result = extract_register_topic_config_from_request(&request);
+        // Verify decode fails with invalid data
+        assert!(result.is_err(), "Expected decode to fail with invalid JSON");
+    }
+
+    #[test]
+    fn extract_register_topic_config_from_request_without_body() {
+        let request = RemotingCommand::new_request(0, vec![]);
+        let result = extract_register_topic_config_from_request(&request).expect("should succeed with empty body");
+
+        // Verify DataVersion is explicitly initialized with zeros (align with Java logic)
+        let data_version = &result.topic_config_serialize_wrapper.data_version;
+        assert_eq!(data_version.get_counter(), 0, "counter should be 0");
+        assert_eq!(data_version.get_timestamp(), 0, "timestamp should be 0");
+        assert_eq!(data_version.get_state_version(), 0, "stateVersion should be 0");
+    }
+
+    #[test]
+    fn extract_register_topic_config_from_request_with_empty_body() {
+        // Test with empty body (should initialize DataVersion to zeros)
+        let request = RemotingCommand::new_request(0, vec![]);
+        let result = extract_register_topic_config_from_request(&request).expect("should succeed with empty body");
+
+        // Verify DataVersion fields are explicitly set to 0 (Java behavior)
+        let data_version = &result.topic_config_serialize_wrapper.data_version;
+        assert_eq!(data_version.get_counter(), 0, "counter should be 0");
+        assert_eq!(data_version.get_timestamp(), 0, "timestamp should be 0");
+        assert_eq!(data_version.get_state_version(), 0, "stateVersion should be 0");
+    }
+
+    #[test]
+    fn extract_register_broker_body_from_request_with_body() {
+        let body: Vec<u8> = vec![/* some valid encoded data */];
+        let request = RemotingCommand::new_request(0, body);
+        let request_header = RegisterBrokerRequestHeader::default();
+        // Should return Ok with default body since body is invalid
+        let _result = extract_register_broker_body_from_request(&request, &request_header, Default::default());
+        assert!(_result.is_ok());
+    }
+
+    #[test]
+    fn extract_register_broker_body_from_request_with_empty_body() {
+        // Test with empty body (should initialize DataVersion to zeros)
+        let request = RemotingCommand::new_request(0, vec![]);
+        let request_header = RegisterBrokerRequestHeader::default();
+        let result = extract_register_broker_body_from_request(&request, &request_header, Default::default())
+            .expect("should succeed");
+
+        // Verify DataVersion fields are explicitly set to 0 (Java behavior)
+        let data_version = &result.topic_config_serialize_wrapper.mapping_data_version;
+        assert_eq!(data_version.get_counter(), 0, "counter should be 0");
+        assert_eq!(data_version.get_timestamp(), 0, "timestamp should be 0");
+        assert_eq!(data_version.get_state_version(), 0, "stateVersion should be 0");
+    }
+
+    #[test]
+    fn extract_register_broker_body_from_request_without_body() {
+        let request = RemotingCommand::new_request(0, vec![]);
+        let request_header = RegisterBrokerRequestHeader::default();
+        let result = extract_register_broker_body_from_request(&request, &request_header, Default::default())
+            .expect("should succeed");
+
+        // Verify DataVersion is explicitly initialized with zeros (align with Java logic)
+        assert_eq!(
+            result.topic_config_serialize_wrapper.mapping_data_version.get_counter(),
+            0
+        );
+        assert_eq!(
+            result
+                .topic_config_serialize_wrapper
+                .mapping_data_version
+                .get_timestamp(),
+            0
+        );
+        assert_eq!(
+            result
+                .topic_config_serialize_wrapper
+                .mapping_data_version
+                .get_state_version(),
+            0
+        );
+    }
+
+    #[test]
+    fn check_sum_crc32_valid_crc() {
+        let body = vec![/* some valid data */];
+        let crc32 = crc32_utils::crc32(&body);
+        let request = RemotingCommand::new_request(0, body);
+        let request_header = RegisterBrokerRequestHeader {
+            body_crc32: crc32,
+            ..Default::default()
+        };
+        let result = check_sum_crc32(&request, &request_header);
+        assert!(result);
+    }
+
+    #[test]
+    fn check_sum_crc32_invalid_crc() {
+        let body = vec![/* some valid data */];
+        let request = RemotingCommand::new_request(0, body);
+        let request_header = RegisterBrokerRequestHeader {
+            body_crc32: 12345, // some invalid crc32
+            ..Default::default()
+        };
+        let result = check_sum_crc32(&request, &request_header);
+        assert!(!result);
+    }
+
+    #[test]
+    fn check_sum_crc32_zero_crc() {
+        let body = vec![/* some valid data */];
+        let request = RemotingCommand::new_request(0, body);
+        let request_header = RegisterBrokerRequestHeader {
+            body_crc32: 0,
+            ..Default::default()
+        };
+        let result = check_sum_crc32(&request, &request_header);
+        assert!(result);
+    }
+
+    #[test]
+    fn build_effective_config_blacklist_includes_fixed_keys() {
+        let effective = build_effective_config_blacklist(&NamesrvConfig {
+            config_black_list: "customConfig".to_string(),
+            ..Default::default()
+        });
+
+        for required in ["configBlackList", "configStorePath", "kvConfigPath", "rocketmqHome"] {
+            assert!(
+                effective.iter().any(|entry| entry.as_str() == required),
+                "missing required blacklist entry: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_effective_config_blacklist_appends_unique_custom_entries() {
+        let effective = build_effective_config_blacklist(&NamesrvConfig {
+            config_black_list: "customConfig; rocketmqHome ; customConfig ; anotherConfig".to_string(),
+            ..Default::default()
+        });
+        let effective_keys: Vec<&str> = effective.iter().map(|entry| entry.as_str()).collect();
+
+        assert_eq!(
+            effective
+                .iter()
+                .filter(|entry| entry.as_str() == "customConfig")
+                .count(),
+            1
+        );
+        assert_eq!(
+            effective
+                .iter()
+                .filter(|entry| entry.as_str() == "rocketmqHome")
+                .count(),
+            1
+        );
+        assert_eq!(
+            effective_keys,
+            vec![
+                "configBlackList",
+                "configStorePath",
+                "kvConfigPath",
+                "rocketmqHome",
+                "customConfig",
+                "anotherConfig",
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_blacklist_config_exist_distinguishes_blocked_from_allowed_properties() {
+        let blacklist = vec![
+            CheetahString::from_static_str("rocketmqHome"),
+            CheetahString::from_static_str("customConfig"),
+        ];
+
+        let blocked_properties = HashMap::from([(
+            CheetahString::from_static_str("customConfig"),
+            CheetahString::from_static_str("value"),
+        )]);
+        assert!(validate_blacklist_config_exist(&blocked_properties, &blacklist));
+
+        let allowed_properties = HashMap::from([(
+            CheetahString::from_static_str("listenPort"),
+            CheetahString::from_static_str("9876"),
+        )]);
+        assert!(!validate_blacklist_config_exist(&allowed_properties, &blacklist));
+    }
+
+    #[test]
+    fn get_namesrv_config_defaults_to_full_response_without_probe_header() {
+        let request = RemotingCommand::create_remoting_command(RequestCode::GetNamesrvConfig);
+        assert!(!is_probe_only_namesrv_config_request(&request));
+
+        let response = create_namesrv_config_success_response(
+            &rocketmq_protocol::protocol::remoting_command_defaults::application_remoting_command_factory(),
+            Some(b"name=value".to_vec()),
+        );
+        assert_eq!(ResponseCode::from(response.code()), ResponseCode::Success);
+        assert_eq!(
+            response.body().map(|body| body.as_ref().to_vec()),
+            Some(b"name=value".to_vec())
+        );
+    }
+
+    #[test]
+    fn get_namesrv_config_probe_only_request_skips_body() {
+        let mut request = RemotingCommand::create_request_command(
+            RequestCode::GetNamesrvConfig,
+            GetNamesrvConfigRequestHeader::for_probe(),
+        );
+        request.make_custom_header_to_net();
+
+        assert!(is_probe_only_namesrv_config_request(&request));
+
+        let response = create_namesrv_config_success_response(
+            &rocketmq_protocol::protocol::remoting_command_defaults::application_remoting_command_factory(),
+            None,
+        );
+        assert_eq!(ResponseCode::from(response.code()), ResponseCode::Success);
+        assert!(response.body().is_none());
+    }
+}

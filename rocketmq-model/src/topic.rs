@@ -1,0 +1,497 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fmt;
+use std::fmt::Display;
+
+use cheetah_string::CheetahString;
+use serde::Deserialize;
+use serde::Deserializer;
+use serde::Serialize;
+use serde::Serializer;
+
+const DEFAULT_TOPIC_PERMISSION: u32 = 0x1 << 2 | 0x1 << 1;
+const MESSAGE_TYPE_ATTRIBUTE: &str = "message.type";
+const LITE_EXPIRATION_ATTRIBUTE: &str = "lite.topic.expiration";
+
+pub const RETRY_GROUP_TOPIC_PREFIX: &str = "%RETRY%";
+pub const DLQ_GROUP_TOPIC_PREFIX: &str = "%DLQ%";
+pub const SYSTEM_TOPIC_PREFIX: &str = "rmq_sys_";
+pub const SYSTEM_TOPICS: &[&str] = &[
+    "SCHEDULE_TOPIC_XXXX",
+    "BenchmarkTest",
+    "RMQ_SYS_TRANS_HALF_TOPIC",
+    "RMQ_SYS_ROCKSDB_TRANS_HALF_TOPIC",
+    "RMQ_SYS_TRACE_TOPIC",
+    "RMQ_SYS_TRANS_OP_HALF_TOPIC",
+    "RMQ_SYS_ROCKSDB_TRANS_OP_HALF_TOPIC",
+    "TRANS_CHECK_MAX_TIME_TOPIC",
+    "SELF_TEST_TOPIC",
+    "OFFSET_MOVED_EVENT",
+    "CHECKPOINT_TOPIC",
+];
+
+/// Returns whether a topic belongs to the stable RocketMQ system-topic set.
+pub fn is_system_topic(topic: &str) -> bool {
+    topic.starts_with(SYSTEM_TOPIC_PREFIX) || SYSTEM_TOPICS.contains(&topic)
+}
+
+/// Topic filter expression mode.
+#[derive(Clone, Default, Eq, PartialEq, Copy)]
+pub enum TopicFilterType {
+    #[default]
+    SingleTag,
+    MultiTag,
+}
+
+impl TopicFilterType {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::SingleTag => "SINGLE_TAG",
+            Self::MultiTag => "MULTI_TAG",
+        }
+    }
+}
+
+impl Display for TopicFilterType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl fmt::Debug for TopicFilterType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&str> for TopicFilterType {
+    fn from(value: &str) -> Self {
+        match value {
+            "MULTI_TAG" => Self::MultiTag,
+            _ => Self::SingleTag,
+        }
+    }
+}
+
+impl From<String> for TopicFilterType {
+    fn from(value: String) -> Self {
+        Self::from(value.as_str())
+    }
+}
+
+impl From<i32> for TopicFilterType {
+    fn from(value: i32) -> Self {
+        match value {
+            1 => Self::MultiTag,
+            _ => Self::SingleTag,
+        }
+    }
+}
+
+impl Serialize for TopicFilterType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TopicFilterType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "SINGLE_TAG" => Ok(Self::SingleTag),
+            "MULTI_TAG" => Ok(Self::MultiTag),
+            _ => Err(serde::de::Error::unknown_variant(&value, &["SINGLE_TAG", "MULTI_TAG"])),
+        }
+    }
+}
+
+/// Semantic message kind associated with a topic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TopicMessageType {
+    Unspecified,
+    Normal,
+    Fifo,
+    Delay,
+    Transaction,
+    Priority,
+    Lite,
+    Mixed,
+}
+
+impl From<String> for TopicMessageType {
+    fn from(value: String) -> Self {
+        match value.to_uppercase().as_str() {
+            "UNSPECIFIED" => Self::Unspecified,
+            "NORMAL" => Self::Normal,
+            "FIFO" => Self::Fifo,
+            "DELAY" => Self::Delay,
+            "TRANSACTION" => Self::Transaction,
+            "PRIORITY" => Self::Priority,
+            "LITE" => Self::Lite,
+            "MIXED" => Self::Mixed,
+            _ => Self::Unspecified,
+        }
+    }
+}
+
+impl TopicMessageType {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "UNSPECIFIED",
+            Self::Normal => "NORMAL",
+            Self::Fifo => "FIFO",
+            Self::Delay => "DELAY",
+            Self::Transaction => "TRANSACTION",
+            Self::Priority => "PRIORITY",
+            Self::Lite => "LITE",
+            Self::Mixed => "MIXED",
+        }
+    }
+
+    pub fn topic_message_type_set() -> HashSet<String> {
+        [
+            Self::Unspecified,
+            Self::Normal,
+            Self::Fifo,
+            Self::Delay,
+            Self::Transaction,
+            Self::Priority,
+            Self::Lite,
+            Self::Mixed,
+        ]
+        .into_iter()
+        .map(|value| value.as_str().to_owned())
+        .collect()
+    }
+
+    pub fn parse_from_message_property(properties: &HashMap<String, String>) -> Self {
+        if properties
+            .get("TRAN_MSG")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        {
+            Self::Transaction
+        } else if ["DELAY", "TIMER_DELIVER_MS", "TIMER_DELAY_SEC", "TIMER_DELAY_MS"]
+            .iter()
+            .any(|key| properties.contains_key(*key))
+        {
+            Self::Delay
+        } else if properties.contains_key("__SHARDINGKEY") {
+            Self::Fifo
+        } else if properties.contains_key("_SYS_MSG_PRIORITY_") {
+            Self::Priority
+        } else if properties.contains_key("__LITE_TOPIC") {
+            Self::Lite
+        } else {
+            Self::Normal
+        }
+    }
+
+    pub fn get_metrics_value(&self) -> String {
+        self.as_str().to_ascii_lowercase()
+    }
+}
+
+impl Display for TopicMessageType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Persistent topic configuration value object.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TopicConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic_name: Option<CheetahString>,
+    pub read_queue_nums: u32,
+    pub write_queue_nums: u32,
+    pub perm: u32,
+    pub topic_filter_type: TopicFilterType,
+    pub topic_sys_flag: u32,
+    pub order: bool,
+    // Custom: absent on Java 4.6.1; retain the native extension without requiring it on old responses.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub attributes: HashMap<CheetahString, CheetahString>,
+}
+
+impl TopicConfig {
+    const DEFAULT_READ_QUEUE_NUMS: u32 = 16;
+    const DEFAULT_WRITE_QUEUE_NUMS: u32 = 16;
+    const SEPARATOR: &'static str = " ";
+
+    pub fn new(topic_name: impl Into<CheetahString>) -> Self {
+        Self {
+            topic_name: Some(topic_name.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_queues(topic_name: impl Into<CheetahString>, read_queue_nums: u32, write_queue_nums: u32) -> Self {
+        Self {
+            read_queue_nums,
+            write_queue_nums,
+            ..Self::new(topic_name)
+        }
+    }
+
+    pub fn with_perm(
+        topic_name: impl Into<CheetahString>,
+        read_queue_nums: u32,
+        write_queue_nums: u32,
+        perm: u32,
+    ) -> Self {
+        Self {
+            read_queue_nums,
+            write_queue_nums,
+            perm,
+            ..Self::new(topic_name)
+        }
+    }
+
+    pub fn with_sys_flag(
+        topic_name: impl Into<CheetahString>,
+        read_queue_nums: u32,
+        write_queue_nums: u32,
+        perm: u32,
+        topic_sys_flag: u32,
+    ) -> Self {
+        Self {
+            read_queue_nums,
+            write_queue_nums,
+            perm,
+            topic_sys_flag,
+            ..Self::new(topic_name)
+        }
+    }
+
+    pub fn get_topic_message_type(&self) -> TopicMessageType {
+        self.attributes
+            .get(MESSAGE_TYPE_ATTRIBUTE)
+            .map(|value| TopicMessageType::from(value.to_string()))
+            .unwrap_or(TopicMessageType::Normal)
+    }
+
+    pub fn set_lite_topic_expiration(&mut self, lite_topic_expiration: i32) {
+        if self.get_topic_message_type() == TopicMessageType::Lite {
+            self.attributes.insert(
+                CheetahString::from_static_str(LITE_EXPIRATION_ATTRIBUTE),
+                CheetahString::from_string(lite_topic_expiration.to_string()),
+            );
+        }
+    }
+
+    pub fn get_lite_topic_expiration(&self) -> i32 {
+        if self.get_topic_message_type() != TopicMessageType::Lite {
+            return -1;
+        }
+        self.attributes
+            .get(LITE_EXPIRATION_ATTRIBUTE)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(-1)
+    }
+
+    pub fn encode(&self) -> String {
+        // Custom: the fixed Java text format has exactly five fields.
+        [
+            self.topic_name
+                .as_ref()
+                .map_or("null", |name| name.as_str())
+                .to_string(),
+            self.read_queue_nums.to_string(),
+            self.write_queue_nums.to_string(),
+            self.perm.to_string(),
+            self.topic_filter_type.to_string(),
+        ]
+        .join(Self::SEPARATOR)
+    }
+
+    pub fn decode(&mut self, input: &str) -> bool {
+        // Custom: Java's five-field format omits sysFlag/order. Never silently replace bad numbers.
+        let parts: Vec<&str> = input.trim_end_matches(' ').split(Self::SEPARATOR).collect();
+        if parts.len() != 5 {
+            return false;
+        }
+        let (Ok(read), Ok(write), Ok(perm)) = (parts[1].parse(), parts[2].parse(), parts[3].parse()) else {
+            return false;
+        };
+        let filter = match parts[4] {
+            "SINGLE_TAG" => TopicFilterType::SingleTag,
+            "MULTI_TAG" => TopicFilterType::MultiTag,
+            _ => return false,
+        };
+        self.topic_name = Some(parts[0].into());
+        self.read_queue_nums = read;
+        self.write_queue_nums = write;
+        self.perm = perm;
+        self.topic_filter_type = filter;
+        true
+    }
+
+    pub fn get_read_queue_nums(&self) -> u32 {
+        self.read_queue_nums
+    }
+}
+
+impl Default for TopicConfig {
+    fn default() -> Self {
+        Self {
+            topic_name: None,
+            read_queue_nums: Self::DEFAULT_READ_QUEUE_NUMS,
+            write_queue_nums: Self::DEFAULT_WRITE_QUEUE_NUMS,
+            perm: DEFAULT_TOPIC_PERMISSION,
+            topic_filter_type: TopicFilterType::SingleTag,
+            topic_sys_flag: 0,
+            order: false,
+            attributes: HashMap::new(),
+        }
+    }
+}
+
+impl Display for TopicConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "TopicConfig {{ topic_name: {:?}, read_queue_nums: {}, write_queue_nums: {}, perm: {}, topic_filter_type: \
+             {}, topic_sys_flag: {}, order: {}, attributes: {:?} }}",
+            self.topic_name,
+            self.read_queue_nums,
+            self.write_queue_nums,
+            self.perm,
+            self.topic_filter_type,
+            self.topic_sys_flag,
+            self.order,
+            self.attributes
+        )
+    }
+}
+
+// Custom: native hashing preserves equality, including owned native extension attributes.
+impl std::hash::Hash for TopicConfig {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.topic_name.hash(state);
+        self.read_queue_nums.hash(state);
+        self.write_queue_nums.hash(state);
+        self.perm.hash(state);
+        self.topic_filter_type.as_str().hash(state);
+        self.topic_sys_flag.hash(state);
+        self.order.hash(state);
+        let mut entries = self.attributes.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.0);
+        entries.hash(state);
+    }
+}
+
+#[cfg(test)]
+mod topic_message_type_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    /// A precedence case: a description, the marker properties to classify, and the
+    /// expected message type.
+    type PrecedenceCase = (&'static str, &'static [(&'static str, &'static str)], TopicMessageType);
+
+    fn props(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn parse_from_message_property_marker_precedence() {
+        // Each row carries every lower-precedence marker alongside the winning one, so it
+        // asserts which marker wins a tie rather than merely that a lone marker maps through.
+        let cases: &[PrecedenceCase] = &[
+            (
+                "TRAN_MSG=true outranks delay and sharding markers",
+                &[("TRAN_MSG", "true"), ("DELAY", "1"), ("__SHARDINGKEY", "k")],
+                TopicMessageType::Transaction,
+            ),
+            (
+                "a delay marker outranks sharding/priority/lite; TRAN_MSG=false does not force Transaction",
+                &[
+                    ("TRAN_MSG", "false"),
+                    ("DELAY", "3"),
+                    ("__SHARDINGKEY", "k"),
+                    ("_SYS_MSG_PRIORITY_", "5"),
+                    ("__LITE_TOPIC", "1"),
+                ],
+                TopicMessageType::Delay,
+            ),
+            (
+                "__SHARDINGKEY outranks priority and lite",
+                &[
+                    ("__SHARDINGKEY", "k"),
+                    ("_SYS_MSG_PRIORITY_", "5"),
+                    ("__LITE_TOPIC", "1"),
+                ],
+                TopicMessageType::Fifo,
+            ),
+            (
+                "_SYS_MSG_PRIORITY_ outranks lite",
+                &[("_SYS_MSG_PRIORITY_", "5"), ("__LITE_TOPIC", "1")],
+                TopicMessageType::Priority,
+            ),
+            (
+                "__LITE_TOPIC alone selects Lite",
+                &[("__LITE_TOPIC", "1")],
+                TopicMessageType::Lite,
+            ),
+            (
+                "TRAN_MSG=false with no other marker selects Normal",
+                &[("TRAN_MSG", "false")],
+                TopicMessageType::Normal,
+            ),
+            ("an empty property map selects Normal", &[], TopicMessageType::Normal),
+        ];
+
+        for (desc, pairs, expected) in cases {
+            let got = TopicMessageType::parse_from_message_property(&props(pairs));
+            assert_eq!(got, *expected, "{desc}");
+        }
+    }
+
+    #[test]
+    fn parse_from_message_property_treats_every_timer_key_as_delay() {
+        for key in ["DELAY", "TIMER_DELIVER_MS", "TIMER_DELAY_SEC", "TIMER_DELAY_MS"] {
+            let got = TopicMessageType::parse_from_message_property(&props(&[(key, "1")]));
+            assert_eq!(got, TopicMessageType::Delay, "{key} should select Delay");
+        }
+    }
+
+    #[test]
+    fn parse_from_message_property_tran_msg_true_is_case_insensitive() {
+        for value in ["true", "TRUE", "TrUe"] {
+            let got = TopicMessageType::parse_from_message_property(&props(&[("TRAN_MSG", value)]));
+            assert_eq!(
+                got,
+                TopicMessageType::Transaction,
+                "TRAN_MSG={value} should select Transaction"
+            );
+        }
+        // A TRAN_MSG value other than a case-insensitive "true" must not be read as Transaction.
+        let got = TopicMessageType::parse_from_message_property(&props(&[("TRAN_MSG", "1")]));
+        assert_eq!(got, TopicMessageType::Normal, "TRAN_MSG=1 is not Transaction");
+    }
+}

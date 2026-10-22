@@ -1,0 +1,4463 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Custom fork: Java 4.6.1 network lifecycle and preserved physical request failures.
+
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::future::Future;
+use std::sync::atomic::AtomicI64;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::RwLock as StdRwLock;
+use std::time::Duration;
+use std::time::Instant;
+
+use crate::ClientError;
+use crate::ClientResult;
+use arc_swap::ArcSwapOption;
+use cheetah_string::CheetahString;
+use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
+use futures::stream;
+use futures::StreamExt;
+use rand::seq::IndexedRandom;
+use rocketmq_model::common::base::service_state::ServiceState;
+use rocketmq_model::common::boundary_type::BoundaryType;
+use rocketmq_model::common::config::TopicConfig;
+#[cfg(test)]
+use rocketmq_model::common::constant::PermName;
+use rocketmq_model::common::filter::expression_type::ExpressionType;
+use rocketmq_model::common::message::message_ext::MessageExt;
+use rocketmq_model::common::message::message_queue::MessageQueue;
+use rocketmq_model::common::message::message_queue_assignment::MessageQueueAssignment;
+use rocketmq_model::common::message::message_single::Message;
+use rocketmq_model::common::mix_all;
+use rocketmq_model::common::mq_version::CURRENT_VERSION;
+#[cfg(test)]
+use rocketmq_model::common::topic::TopicValidator;
+use rocketmq_observability::metrics::client::ClientMetrics;
+use rocketmq_observability::TelemetryHandle;
+use rocketmq_protocol::common::message::message_decoder as MessageDecoder;
+use rocketmq_protocol::protocol::body::acl_info::AclInfo;
+use rocketmq_protocol::protocol::body::broker_body::cluster_info::ClusterInfo;
+use rocketmq_protocol::protocol::body::consume_message_directly_result::ConsumeMessageDirectlyResult;
+use rocketmq_protocol::protocol::body::consumer_running_info::ConsumerRunningInfo;
+use rocketmq_protocol::protocol::body::user_info::UserInfo;
+use rocketmq_protocol::protocol::header::get_topic_config_request_header::GetTopicConfigRequestHeader;
+use rocketmq_protocol::protocol::header::pull_message_request_header::PullMessageRequestHeader;
+use rocketmq_protocol::protocol::header::query_consumer_offset_request_header::QueryConsumerOffsetRequestHeader;
+use rocketmq_protocol::protocol::header::update_consumer_offset_header::UpdateConsumerOffsetRequestHeader;
+use rocketmq_protocol::protocol::heartbeat::consumer_data::ConsumerData;
+use rocketmq_protocol::protocol::heartbeat::heartbeat_data::HeartbeatData;
+use rocketmq_protocol::protocol::heartbeat::message_model::MessageModel;
+use rocketmq_protocol::protocol::heartbeat::producer_data::ProducerData;
+use rocketmq_protocol::protocol::heartbeat::subscription_data::SubscriptionData;
+use rocketmq_protocol::protocol::namespace_util::NamespaceUtil;
+use rocketmq_protocol::protocol::remoting_command_defaults::application_remoting_command_factory;
+use rocketmq_protocol::protocol::remoting_command_defaults::RemotingCommandFactory;
+use rocketmq_protocol::protocol::route::route_data_view::BrokerData;
+use rocketmq_protocol::protocol::route::topic_route_data::TopicRouteData;
+use rocketmq_protocol::protocol::route_facade::BrokerDataExt;
+use rocketmq_protocol::protocol::subscription::subscription_group_config::SubscriptionGroupConfig;
+use rocketmq_runtime::common::time_utils::current_millis;
+use rocketmq_runtime::ChildServiceContext;
+use rocketmq_runtime::ResourceBudget;
+use rocketmq_runtime::ScheduledExecutionPolicy;
+use rocketmq_runtime::ScheduledTaskConfig;
+use rocketmq_runtime::ScheduledTaskGroup;
+use rocketmq_transport::api::ConnectionNetEvent;
+use rocketmq_transport::api::RPCHook;
+use rocketmq_transport::api::RequestDeadline;
+use rocketmq_transport::api::TransportClientConfig;
+use serde::Serialize;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+use tracing::error;
+use tracing::info;
+use tracing::warn;
+
+use crate::base::client_config::ClientConfig;
+use crate::common::retry_policy::RetryInput;
+use crate::consumer::consumer_impl::pull_message_service::PullMessageService;
+use crate::consumer::consumer_impl::pull_request_ext::PullResultExt;
+use crate::consumer::consumer_impl::re_balance::rebalance_service::RebalanceService;
+use crate::consumer::mq_consumer_inner::MQConsumerInner;
+use crate::consumer::mq_consumer_inner::MQConsumerInnerImpl;
+use crate::consumer::pull_callback::PullCallback;
+use crate::consumer::pull_result::PullResult;
+use crate::consumer::pull_status::PullStatus;
+use crate::factory::client_tables::*;
+use crate::factory::route_update::RouteUpdateCoordinator;
+use crate::factory::route_update::TopicRouteApplyOutcome;
+use crate::implementation::client_remoting_processor::ClientRemotingProcessor;
+use crate::implementation::communication_mode::CommunicationMode;
+use crate::implementation::find_broker_result::FindBrokerResult;
+use crate::implementation::mq_admin_impl::MQAdminImpl;
+use crate::implementation::mq_client_api_impl::MQClientAPIImpl;
+use crate::nameserver_discovery::supervisor::NameServerDiscoverySupervisor;
+use crate::nameserver_discovery::NameServerDiscoveryConfig;
+use crate::nameserver_discovery::NameServerSource;
+use crate::producer::default_mq_producer::DefaultMQProducer;
+use crate::producer::default_mq_producer::ProducerConfig;
+use crate::producer::producer_impl::mq_producer_inner::MQProducerInnerImpl;
+use crate::producer::producer_impl::topic_publish_info::TopicPublishInfo;
+use crate::producer::request_future_holder::RequestFutureHolder;
+use crate::producer::send_result::SendResult;
+use crate::runtime::spawn_client_task_with_context;
+use crate::runtime::ClientRuntime;
+use crate::runtime::ClientTrackedTaskHandle;
+use crate::stat::consumer_stats_manager::ConsumerStatsManager;
+
+mod class_filter;
+mod connection_listener;
+mod route_conversion;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use connection_listener::run_lifecycle_probe as run_connection_event_listener_lifecycle_probe;
+#[cfg(any(test, feature = "test-support"))]
+pub use connection_listener::ConnectionEventListenerLifecycleProbe;
+use route_conversion::cap_default_topic_route_queue_nums;
+#[allow(
+    unused_imports,
+    reason = "preserves the existing public route-conversion entry point"
+)]
+pub use route_conversion::topic_route_data2_topic_publish_info;
+#[allow(
+    unused_imports,
+    reason = "preserves the existing public route-conversion entry point"
+)]
+pub use route_conversion::topic_route_data2_topic_subscribe_info;
+pub use route_conversion::topic_route_data2topic_publish_info;
+pub use route_conversion::topic_route_data2topic_subscribe_info;
+
+const LOCK_TIMEOUT_MILLIS: u64 = 3000;
+const SCHEDULED_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const ROUTE_REFRESH_MAX_TOPICS_PER_ROUND: usize = 64;
+
+async fn collect_bounded<F, T>(tasks: Vec<F>, limit: usize) -> Vec<T>
+where
+    F: Future<Output = T>,
+{
+    stream::iter(tasks).buffer_unordered(limit.max(1)).collect().await
+}
+
+fn client_scheduled_task_startup_failed(
+    task: &'static str,
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> ClientError {
+    ClientError::service_source(task, error)
+}
+
+fn sync_pull_result_missing(operation: &'static str) -> ClientError {
+    ClientError::invalid_state(
+        "PullResultExt returned by sync pull_message",
+        format!("{operation} returned None"),
+    )
+}
+
+fn get_topic_config_request_header(topic: CheetahString) -> GetTopicConfigRequestHeader {
+    let mut request_header = GetTopicConfigRequestHeader {
+        topic,
+        topic_request_header: None,
+    };
+    rocketmq_protocol::protocol::header::message_operation_header::TopicRequestHeaderTrait::set_lo(
+        &mut request_header,
+        Some(true),
+    );
+    request_header
+}
+
+fn schedule_rebalance_wakeup(
+    service_context: &ChildServiceContext,
+    service: RebalanceService,
+    delay: Duration,
+    tracker: &TaskTracker,
+    shutdown_token: &CancellationToken,
+) {
+    if delay.is_zero() {
+        service.wakeup();
+        return;
+    }
+
+    if shutdown_token.is_cancelled() {
+        return;
+    }
+
+    let shutdown_token = shutdown_token.clone();
+    let task = tracker.track_future(async move {
+        tokio::select! {
+            biased;
+            _ = shutdown_token.cancelled() => {},
+            _ = tokio::time::sleep(delay) => {
+                if !shutdown_token.is_cancelled() {
+                    service.wakeup();
+                }
+            },
+        }
+    });
+
+    if let Err(error) =
+        spawn_client_task_with_context(service_context, "rocketmq-client-rebalance-delay", Box::pin(task))
+    {
+        error!("Failed to spawn delayed rebalance wakeup task: {}", error);
+    }
+}
+
+pub struct MQClientInstance {
+    service_context: ChildServiceContext,
+    resource_budget: ResourceBudget,
+    telemetry_handle: TelemetryHandle,
+    client_metrics: ClientMetrics,
+    request_future_holder: Arc<RequestFutureHolder>,
+    remoting_command_factory: RemotingCommandFactory,
+    pub(crate) client_config: Arc<ClientConfig>,
+    nameserver_discovery_config: Option<NameServerDiscoveryConfig>,
+    nameserver_discovery_supervisor: Mutex<Option<Arc<NameServerDiscoverySupervisor>>>,
+    pub(crate) client_id: CheetahString,
+    boot_timestamp: u64,
+    /**
+     * The container of the producer in the current client. The key is the name of
+     * producerGroup.
+     */
+    producer_table: SharedProducerTable,
+    producer_registration_admission: StdMutex<bool>,
+    producer_registry_transition: Mutex<()>,
+    /**
+     * The container of the consumer in the current client. The key is the name of
+     * consumer_group.
+     */
+    consumer_table: SharedConsumerTable,
+    /**
+     * The container of the adminExt in the current client. The key is the name of
+     * adminExtGroup.
+     */
+    admin_ext_table: SharedAdminExtTable,
+    pub(crate) mq_client_api_impl: ArcSwapOption<MQClientAPIImpl>,
+    pub(crate) mq_admin_impl: Arc<MQAdminImpl>,
+    pub(crate) topic_route_table: SharedTopicRouteTable,
+    topic_end_points_table: SharedTopicEndPointsTable,
+    lock_namesrv: Arc<tokio::sync::Mutex<()>>,
+    route_update_coordinator: RouteUpdateCoordinator,
+    lock_heartbeat: Arc<tokio::sync::Mutex<()>>,
+    // Custom: source/address ACK cache owned and serialized by this client identity.
+    class_filter_registrations: tokio::sync::Mutex<class_filter::RegistrationCache>,
+
+    lifecycle_transition: Mutex<()>,
+    service_state: StdRwLock<ServiceState>,
+    pub(crate) pull_message_service: Arc<PullMessageService>,
+    rebalance_service: RebalanceService,
+    pub(crate) default_producer: Mutex<DefaultMQProducer>,
+    broker_addr_table: SharedBrokerAddrTable,
+    broker_version_table: SharedBrokerVersionTable,
+    send_heartbeat_times_total: Arc<AtomicI64>,
+    scheduled_tasks: ScheduledTaskGroup,
+    /// HeartbeatV2: Cache of broker address -> last fingerprint
+    broker_heartbeat_fingerprint_table: SharedBrokerHeartbeatFingerprintTable,
+    /// HeartbeatV2: Set of brokers that support V2 protocol
+    broker_support_v2_heartbeat_set: SharedBrokerSupportV2HeartbeatSet,
+    route_refresh_state: Arc<TopicRouteRefreshState>,
+    consumer_stats_manager: ConsumerStatsManager,
+    connection_event_shutdown: CancellationToken,
+    connection_event_task_handle: StdMutex<Option<ClientTrackedTaskHandle>>,
+    rebalance_delay_tasks: TaskTracker,
+    rebalance_delay_shutdown: CancellationToken,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteRefreshShardProbe {
+    pub topic_count: usize,
+    pub batch_size: usize,
+    pub selected_topics: usize,
+    pub skipped_topics: usize,
+    pub peak_topic_reduction_percent: f64,
+    pub elapsed_us: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteRefreshConcurrentProbe {
+    pub healthy: bool,
+    pub stale_skipped: bool,
+    pub final_order_topic_conf: Option<CheetahString>,
+    pub route_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HeartbeatRouteIndexProbe {
+    pub topic_count: usize,
+    pub broker_count: usize,
+    pub lookup_count: usize,
+    pub scan_elapsed_us: u128,
+    pub index_elapsed_us: u128,
+    pub improvement_percent: f64,
+    pub scan_found_count: usize,
+    pub index_found_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopicRouteRefreshKind {
+    Periodic,
+    RouteMiss,
+}
+
+impl MQClientInstance {
+    // Custom: owned public equivalents for Java client-instance component getters.
+    pub fn client_id(&self) -> &CheetahString {
+        &self.client_id
+    }
+    pub fn client_config(&self) -> Arc<ClientConfig> {
+        self.client_config.clone()
+    }
+    pub fn boot_timestamp(&self) -> u64 {
+        self.boot_timestamp
+    }
+    pub fn mq_admin_impl(&self) -> Arc<MQAdminImpl> {
+        self.mq_admin_impl.clone()
+    }
+    pub fn pull_message_service(&self) -> Arc<PullMessageService> {
+        self.pull_message_service.clone()
+    }
+    pub fn scheduled_executor_service(&self) -> ScheduledTaskGroup {
+        self.scheduled_tasks.clone()
+    }
+    pub fn netty_client_config(&self) -> ClientResult<TransportClientConfig> {
+        Ok(self
+            .get_mq_client_api_impl()?
+            .get_remoting_client()
+            .configuration()
+            .clone())
+    }
+    pub async fn default_mq_producer(&self) -> crate::ClientResult<Arc<crate::DefaultMQProducerImpl>> {
+        self.default_producer
+            .lock()
+            .await
+            .default_mq_producer_impl()
+            .cloned()
+            .ok_or_else(|| crate::ClientError::not_initialized("internal producer"))
+    }
+    /// Java's built-in consume services implement inc/decCorePoolSize as no-ops.
+    pub fn adjust_thread_pool(&self) {}
+
+    pub fn new_arc(
+        client_config: ClientConfig,
+        instance_generation: u64,
+        client_id: impl Into<CheetahString>,
+        rpc_hook: Option<Arc<dyn RPCHook>>,
+        service_context: ChildServiceContext,
+        telemetry_handle: TelemetryHandle,
+        request_future_holder: Arc<RequestFutureHolder>,
+    ) -> Arc<MQClientInstance> {
+        Self::new_arc_with_remoting_command_factory(
+            client_config,
+            application_remoting_command_factory(),
+            instance_generation,
+            client_id,
+            rpc_hook,
+            service_context,
+            telemetry_handle,
+            request_future_holder,
+        )
+    }
+
+    /// Creates a client instance with explicitly owned remoting wire defaults.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the compatibility constructor keeps the existing lifecycle dependencies explicit"
+    )]
+    pub(crate) fn new_arc_with_remoting_command_factory(
+        client_config: ClientConfig,
+        remoting_command_factory: RemotingCommandFactory,
+        instance_generation: u64,
+        client_id: impl Into<CheetahString>,
+        rpc_hook: Option<Arc<dyn RPCHook>>,
+        service_context: ChildServiceContext,
+        telemetry_handle: TelemetryHandle,
+        request_future_holder: Arc<RequestFutureHolder>,
+    ) -> Arc<MQClientInstance> {
+        let resource_budget = crate::runtime::build_client_resource_budget(
+            &crate::runtime::ClientRuntimeConfig::default(),
+            &service_context.process_budget(),
+        )
+        .expect("service-context MQClientInstance resource budget must be valid");
+        let client_metrics = ClientMetrics::from_handle(&telemetry_handle);
+        Self::new_arc_with_resource_budget(
+            client_config,
+            remoting_command_factory,
+            instance_generation,
+            client_id,
+            rpc_hook,
+            service_context,
+            request_future_holder,
+            resource_budget,
+            telemetry_handle,
+            client_metrics,
+        )
+    }
+
+    pub(crate) fn new_arc_with_resource_budget(
+        client_config: ClientConfig,
+        remoting_command_factory: RemotingCommandFactory,
+        instance_generation: u64,
+        client_id: impl Into<CheetahString>,
+        rpc_hook: Option<Arc<dyn RPCHook>>,
+        service_context: ChildServiceContext,
+        request_future_holder: Arc<RequestFutureHolder>,
+        resource_budget: ResourceBudget,
+        telemetry_handle: TelemetryHandle,
+        client_metrics: ClientMetrics,
+    ) -> Arc<MQClientInstance> {
+        Self::new_arc_with_resource_budget_and_discovery(
+            client_config,
+            None,
+            remoting_command_factory,
+            instance_generation,
+            client_id,
+            rpc_hook,
+            service_context,
+            request_future_holder,
+            resource_budget,
+            telemetry_handle,
+            client_metrics,
+        )
+    }
+
+    pub(crate) fn new_arc_with_resource_budget_and_discovery(
+        client_config: ClientConfig,
+        nameserver_discovery_config: Option<NameServerDiscoveryConfig>,
+        remoting_command_factory: RemotingCommandFactory,
+        _instance_generation: u64,
+        client_id: impl Into<CheetahString>,
+        rpc_hook: Option<Arc<dyn RPCHook>>,
+        service_context: ChildServiceContext,
+        request_future_holder: Arc<RequestFutureHolder>,
+        resource_budget: ResourceBudget,
+        telemetry_handle: TelemetryHandle,
+        client_metrics: ClientMetrics,
+    ) -> Arc<MQClientInstance> {
+        let client_id = client_id.into();
+        let shared_config = Arc::new(client_config.clone());
+
+        let broker_addr_table = Arc::new(DashMap::default());
+        let producer_table = Arc::new(DashMap::default());
+        let consumer_table = Arc::new(DashMap::default());
+        let admin_ext_table = Arc::new(DashMap::default());
+        let topic_route_table = Arc::new(DashMap::default());
+        let topic_end_points_table = Arc::new(DashMap::default());
+        let broker_version_table = Arc::new(DashMap::default());
+        let broker_heartbeat_fingerprint_table = Arc::new(DashMap::default());
+        let broker_support_v2_heartbeat_set = Arc::new(DashMap::default());
+        let lock_namesrv: Arc<tokio::sync::Mutex<()>> = Arc::default();
+        let route_refresh_state = Arc::new(TopicRouteRefreshState::default());
+        let route_update_coordinator = RouteUpdateCoordinator::new(
+            producer_table.clone(),
+            consumer_table.clone(),
+            topic_route_table.clone(),
+            topic_end_points_table.clone(),
+            broker_addr_table.clone(),
+            route_refresh_state.clone(),
+            lock_namesrv.clone(),
+        );
+
+        let mut default_producer = DefaultMQProducer::unbound();
+        default_producer.set_client_config(client_config.clone());
+        default_producer.set_producer_group(mix_all::CLIENT_INNER_PRODUCER_GROUP);
+        default_producer.set_default_mqproducer_impl(
+            crate::producer::producer_impl::default_mq_producer_impl::DefaultMQProducerImpl::new_internal(
+                service_context.component("default-producer"),
+                default_producer.client_config_snapshot().as_ref().clone(),
+                default_producer.producer_config_snapshot().as_ref().clone(),
+                None,
+            ),
+        );
+        let default_producer = Mutex::new(default_producer);
+        let rebalance_service = RebalanceService::new(client_metrics.clone());
+        let instance = Arc::new(MQClientInstance {
+            service_context: service_context.clone(),
+            resource_budget: resource_budget.clone(),
+            telemetry_handle,
+            client_metrics,
+            request_future_holder,
+            remoting_command_factory,
+            client_config: shared_config,
+            nameserver_discovery_config,
+            nameserver_discovery_supervisor: Mutex::new(None),
+            client_id,
+            boot_timestamp: current_millis(),
+            producer_table,
+            producer_registration_admission: StdMutex::new(true),
+            producer_registry_transition: Mutex::new(()),
+            consumer_table,
+            admin_ext_table,
+            mq_client_api_impl: ArcSwapOption::empty(),
+            mq_admin_impl: Arc::new(MQAdminImpl::new()),
+            topic_route_table,
+            topic_end_points_table,
+            lock_namesrv,
+            route_update_coordinator,
+            lock_heartbeat: Arc::default(),
+            class_filter_registrations: Default::default(),
+            lifecycle_transition: Mutex::new(()),
+            service_state: StdRwLock::new(ServiceState::CreateJust),
+            pull_message_service: Arc::new(PullMessageService::with_shards_and_resource_budget(
+                client_config.pull_message_service_shards,
+                resource_budget,
+            )),
+            rebalance_service,
+            default_producer,
+            broker_addr_table,
+            broker_version_table,
+            send_heartbeat_times_total: Arc::new(AtomicI64::new(0)),
+            scheduled_tasks: service_context.scheduled_tasks("client-instance-schedules"),
+            broker_heartbeat_fingerprint_table,
+            broker_support_v2_heartbeat_set,
+            route_refresh_state,
+            consumer_stats_manager: ConsumerStatsManager::new(service_context.component("consumer-stats")),
+            connection_event_shutdown: CancellationToken::new(),
+            connection_event_task_handle: StdMutex::new(None),
+            rebalance_delay_tasks: TaskTracker::new(),
+            rebalance_delay_shutdown: CancellationToken::new(),
+        });
+
+        let client_bound = instance.mq_admin_impl.set_client(&instance);
+        debug_assert!(client_bound, "MQAdminImpl client must only be bound once");
+        if let Ok(default_producer) = instance.default_producer.try_lock() {
+            if let Some(producer_impl) = default_producer.default_mqproducer_impl.as_ref() {
+                producer_impl
+                    .bind_client_instance(&instance)
+                    .expect("internal producer must bind to its owning MQClientInstance");
+            }
+        }
+
+        let (tx, rx) = if client_config.enable_heartbeat_channel_event_listener {
+            let (tx, rx) = tokio::sync::broadcast::channel::<ConnectionNetEvent>(16);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let mq_client_api_impl = Arc::new(MQClientAPIImpl::new(
+            Arc::new(TransportClientConfig::default()),
+            ClientRemotingProcessor::new(&instance),
+            rpc_hook,
+            Arc::new(client_config.clone()),
+            tx,
+            service_context.component("remoting"),
+            instance.telemetry_handle.clone(),
+            remoting_command_factory,
+        ));
+
+        if let Some(namesrv_addr) = client_config.get_namesrv_addr().as_deref() {
+            mq_client_api_impl.update_name_server_address_list_sync(namesrv_addr);
+        }
+
+        instance.mq_client_api_impl.store(Some(mq_client_api_impl));
+
+        // Use weak reference to avoid circular dependencies
+        if let Some(rx) = rx {
+            let weak_instance = Arc::downgrade(&instance);
+            let connection_event_shutdown = instance.connection_event_shutdown.clone();
+            *instance
+                .connection_event_task_handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = connection_listener::spawn(
+                &service_context.component("connection-events"),
+                rx,
+                weak_instance,
+                connection_event_shutdown,
+            );
+        }
+        instance
+    }
+
+    pub fn service_context(&self) -> &ChildServiceContext {
+        &self.service_context
+    }
+
+    pub(crate) fn remoting_command_factory(&self) -> RemotingCommandFactory {
+        self.remoting_command_factory
+    }
+
+    pub(crate) fn resource_budget(&self) -> ResourceBudget {
+        self.resource_budget.clone()
+    }
+
+    pub(crate) fn telemetry_handle(&self) -> &TelemetryHandle {
+        &self.telemetry_handle
+    }
+
+    pub(crate) fn client_metrics(&self) -> &ClientMetrics {
+        &self.client_metrics
+    }
+
+    /// Returns a read-only discovery status without endpoint names or addresses.
+    pub async fn nameserver_discovery_status(&self) -> Option<crate::nameserver_discovery::NameServerDiscoveryStatus> {
+        #[cfg(feature = "nameserver-dns-discovery")]
+        {
+            let status = self
+                .nameserver_discovery_supervisor
+                .lock()
+                .await
+                .as_ref()
+                .map(|supervisor| supervisor.status());
+            status.map(|status| {
+                let transport = self
+                    .mq_client_api_impl
+                    .load_full()
+                    .map(|api| api.get_remoting_client().snapshot())
+                    .unwrap_or_default();
+                status.with_transport_counts(
+                    transport.healthy_name_server_count,
+                    transport.probing_name_server_count,
+                    transport.draining_name_server_count,
+                    transport.circuit_open_name_server_count,
+                )
+            })
+        }
+
+        #[cfg(not(feature = "nameserver-dns-discovery"))]
+        {
+            None
+        }
+    }
+
+    pub(crate) fn request_future_holder(&self) -> Arc<RequestFutureHolder> {
+        Arc::clone(&self.request_future_holder)
+    }
+
+    fn service_state(&self) -> ServiceState {
+        *self
+            .service_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn set_service_state(&self, state: ServiceState) {
+        *self
+            .service_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
+    }
+
+    /// Returns a reference to the `ConsumerStatsManager` held by this instance.
+    pub fn consumer_stats_manager(&self) -> &ConsumerStatsManager {
+        &self.consumer_stats_manager
+    }
+
+    async fn start_default_producer(&self) -> crate::ClientResult<()> {
+        let mut default_producer = self.default_producer.lock().await;
+        let Some(producer_impl) = default_producer.default_mqproducer_impl.as_mut() else {
+            return Err(mq_client_err!("default producer impl is None"));
+        };
+        // A user producer starts this internal producer through the same factory future. Erase the nested
+        // lifecycle future here so the combined startup chain stays within the default Windows main stack.
+        Box::pin(producer_impl.start_with_factory(false)).await
+    }
+
+    async fn shutdown_default_producer(&self) -> crate::ClientResult<()> {
+        let mut default_producer = self.default_producer.lock().await;
+        let Some(producer_impl) = default_producer.default_mqproducer_impl.as_mut() else {
+            return Ok(());
+        };
+        Box::pin(producer_impl.shutdown_with_factory(false)).await
+    }
+
+    pub(crate) async fn send_with_default_producer(&self, message: Message) -> crate::ClientResult<Option<SendResult>> {
+        let default_producer = {
+            let default_producer = self.default_producer.lock().await;
+            default_producer.clone()
+        };
+        default_producer.send(message).await
+    }
+
+    pub(crate) async fn send_with_default_producer_impl(
+        &self,
+        message: &mut Message,
+    ) -> crate::ClientResult<Option<SendResult>> {
+        let producer_impl = {
+            let default_producer = self.default_producer.lock().await;
+            default_producer.default_mqproducer_impl.as_ref().cloned()
+        }
+        .ok_or_else(|| crate::ClientError::not_initialized("DefaultMQProducerImpl"))?;
+        producer_impl.send(message).await
+    }
+
+    pub fn on_channel_connect(&self, _remote_addr: &str) {}
+
+    pub fn on_channel_close(&self, _remote_addr: &str) {}
+
+    pub fn on_channel_exception(&self, _remote_addr: &str) {}
+
+    pub fn on_channel_idle(&self, _remote_addr: &str) {}
+
+    pub async fn on_channel_active(&self, remote_addr: &str) {
+        let matched_brokers: Vec<_> = self
+            .broker_addr_table
+            .iter()
+            .flat_map(|entry| {
+                let (name, addrs) = entry.pair();
+                addrs
+                    .iter()
+                    .filter(|(_, addr)| addr.as_str() == remote_addr)
+                    .map(|(id, addr)| (*id, name.clone(), addr.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        for (id, broker_name, addr) in matched_brokers {
+            if self.send_heartbeat_to_broker(id, &broker_name, &addr, false).await {
+                self.re_balance_immediately();
+            }
+        }
+    }
+
+    pub fn re_balance_immediately(&self) {
+        self.rebalance_service.wakeup();
+    }
+
+    pub fn rebalance_immediately(&self) {
+        self.re_balance_immediately();
+    }
+
+    pub fn re_balance_later(&self, delay_millis: Duration) {
+        schedule_rebalance_wakeup(
+            &self.service_context,
+            self.rebalance_service.clone(),
+            delay_millis,
+            &self.rebalance_delay_tasks,
+            &self.rebalance_delay_shutdown,
+        );
+    }
+
+    pub async fn start(self: &Arc<Self>) -> crate::ClientResult<()> {
+        let _transition = self.lifecycle_transition.lock().await;
+        {
+            let admission = self
+                .producer_registration_admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !*admission {
+                return Err(mq_client_err!(format!(
+                    "The Factory object[{}] cannot start because producer registration admission is closed.",
+                    self.client_id
+                )));
+            }
+        }
+        match self.service_state() {
+            ServiceState::CreateJust => {
+                self.set_service_state(ServiceState::StartFailed);
+                self.start_nameserver_discovery().await?;
+                // If not specified,looking address from name remoting_server
+                if self.nameserver_discovery_config.is_none() && self.client_config.namesrv_addr.is_none() {
+                    let Some(mq_client_api_impl) = self.mq_client_api_impl.load_full() else {
+                        return Err(mq_client_err!("mq_client_api_impl is None"));
+                    };
+                    mq_client_api_impl.fetch_name_server_addr().await;
+                }
+                // Start request-response channel
+                let Some(mq_client_api_impl) = self.mq_client_api_impl.load_full() else {
+                    return Err(mq_client_err!("mq_client_api_impl is None"));
+                };
+                mq_client_api_impl.start().await?;
+                // Start various schedule tasks
+                self.start_scheduled_task(self.clone())?;
+                // Start pull service
+                let instance = self.clone();
+                if let Err(e) = self.pull_message_service.start(instance).await {
+                    error!("Failed to start pull message service: {:?}", e);
+                }
+                // Start rebalance service
+                if let Err(e) = self.rebalance_service.start(self.clone()).await {
+                    error!("Failed to start rebalance service: {:?}", e);
+                }
+                // Start push service
+
+                self.start_default_producer().await?;
+                // Start consumer stats manager
+                self.consumer_stats_manager.start();
+                info!("the client factory[{}] start OK", self.client_id);
+                self.set_service_state(ServiceState::Running);
+            }
+            ServiceState::Running => {}
+            ServiceState::ShutdownAlready => {}
+            ServiceState::StartFailed => {
+                return Err(mq_client_err!(format!(
+                    "The Factory object[{}] has been created before, and failed.",
+                    self.client_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) {
+        let _transition = self.lifecycle_transition.lock().await;
+        *self
+            .producer_registration_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+        match self.service_state() {
+            ServiceState::CreateJust | ServiceState::ShutdownAlready => {
+                warn!(
+                    "MQClientInstance shutdown called but state is {:?}, ignoring shutdown request",
+                    self.service_state()
+                );
+                self.shutdown_nameserver_discovery().await;
+                if let Some(mq_client_api_impl) = self.mq_client_api_impl.load_full() {
+                    if !mq_client_api_impl.shutdown_graceful(Duration::from_secs(1)).await {
+                        warn!(
+                            "MQClientInstance[{}] client API did not shut down cleanly",
+                            self.client_id
+                        );
+                    }
+                }
+                self.shutdown_connection_event_listener(Duration::from_secs(1)).await;
+                self.shutdown_rebalance_delay_tasks(Duration::from_secs(1)).await;
+                return;
+            }
+            ServiceState::StartFailed => {
+                warn!(
+                    "MQClientInstance[{}] cleaning up resources from a partial startup",
+                    self.client_id
+                );
+            }
+            ServiceState::Running => {
+                info!(
+                    "MQClientInstance[{}] shutdown starting, current state: Running",
+                    self.client_id
+                );
+            }
+        }
+
+        self.shutdown_nameserver_discovery().await;
+
+        info!("MQClientInstance[{}] shutting down rebalance service", self.client_id);
+        if let Err(e) = self.rebalance_service.shutdown(3000).await {
+            warn!("Failed to shutdown rebalance service: {:?}", e);
+        }
+
+        info!(
+            "MQClientInstance[{}] shutting down pull message service",
+            self.client_id
+        );
+        if let Err(e) = self.pull_message_service.shutdown_default().await {
+            warn!("Failed to shutdown pull message service: {:?}", e);
+        }
+
+        info!("MQClientInstance[{}] persisting all consumer offsets", self.client_id);
+        self.persist_all_consumer_offset().await;
+
+        info!("MQClientInstance[{}] shutting down default producer", self.client_id);
+        if let Err(e) = self.shutdown_default_producer().await {
+            warn!("Failed to shutdown default producer: {:?}", e);
+        }
+
+        info!("MQClientInstance[{}] unregistering all consumers", self.client_id);
+        self.unregister_all_consumers().await;
+
+        info!("MQClientInstance[{}] unregistering all producers", self.client_id);
+        self.unregister_all_producers().await;
+
+        if let Some(mq_client_api_impl) = self.mq_client_api_impl.load_full() {
+            info!(
+                "MQClientInstance[{}] shutting down client API background tasks and network client",
+                self.client_id
+            );
+            if !mq_client_api_impl.shutdown_graceful(Duration::from_secs(1)).await {
+                warn!(
+                    "MQClientInstance[{}] client API did not shut down cleanly",
+                    self.client_id
+                );
+            }
+        }
+
+        self.shutdown_connection_event_listener(Duration::from_secs(1)).await;
+        self.shutdown_rebalance_delay_tasks(Duration::from_secs(1)).await;
+
+        info!("MQClientInstance[{}] shutting down scheduled tasks", self.client_id);
+        let scheduled_report = self.scheduled_tasks.shutdown(SCHEDULED_TASK_SHUTDOWN_TIMEOUT).await;
+        if scheduled_report.is_healthy() {
+            info!("MQClientInstance[{}] scheduled tasks stopped", self.client_id);
+        } else {
+            warn!(
+                "MQClientInstance[{}] scheduled task shutdown unhealthy: {}",
+                self.client_id,
+                scheduled_report.to_json()
+            );
+        }
+
+        info!(
+            "MQClientInstance[{}] shutting down consumer stats manager",
+            self.client_id
+        );
+        self.consumer_stats_manager.shutdown_async().await;
+
+        info!("MQClientInstance[{}] clearing all registration tables", self.client_id);
+        self.producer_table.clear();
+        self.consumer_table.clear();
+        self.admin_ext_table.clear();
+
+        self.topic_route_table.clear();
+        self.route_refresh_state.versions.clear();
+        self.route_refresh_state.broker_addr_route_index.clear();
+        self.topic_end_points_table.clear();
+        self.broker_addr_table.clear();
+        self.broker_version_table.clear();
+
+        self.set_service_state(ServiceState::ShutdownAlready);
+
+        info!("MQClientInstance[{}] shutdown completed successfully", self.client_id);
+    }
+
+    async fn start_nameserver_discovery(&self) -> ClientResult<()> {
+        let Some(config) = self.nameserver_discovery_config.clone() else {
+            return Ok(());
+        };
+        if matches!(config.source(), NameServerSource::Static(_)) {
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "nameserver-dns-discovery"))]
+        {
+            Err(ClientError::config_invalid(
+                "nameserver_discovery.dns",
+                "enabled",
+                "requires the nameserver-dns-discovery Cargo feature",
+            ))
+        }
+
+        #[cfg(feature = "nameserver-dns-discovery")]
+        {
+            let Some(api) = self.mq_client_api_impl.load_full() else {
+                return Err(mq_client_err!("mq_client_api_impl is None"));
+            };
+            let drain_timeout = config.drain_timeout();
+            let publisher = Arc::new(
+                move |endpoints: Arc<[crate::nameserver_discovery::ResolvedNameServerEndpoint]>| {
+                    let targets = endpoints
+                        .iter()
+                        .filter_map(|endpoint| {
+                            rocketmq_transport::api::ConnectTarget::new(
+                                endpoint.socket_addr(),
+                                endpoint.authority().as_str(),
+                            )
+                            .map_err(|error| {
+                                warn!(?error, "ignored invalid resolved NameServer connect target");
+                            })
+                            .ok()
+                        })
+                        .collect::<Vec<_>>();
+                    api.update_name_server_connect_targets_sync(targets, drain_timeout);
+                },
+            );
+            let supervisor = NameServerDiscoverySupervisor::start_dns(
+                config,
+                &self.service_context,
+                self.client_id.as_str(),
+                self.client_metrics.clone(),
+                publisher,
+            )
+            .await?;
+            *self.nameserver_discovery_supervisor.lock().await = Some(supervisor);
+            Ok(())
+        }
+    }
+
+    async fn shutdown_nameserver_discovery(&self) {
+        let supervisor = self.nameserver_discovery_supervisor.lock().await.take();
+        if let Some(supervisor) = supervisor {
+            supervisor.shutdown().await;
+        }
+    }
+
+    async fn shutdown_connection_event_listener(&self, timeout: Duration) {
+        self.connection_event_shutdown.cancel();
+        let handle = self
+            .connection_event_task_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(handle) = handle else {
+            return;
+        };
+
+        let report = handle.shutdown(timeout).await;
+        if !report.is_healthy() {
+            warn!(
+                report = %report.to_json(),
+                "MQClientInstance[{}] connection event listener shutdown report is unhealthy",
+                self.client_id
+            );
+        }
+    }
+
+    fn connection_event_task_count(&self) -> usize {
+        self.connection_event_task_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(ClientTrackedTaskHandle::task_count)
+            .unwrap_or_default()
+    }
+
+    async fn shutdown_rebalance_delay_tasks(&self, timeout: Duration) {
+        self.rebalance_delay_shutdown.cancel();
+        self.rebalance_delay_tasks.close();
+        if tokio::time::timeout(timeout, self.rebalance_delay_tasks.wait())
+            .await
+            .is_err()
+        {
+            warn!(
+                "MQClientInstance[{}] rebalance delay tasks did not finish in time",
+                self.client_id
+            );
+        }
+    }
+
+    /// Unregister all producers from broker
+    async fn unregister_all_producers(&self) {
+        let producer_registrations: Vec<(CheetahString, MQProducerInnerImpl)> = self
+            .producer_table
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+
+        for (group, expected_owner) in producer_registrations {
+            info!("Unregistering producer group: {}", group);
+            self.unregister_producer_if_owner(group, &expected_owner).await;
+        }
+    }
+
+    /// Unregister all consumers from broker
+    async fn unregister_all_consumers(&self) {
+        // Get all consumer groups before removing from table
+        let consumer_groups: Vec<CheetahString> = self.consumer_table.iter().map(|entry| entry.key().clone()).collect();
+
+        // Unregister each consumer (removes from table and notifies broker)
+        for group in consumer_groups {
+            info!("Unregistering consumer group: {}", group);
+            self.unregister_consumer(group).await;
+        }
+    }
+
+    pub async fn register_producer(&self, group: &str, producer: MQProducerInnerImpl) -> bool {
+        if group.is_empty() {
+            return false;
+        }
+
+        let _transition = self.producer_registry_transition.lock().await;
+        let admission = self
+            .producer_registration_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !*admission {
+            warn!(
+                "the producer group[{}] cannot register because producer registration admission is closed.",
+                group
+            );
+            return false;
+        }
+
+        // Keep admission held through the entry mutation so shutdown closing the
+        // gate and producer registration have a single ordering point.
+        if !producer.is_alive() {
+            warn!("the producer group[{}] has no live producer root.", group);
+            return false;
+        }
+
+        match self.producer_table.entry(group.into()) {
+            Entry::Vacant(entry) => {
+                entry.insert(producer);
+                true
+            }
+            Entry::Occupied(mut entry) => {
+                if entry.get().points_to_same_producer(&producer) {
+                    return true;
+                }
+                if !entry.get().is_alive() {
+                    entry.insert(producer);
+                    return true;
+                }
+
+                warn!("the producer group[{}] exist already.", group);
+                false
+            }
+        }
+    }
+
+    fn prune_dead_producers(&self) {
+        self.producer_table.retain(|_, producer| producer.is_alive());
+    }
+
+    pub async fn register_admin_ext(&self, group: &str) -> bool {
+        self.register_admin_ext_owned(group, 0)
+    }
+
+    // Custom: claim a group atomically and retain its lifecycle owner.
+    pub(crate) fn register_admin_ext_owned(&self, group: &str, owner: u64) -> bool {
+        // Custom: Java rejects null, but accepts an empty local registration label.
+        match self.admin_ext_table.entry(group.into()) {
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(owner);
+                true
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => false,
+        }
+    }
+
+    pub(crate) fn unregister_admin_ext_owned(&self, group: &str, owner: u64) -> bool {
+        self.admin_ext_table
+            .remove_if(group, |_, current| *current == owner)
+            .is_some()
+    }
+
+    fn start_scheduled_task(&self, this: Arc<Self>) -> crate::ClientResult<()> {
+        info!("Starting client instance scheduled tasks");
+
+        if self.client_config.namesrv_addr.is_none() {
+            if let Some(mq_client_api_impl) = self.mq_client_api_impl.load_full() {
+                self.scheduled_tasks
+                    .schedule(
+                        ScheduledTaskConfig::fixed_rate_no_overlap(
+                            "client.fetch-name-server-addr",
+                            Duration::from_secs(120),
+                        )
+                        .with_initial_delay(Duration::from_secs(10)),
+                        ScheduledExecutionPolicy::default(),
+                        move || {
+                            let mq_client_api_impl = Arc::clone(&mq_client_api_impl);
+                            async move {
+                                info!("ScheduledTask: fetchNameServerAddr");
+                                mq_client_api_impl.fetch_name_server_addr().await;
+                            }
+                        },
+                    )
+                    .map_err(|error| client_scheduled_task_startup_failed("fetchNameServerAddr", error))?;
+            } else {
+                warn!(
+                    "ScheduledTask: fetchNameServerAddr skipped because mq_client_api_impl is None. [{}]",
+                    self.client_id
+                );
+            }
+        }
+
+        let client_instance = this.clone();
+        let poll_name_server_interval = self.client_config.poll_name_server_interval;
+        self.scheduled_tasks
+            .schedule(
+                ScheduledTaskConfig::fixed_rate_no_overlap(
+                    "client.update-topic-route",
+                    Duration::from_millis(poll_name_server_interval as u64),
+                )
+                .with_initial_delay(Duration::from_millis(10)),
+                ScheduledExecutionPolicy::default(),
+                move || {
+                    let instance = Arc::clone(&client_instance);
+                    async move {
+                        info!("ScheduledTask: update_topic_route_info_from_name_server");
+                        instance.update_topic_route_info_from_name_server().await;
+                    }
+                },
+            )
+            .map_err(|error| client_scheduled_task_startup_failed("update_topic_route_info_from_name_server", error))?;
+
+        let client_instance = this.clone();
+        let heartbeat_broker_interval = self.client_config.heartbeat_broker_interval;
+        self.scheduled_tasks
+            .schedule(
+                ScheduledTaskConfig::fixed_rate_no_overlap(
+                    "client.heartbeat",
+                    Duration::from_millis(heartbeat_broker_interval as u64),
+                )
+                .with_initial_delay(Duration::from_secs(1)),
+                ScheduledExecutionPolicy::default(),
+                move || {
+                    let instance = Arc::clone(&client_instance);
+                    async move {
+                        info!("ScheduledTask: clean_offline_broker and send_heartbeat");
+                        instance.clean_offline_broker().await;
+                        instance.send_heartbeat_to_all_broker_with_lock().await;
+                    }
+                },
+            )
+            .map_err(|error| client_scheduled_task_startup_failed("clean_offline_broker_and_send_heartbeat", error))?;
+
+        let client_instance = this;
+        let persist_consumer_offset_interval = self.client_config.persist_consumer_offset_interval as u64;
+        self.scheduled_tasks
+            .schedule(
+                ScheduledTaskConfig::fixed_rate_no_overlap(
+                    "client.persist-consumer-offset",
+                    Duration::from_millis(persist_consumer_offset_interval),
+                )
+                .with_initial_delay(Duration::from_secs(10)),
+                ScheduledExecutionPolicy::default(),
+                move || {
+                    let instance = Arc::clone(&client_instance);
+                    async move {
+                        info!("ScheduledTask: persistAllConsumerOffset");
+                        instance.persist_all_consumer_offset().await;
+                    }
+                },
+            )
+            .map_err(|error| client_scheduled_task_startup_failed("persistAllConsumerOffset", error))?;
+
+        info!(
+            "All scheduled tasks started, total tasks: {}",
+            self.scheduled_tasks.snapshot().len()
+        );
+        Ok(())
+    }
+
+    pub async fn update_topic_route_info_from_name_server(&self) {
+        let topic_list = self.collect_registered_route_topics();
+        let total_topics = topic_list.len();
+        let (refresh_topics, skipped_topics) = self.select_periodic_route_refresh_batch(&topic_list);
+        let started = Instant::now();
+
+        for topic in refresh_topics.iter() {
+            self.update_topic_route_info_from_name_server_default_with_kind(
+                topic,
+                false,
+                None,
+                TopicRouteRefreshKind::Periodic,
+            )
+            .await;
+        }
+
+        self.route_refresh_state.metrics.record_periodic_batch(
+            total_topics as u64,
+            refresh_topics.len() as u64,
+            skipped_topics as u64,
+            started.elapsed().as_micros() as u64,
+        );
+    }
+
+    #[inline]
+    pub async fn update_topic_route_info_from_name_server_topic(&self, topic: &CheetahString) -> bool {
+        self.update_topic_route_info_from_name_server_default(topic, false, None)
+            .await
+    }
+
+    pub async fn find_consumer_id_list(
+        &self,
+        topic: &CheetahString,
+        group: &CheetahString,
+    ) -> Option<Vec<CheetahString>> {
+        let mut broker_addr = self.find_broker_addr_by_topic(topic).await;
+        if broker_addr.is_none() {
+            self.update_topic_route_info_from_name_server_topic(topic).await;
+            broker_addr = self.find_broker_addr_by_topic(topic).await;
+        }
+        if let Some(broker_addr) = broker_addr {
+            if let Some(mq_client_api_impl) = self.mq_client_api_impl.load_full() {
+                match mq_client_api_impl
+                    .get_consumer_id_list_by_group(
+                        broker_addr.as_str(),
+                        group,
+                        self.client_config.mq_client_api_timeout,
+                    )
+                    .await
+                {
+                    Ok(value) => return Some(value),
+                    Err(e) => {
+                        warn!(
+                            "getConsumerIdListByGroup exception,{}  {}, err:{}",
+                            broker_addr,
+                            group,
+                            e.to_string()
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    "getConsumerIdListByGroup skipped because mq_client_api_impl is None, topic={}, group={}",
+                    topic, group
+                );
+            }
+        }
+        None
+    }
+
+    pub async fn find_broker_addr_by_topic(&self, topic: &str) -> Option<CheetahString> {
+        if let Some(topic_route_data) = self.topic_route_table.get(topic) {
+            let brokers = &topic_route_data.value().broker_datas;
+            if !brokers.is_empty() {
+                let bd = brokers.choose(&mut rand::rng());
+                if let Some(bd) = bd {
+                    return bd.select_broker_addr();
+                }
+            }
+        }
+        None
+    }
+
+    pub async fn query_topic_route_data(&self, topic: &CheetahString) -> Option<TopicRouteData> {
+        if let Some(topic_route_data) = self.topic_route_table.get(topic) {
+            return Some(TopicRouteData::from_existing(topic_route_data.value()));
+        }
+
+        self.update_topic_route_info_from_name_server_topic(topic).await;
+        self.topic_route_table
+            .get(topic)
+            .map(|entry| TopicRouteData::from_existing(entry.value()))
+    }
+
+    /// Custom fork: explicit metadata queries preserve NameServer failures and
+    /// atomically update route/broker tables. An absent topic is distinct from an error.
+    pub async fn refresh_topic_route_data(&self, topic: &CheetahString) -> ClientResult<Option<TopicRouteData>> {
+        let request_version = self.topic_route_version(topic);
+        let api = self
+            .mq_client_api_impl
+            .load_full()
+            .ok_or_else(crate::ClientError::not_started)?;
+        let Some(mut route) = api
+            .get_topic_route_info_from_name_server(topic, self.client_config.mq_client_api_timeout)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if matches!(
+            self.apply_topic_route_data_if_fresh(topic, &mut route, request_version)
+                .await,
+            TopicRouteApplyOutcome::Stale
+        ) {
+            return Ok(self
+                .topic_route_table
+                .get(topic)
+                .map(|entry| TopicRouteData::from_existing(entry.value())));
+        }
+        Ok(Some(route))
+    }
+
+    pub async fn update_topic_route_info_from_name_server_default(
+        &self,
+        topic: &CheetahString,
+        is_default: bool,
+        producer_config: Option<&Arc<ProducerConfig>>,
+    ) -> bool {
+        self.update_topic_route_info_from_name_server_default_with_kind(
+            topic,
+            is_default,
+            producer_config,
+            TopicRouteRefreshKind::RouteMiss,
+        )
+        .await
+    }
+
+    pub(crate) async fn refresh_topic_route_info_once(
+        &self,
+        topic: &CheetahString,
+        deadline: RequestDeadline,
+    ) -> Result<Option<TopicPublishInfo>, RetryInput> {
+        self.route_refresh_state.metrics.record_attempt();
+        let started = Instant::now();
+        let request_version = self.topic_route_version(topic);
+        let Some(mq_client_api_impl) = self.mq_client_api_impl.load_full() else {
+            self.route_refresh_state.metrics.record_failure();
+            self.record_topic_route_refresh_finish(
+                TopicRouteRefreshKind::RouteMiss,
+                started,
+                TopicRouteApplyOutcome::Unchanged,
+            );
+            return Err(RetryInput::BusinessError(ClientError::not_started()));
+        };
+
+        let topic_route_data = match mq_client_api_impl
+            .get_topic_route_info_once(topic, deadline, true)
+            .await
+        {
+            Ok(Some(topic_route_data)) => topic_route_data,
+            Ok(None) => {
+                self.record_single_route_refresh_failure(started);
+                return Ok(None);
+            }
+            Err(input) => {
+                self.record_single_route_refresh_failure(started);
+                return Err(input);
+            }
+        };
+
+        Ok(self
+            .apply_topic_publish_info_once(topic, topic_route_data, request_version, started)
+            .await)
+    }
+
+    /// Performs initial producer route preparation without creating a second retry authority.
+    ///
+    /// The requested topic is queried once. Only an absent requested-topic route permits one
+    /// fallback query for the auto-create topic, using the same absolute deadline. The fallback
+    /// retains the producer's configured queue cap before the route is published for `topic`.
+    pub(crate) async fn prepare_topic_publish_info_once(
+        &self,
+        topic: &CheetahString,
+        producer_config: &ProducerConfig,
+        deadline: RequestDeadline,
+    ) -> Result<Option<TopicPublishInfo>, RetryInput> {
+        self.route_refresh_state.metrics.record_attempt();
+        let started = Instant::now();
+        let request_version = self.topic_route_version(topic);
+        let Some(mq_client_api_impl) = self.mq_client_api_impl.load_full() else {
+            self.record_single_route_refresh_failure(started);
+            return Err(RetryInput::BusinessError(ClientError::not_started()));
+        };
+
+        let topic_route_data = match mq_client_api_impl
+            .get_topic_route_info_once(topic, deadline, true)
+            .await
+        {
+            Ok(Some(topic_route_data)) => topic_route_data,
+            Ok(None) => match mq_client_api_impl.get_default_topic_route_info_once(deadline).await {
+                Ok(Some(mut topic_route_data)) => {
+                    cap_default_topic_route_queue_nums(
+                        &mut topic_route_data,
+                        producer_config.default_topic_queue_nums(),
+                    );
+                    topic_route_data
+                }
+                Ok(None) => {
+                    self.record_single_route_refresh_failure(started);
+                    return Ok(None);
+                }
+                Err(input) => {
+                    self.record_single_route_refresh_failure(started);
+                    return Err(input);
+                }
+            },
+            Err(input) => {
+                self.record_single_route_refresh_failure(started);
+                return Err(input);
+            }
+        };
+
+        Ok(self
+            .apply_topic_publish_info_once(topic, topic_route_data, request_version, started)
+            .await)
+    }
+
+    fn record_single_route_refresh_failure(&self, started: Instant) {
+        self.route_refresh_state.metrics.record_failure();
+        self.record_topic_route_refresh_finish(
+            TopicRouteRefreshKind::RouteMiss,
+            started,
+            TopicRouteApplyOutcome::Unchanged,
+        );
+    }
+
+    async fn apply_topic_publish_info_once(
+        &self,
+        topic: &CheetahString,
+        mut topic_route_data: TopicRouteData,
+        request_version: u64,
+        started: Instant,
+    ) -> Option<TopicPublishInfo> {
+        let mut publish_info = topic_route_data2topic_publish_info(topic, &mut topic_route_data);
+        publish_info.have_topic_router_info = true;
+        let outcome = self
+            .apply_topic_route_data_if_fresh(topic, &mut topic_route_data, request_version)
+            .await;
+        self.record_topic_route_refresh_finish(TopicRouteRefreshKind::RouteMiss, started, outcome);
+        match outcome {
+            TopicRouteApplyOutcome::Applied => self.route_refresh_state.metrics.record_success(),
+            TopicRouteApplyOutcome::Unchanged | TopicRouteApplyOutcome::Stale => {
+                self.route_refresh_state.metrics.record_skip()
+            }
+        }
+
+        if matches!(outcome, TopicRouteApplyOutcome::Stale) {
+            let current_route = self
+                .topic_route_table
+                .get(topic)
+                .map(|entry| TopicRouteData::from_existing(entry.value()));
+            if let Some(mut current_route) = current_route {
+                let mut current_publish_info = topic_route_data2topic_publish_info(topic, &mut current_route);
+                current_publish_info.have_topic_router_info = true;
+                return Some(current_publish_info);
+            }
+            return None;
+        }
+
+        Some(publish_info)
+    }
+
+    async fn update_topic_route_info_from_name_server_default_with_kind(
+        &self,
+        topic: &CheetahString,
+        is_default: bool,
+        producer_config: Option<&Arc<ProducerConfig>>,
+        refresh_kind: TopicRouteRefreshKind,
+    ) -> bool {
+        self.route_refresh_state.metrics.record_attempt();
+        let started = Instant::now();
+        let request_version = self.topic_route_version(topic);
+
+        let Some(mq_client_api_impl) = self.mq_client_api_impl.load_full() else {
+            error!(
+                "updateTopicRouteInfoFromNameServer skipped because mq_client_api_impl is None, Topic: {}. [{}]",
+                topic, self.client_id
+            );
+            self.record_topic_route_refresh_finish(refresh_kind, started, TopicRouteApplyOutcome::Unchanged);
+            self.route_refresh_state.metrics.record_failure();
+            return false;
+        };
+
+        let topic_route_data = if let (true, Some(producer_config)) = (is_default, producer_config) {
+            let mut result = match mq_client_api_impl
+                .get_default_topic_route_info_from_name_server(self.client_config.mq_client_api_timeout)
+                .await
+            {
+                Ok(value) => value,
+                Err(e) => {
+                    error!(
+                        "get_default_topic_route_info_from_name_server failed, topic: {}, error: {}",
+                        topic, e
+                    );
+                    None
+                }
+            };
+            if let Some(topic_route_data) = result.as_mut() {
+                cap_default_topic_route_queue_nums(topic_route_data, producer_config.default_topic_queue_nums());
+            }
+            result
+        } else {
+            match mq_client_api_impl
+                .get_topic_route_info_from_name_server(topic, self.client_config.mq_client_api_timeout)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(
+                        "getTopicRouteInfoFromNameServer failed, topic: {}, error: {}",
+                        topic, error
+                    );
+                    None
+                }
+            }
+        };
+        if let Some(mut topic_route_data) = topic_route_data {
+            let outcome = self
+                .apply_topic_route_data_if_fresh(topic, &mut topic_route_data, request_version)
+                .await;
+            self.record_topic_route_refresh_finish(refresh_kind, started, outcome);
+            match outcome {
+                TopicRouteApplyOutcome::Applied => {
+                    self.route_refresh_state.metrics.record_success();
+                    return true;
+                }
+                TopicRouteApplyOutcome::Unchanged | TopicRouteApplyOutcome::Stale => {
+                    self.route_refresh_state.metrics.record_skip();
+                    return false;
+                }
+            }
+        } else {
+            warn!(
+                "updateTopicRouteInfoFromNameServer, getTopicRouteInfoFromNameServer return null, Topic: {}. [{}]",
+                topic, self.client_id
+            );
+            self.route_refresh_state.metrics.record_failure();
+        }
+
+        self.record_topic_route_refresh_finish(refresh_kind, started, TopicRouteApplyOutcome::Unchanged);
+        false
+    }
+
+    fn collect_registered_route_topics(&self) -> Vec<CheetahString> {
+        self.prune_dead_producers();
+        let mut topic_list = HashSet::new();
+
+        for entry in self.producer_table.iter() {
+            topic_list.extend(entry.value().get_publish_topic_list());
+        }
+
+        for entry in self.consumer_table.iter() {
+            entry.value().subscriptions().iter().for_each(|sub| {
+                topic_list.insert(sub.topic.clone());
+            });
+        }
+
+        let mut topics = topic_list.into_iter().collect::<Vec<_>>();
+        topics.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        topics
+    }
+
+    fn select_periodic_route_refresh_batch(&self, topics: &[CheetahString]) -> (Vec<CheetahString>, usize) {
+        let total_topics = topics.len();
+        if total_topics <= ROUTE_REFRESH_MAX_TOPICS_PER_ROUND {
+            return (topics.to_vec(), 0);
+        }
+
+        let start = self
+            .route_refresh_state
+            .periodic_cursor
+            .fetch_add(ROUTE_REFRESH_MAX_TOPICS_PER_ROUND, std::sync::atomic::Ordering::Relaxed)
+            % total_topics;
+        let selected = (0..ROUTE_REFRESH_MAX_TOPICS_PER_ROUND)
+            .map(|offset| topics[(start + offset) % total_topics].clone())
+            .collect::<Vec<_>>();
+        let skipped = total_topics.saturating_sub(selected.len());
+        (selected, skipped)
+    }
+
+    fn topic_route_version(&self, topic: &CheetahString) -> u64 {
+        self.route_refresh_state
+            .versions
+            .get(topic)
+            .map(|entry| *entry.value())
+            .unwrap_or_default()
+    }
+
+    fn record_topic_route_refresh_finish(
+        &self,
+        refresh_kind: TopicRouteRefreshKind,
+        started: Instant,
+        _outcome: TopicRouteApplyOutcome,
+    ) {
+        if matches!(refresh_kind, TopicRouteRefreshKind::RouteMiss) {
+            self.route_refresh_state
+                .metrics
+                .record_route_miss_elapsed(started.elapsed().as_micros() as u64);
+        }
+    }
+
+    async fn apply_topic_route_data_if_fresh(
+        &self,
+        topic: &CheetahString,
+        topic_route_data: &mut TopicRouteData,
+        request_version: u64,
+    ) -> TopicRouteApplyOutcome {
+        self.route_update_coordinator
+            .apply_if_fresh(topic, topic_route_data, request_version)
+            .await
+    }
+
+    fn remove_broker_route_index(&self, addr: &CheetahString) {
+        self.route_refresh_state.broker_addr_route_index.remove(addr);
+    }
+
+    fn is_broker_addr_in_route_index(&self, addr: &str) -> bool {
+        self.route_refresh_state.broker_addr_route_index.contains_key(addr)
+    }
+
+    fn scan_broker_addr_in_topic_route_table(&self, addr: &str) -> bool {
+        for entry in self.topic_route_table.iter() {
+            for bd in entry.value().broker_datas.iter() {
+                for value in bd.broker_addrs().values() {
+                    if value.as_str() == addr {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    pub fn route_refresh_metrics_snapshot(&self) -> TopicRouteRefreshMetricsSnapshot {
+        self.route_refresh_state.metrics.snapshot()
+    }
+
+    pub async fn persist_all_consumer_offset(&self) {
+        for (_, consumer) in self.consumer_snapshot() {
+            consumer.persist_consumer_offset().await;
+        }
+    }
+
+    pub async fn clean_offline_broker(&self) {
+        let lock = tokio::time::timeout(Duration::from_millis(LOCK_TIMEOUT_MILLIS), self.lock_namesrv.lock()).await;
+        if let Ok(_lock) = lock {
+            let mut updated_table = HashMap::new();
+            let mut broker_name_set = HashSet::new();
+
+            for broker_entry in self.broker_addr_table.iter() {
+                let (broker_name, one_table) = broker_entry.pair();
+                let mut clone_addr_table = one_table.clone();
+                let mut remove_id_set = HashSet::new();
+                for (id, addr) in one_table.iter() {
+                    if !self.is_broker_addr_in_route_index(addr) {
+                        self.remove_broker_route_index(addr);
+                        remove_id_set.insert(*id);
+                    }
+                }
+                clone_addr_table.retain(|k, _| !remove_id_set.contains(k));
+                if clone_addr_table.is_empty() {
+                    info!("the broker[{}] name's host is offline, remove it", broker_name);
+                    broker_name_set.insert(broker_name.clone());
+                } else {
+                    updated_table.insert(broker_name.clone(), clone_addr_table);
+                }
+            }
+
+            // Remove offline brokers and update with new data
+            for broker_name in broker_name_set {
+                self.broker_addr_table.remove(&broker_name);
+            }
+            for (broker_name, addrs) in updated_table {
+                self.broker_addr_table.insert(broker_name, addrs);
+            }
+        }
+    }
+    pub async fn send_heartbeat_to_all_broker_with_lock(&self) -> bool {
+        let _guard = match self.lock_heartbeat.try_lock().ok() {
+            Some(g) => g,
+            None => {
+                warn!("lock heartBeat, but failed. [{}]", self.client_id);
+                return false;
+            }
+        };
+
+        let heartbeat_ok = if self.client_config.use_heartbeat_v2 {
+            self.send_heartbeat_to_all_broker_v2(false).await
+        } else if self.client_config.enable_concurrent_heartbeat {
+            self.send_heartbeat_to_all_broker_concurrently().await
+        } else {
+            self.send_heartbeat_to_all_broker().await
+        };
+        // Java refreshes the class after every heartbeat; do not log the Java source or server remark.
+        if let Err(error) = self.upload_filter_class_sources().await {
+            tracing::warn!(kind=?error.failure_kind(), code=?error.broker_response_code(), address=?error.broker_addr(), "class filter registration failed");
+            return false;
+        }
+        heartbeat_ok
+    }
+
+    pub async fn send_heartbeat_to_all_broker_with_lock_v2(&self, is_rebalance: bool) -> bool {
+        let _guard = match tokio::time::timeout(Duration::from_secs(2), self.lock_heartbeat.lock())
+            .await
+            .ok()
+        {
+            Some(g) => g,
+            None => {
+                warn!("lock heartBeat, but failed. [{}]", self.client_id);
+                return false;
+            }
+        };
+
+        if self.client_config.use_heartbeat_v2 {
+            self.send_heartbeat_to_all_broker_v2(is_rebalance).await
+        } else {
+            self.send_heartbeat_to_all_broker().await
+        }
+    }
+
+    pub fn get_mq_client_api_impl(&self) -> crate::ClientResult<Arc<MQClientAPIImpl>> {
+        self.mq_client_api_impl
+            .load_full()
+            .ok_or(crate::ClientError::not_started())
+    }
+
+    pub async fn pull_message_from_broker(
+        &self,
+        broker_addr: &str,
+        request_header: PullMessageRequestHeader,
+        timeout_millis: u64,
+    ) -> crate::ClientResult<PullResult> {
+        struct NoopPullCallback;
+
+        impl PullCallback for NoopPullCallback {
+            async fn on_success(&mut self, _pull_result: PullResultExt) {}
+
+            fn on_exception(&mut self, _e: crate::ClientError) {}
+        }
+
+        let api_impl = self
+            .mq_client_api_impl
+            .load_full()
+            .ok_or(crate::ClientError::not_started())?;
+
+        let mut result = MQClientAPIImpl::pull_message(
+            api_impl.clone(),
+            CheetahString::from(broker_addr),
+            request_header,
+            timeout_millis,
+            CommunicationMode::Sync,
+            NoopPullCallback,
+        )
+        .await?
+        .ok_or_else(|| sync_pull_result_missing("MQClientInstance::pull_message"))?;
+
+        if result.pull_result.pull_status == PullStatus::Found {
+            if let Some(mut message_binary) = result.message_binary.take() {
+                let messages = MessageDecoder::decodes_batch(&mut message_binary, true, true);
+                result.pull_result.set_msg_found_list(Some(messages));
+            }
+        }
+
+        Ok(result.pull_result)
+    }
+
+    pub async fn query_consumer_offset(
+        &self,
+        broker_addr: &str,
+        request_header: QueryConsumerOffsetRequestHeader,
+        timeout_millis: u64,
+    ) -> crate::ClientResult<i64> {
+        let api_impl = self
+            .mq_client_api_impl
+            .load_full()
+            .ok_or(crate::ClientError::not_started())?;
+        api_impl
+            .clone()
+            .query_consumer_offset(broker_addr, request_header, timeout_millis)
+            .await
+    }
+
+    pub async fn update_consumer_offset(
+        &self,
+        broker_addr: &CheetahString,
+        request_header: UpdateConsumerOffsetRequestHeader,
+        timeout_millis: u64,
+    ) -> crate::ClientResult<()> {
+        let api_impl = self
+            .mq_client_api_impl
+            .load_full()
+            .ok_or(crate::ClientError::not_started())?;
+        api_impl
+            .clone()
+            .update_consumer_offset(broker_addr, request_header, timeout_millis)
+            .await
+    }
+
+    pub async fn consumer_send_message_back(
+        &self,
+        broker_addr: &str,
+        broker_name: Option<&str>,
+        message: &MessageExt,
+        consumer_group: &str,
+        delay_level: i32,
+        timeout_millis: u64,
+        max_consume_retry_times: i32,
+    ) -> crate::ClientResult<()> {
+        let api_impl = self
+            .mq_client_api_impl
+            .load_full()
+            .ok_or(crate::ClientError::not_started())?;
+        api_impl
+            .clone()
+            .consumer_send_message_back(
+                broker_addr,
+                broker_name,
+                message,
+                consumer_group,
+                delay_level,
+                timeout_millis,
+                max_consume_retry_times,
+            )
+            .await
+    }
+
+    pub async fn get_max_offset(
+        &self,
+        broker_addr: &str,
+        message_queue: &MessageQueue,
+        timeout_millis: u64,
+    ) -> crate::ClientResult<i64> {
+        let api_impl = self
+            .mq_client_api_impl
+            .load_full()
+            .ok_or(crate::ClientError::not_started())?;
+        api_impl
+            .clone()
+            .get_max_offset(broker_addr, message_queue, timeout_millis)
+            .await
+    }
+
+    pub async fn get_min_offset(
+        &self,
+        broker_addr: &str,
+        message_queue: &MessageQueue,
+        timeout_millis: u64,
+    ) -> crate::ClientResult<i64> {
+        let api_impl = self
+            .mq_client_api_impl
+            .load_full()
+            .ok_or(crate::ClientError::not_started())?;
+        api_impl
+            .clone()
+            .get_min_offset(broker_addr, message_queue, timeout_millis)
+            .await
+    }
+
+    pub async fn search_offset_by_timestamp(
+        &self,
+        broker_addr: &str,
+        message_queue: &MessageQueue,
+        timestamp: i64,
+        boundary_type: BoundaryType,
+        timeout_millis: u64,
+    ) -> crate::ClientResult<i64> {
+        let api_impl = self
+            .mq_client_api_impl
+            .load_full()
+            .ok_or(crate::ClientError::not_started())?;
+        api_impl
+            .clone()
+            .search_offset_by_timestamp(broker_addr, message_queue, timestamp, boundary_type, timeout_millis)
+            .await
+    }
+
+    pub async fn get_topic_config(
+        &self,
+        broker_addr: &CheetahString,
+        topic: CheetahString,
+        timeout_millis: u64,
+    ) -> crate::ClientResult<TopicConfig> {
+        let request_header = get_topic_config_request_header(topic);
+        let api_impl = self
+            .mq_client_api_impl
+            .load_full()
+            .ok_or(crate::ClientError::not_started())?;
+        let topic_mapping = api_impl
+            .get_topic_config(broker_addr, request_header, timeout_millis)
+            .await?;
+        Ok(topic_mapping.topic_config)
+    }
+
+    pub async fn get_subscription_group_config(
+        &self,
+        broker_addr: &CheetahString,
+        group: CheetahString,
+        timeout_millis: u64,
+    ) -> crate::ClientResult<SubscriptionGroupConfig> {
+        let api_impl = self
+            .mq_client_api_impl
+            .load_full()
+            .ok_or(crate::ClientError::not_started())?;
+        api_impl
+            .get_subscription_group_config(broker_addr, group, timeout_millis)
+            .await
+    }
+
+    pub async fn get_broker_cluster_info(&self, timeout_millis: u64) -> crate::ClientResult<ClusterInfo> {
+        let api_impl = self
+            .mq_client_api_impl
+            .load_full()
+            .ok_or(crate::ClientError::not_started())?;
+        api_impl.get_broker_cluster_info(timeout_millis).await
+    }
+
+    pub async fn get_user(
+        &self,
+        broker_addr: CheetahString,
+        username: CheetahString,
+        timeout_millis: u64,
+    ) -> crate::ClientResult<Option<UserInfo>> {
+        let api_impl = self
+            .mq_client_api_impl
+            .load_full()
+            .ok_or(crate::ClientError::not_started())?;
+        api_impl.get_user(broker_addr, username, timeout_millis).await
+    }
+
+    pub async fn get_acl(
+        &self,
+        broker_addr: CheetahString,
+        subject: CheetahString,
+        timeout_millis: u64,
+    ) -> crate::ClientResult<Option<AclInfo>> {
+        let api_impl = self
+            .mq_client_api_impl
+            .load_full()
+            .ok_or(crate::ClientError::not_started())?;
+        let acl_infos = api_impl
+            .list_acl(broker_addr, subject.clone(), CheetahString::default(), timeout_millis)
+            .await?;
+        Ok(acl_infos
+            .into_iter()
+            .find(|acl_info| acl_info.subject.as_ref() == Some(&subject)))
+    }
+
+    pub async fn get_broker_name_from_message_queue(&self, message_queue: &MessageQueue) -> CheetahString {
+        if let Some(broker_name) = self.topic_end_points_table.get(message_queue.topic_str()) {
+            if let Some(addr) = broker_name.value().get(message_queue) {
+                return addr.clone();
+            }
+        }
+        message_queue.broker_name().clone()
+    }
+
+    pub fn find_broker_address_in_publish(&self, broker_name: &CheetahString) -> Option<CheetahString> {
+        if broker_name.is_empty() {
+            return None;
+        }
+        let map = self.broker_addr_table.get(broker_name);
+        if let Some(map) = map {
+            return map.get(&(mix_all::MASTER_ID)).cloned();
+        }
+        None
+    }
+
+    pub async fn find_broker_address_in_admin(&self, broker_name: &CheetahString) -> Option<FindBrokerResult> {
+        if broker_name.is_empty() {
+            return None;
+        }
+
+        let map_ref = self.broker_addr_table.get(broker_name)?;
+        for (id, broker_addr) in map_ref.value() {
+            if broker_addr.is_empty() {
+                continue;
+            }
+            let broker_addr = broker_addr.clone();
+            let broker_version = self.find_broker_version(broker_name, broker_addr.as_str()).await;
+            return Some(FindBrokerResult {
+                broker_addr,
+                slave: *id != mix_all::MASTER_ID,
+                broker_version,
+            });
+        }
+        None
+    }
+
+    pub fn parse_offset_table_from_broker(
+        &self,
+        offset_table: HashMap<MessageQueue, i64>,
+        namespace: &str,
+    ) -> HashMap<MessageQueue, i64> {
+        if namespace.is_empty() {
+            return offset_table;
+        }
+
+        offset_table
+            .into_iter()
+            .map(|(mut queue, offset)| {
+                let topic = NamespaceUtil::without_namespace_with_namespace(queue.topic_str(), namespace);
+                queue.set_topic(CheetahString::from_string(topic));
+                (queue, offset)
+            })
+            .collect()
+    }
+
+    async fn send_heartbeat_to_all_broker_v2(&self, is_rebalance: bool) -> bool {
+        let heartbeat_data_with_sub = self.prepare_heartbeat_data(false).await;
+        let producer_empty = heartbeat_data_with_sub.producer_data_set.is_empty();
+        let consumer_empty = heartbeat_data_with_sub.consumer_data_set.is_empty();
+
+        if producer_empty && consumer_empty {
+            warn!(
+                "sendHeartbeatToAllBrokerV2 sending heartbeat, but no consumer and no producer. [{}]",
+                self.client_id
+            );
+            return false;
+        }
+
+        if self.broker_addr_table.is_empty() {
+            return false;
+        }
+
+        // Reset fingerprint map on rebalance
+        if is_rebalance {
+            self.reset_broker_addr_heartbeat_fingerprint_map().await;
+        }
+
+        // Compute fingerprint for current heartbeat
+        let current_fingerprint = heartbeat_data_with_sub.compute_heartbeat_fingerprint();
+
+        // Send to all brokers after releasing every route-table shard.
+        for (id, broker_name, addr) in self.broker_address_snapshot(consumer_empty) {
+            let mut heartbeat_data = heartbeat_data_with_sub.clone();
+            heartbeat_data.heartbeat_fingerprint = current_fingerprint;
+            self.send_heartbeat_to_broker_v2(id, &broker_name, &addr, heartbeat_data)
+                .await;
+        }
+
+        true
+    }
+
+    async fn reset_broker_addr_heartbeat_fingerprint_map(&self) {
+        self.broker_heartbeat_fingerprint_table.clear();
+    }
+
+    /// Send heartbeat to all brokers concurrently
+    async fn send_heartbeat_to_all_broker_concurrently(&self) -> bool {
+        let heartbeat_data = self.prepare_heartbeat_data(false).await;
+        let producer_empty = heartbeat_data.producer_data_set.is_empty();
+        let consumer_empty = heartbeat_data.consumer_data_set.is_empty();
+
+        if producer_empty && consumer_empty {
+            warn!(
+                "sending heartbeat concurrently, but no consumer and no producer. [{}]",
+                self.client_id
+            );
+            return false;
+        }
+
+        if self.broker_addr_table.is_empty() {
+            return false;
+        }
+        let broker_list = self.broker_address_snapshot(consumer_empty);
+
+        if broker_list.is_empty() {
+            return false;
+        }
+
+        let task_count = broker_list.len();
+
+        // Collect all heartbeat futures without spawning detached runtime tasks.
+        let mut tasks = Vec::new();
+        let Some(mq_client_api) = self.mq_client_api_impl.load_full() else {
+            warn!("send heartbeat concurrently skipped because mq_client_api_impl is None");
+            return false;
+        };
+        for (broker_id, broker_name, addr) in broker_list {
+            // Clone necessary data for the async task
+            let heartbeat_data = heartbeat_data.clone();
+            let _client_id = self.client_id.clone();
+            let mq_client_api = mq_client_api.clone();
+            let timeout = self.client_config.mq_client_api_timeout;
+            let send_heartbeat_times_total = self.send_heartbeat_times_total.clone();
+            let broker_addr_route_index = self.route_refresh_state.broker_addr_route_index.clone();
+
+            // Returns: (broker_name, addr, version, success)
+            let task = async move {
+                match mq_client_api.send_heartbeat(&addr, &heartbeat_data, timeout).await {
+                    Ok((version, _response)) => {
+                        let times = send_heartbeat_times_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if times % 20 == 0 {
+                            info!(
+                                "send heart beat to broker[{} {} {}] success (concurrent)",
+                                broker_name, broker_id, addr
+                            );
+                        }
+                        (broker_name, addr, Some(version), true)
+                    }
+                    Err(_) => {
+                        let is_in_ns = broker_addr_route_index.contains_key(addr.as_str());
+
+                        if is_in_ns {
+                            warn!(
+                                "send heart beat to broker[{} {} {}] failed (concurrent)",
+                                broker_name, broker_id, addr
+                            );
+                        } else {
+                            warn!(
+                                "send heart beat to broker[{} {} {}] exception, because the broker not up, forget it \
+                                 (concurrent)",
+                                broker_name, broker_id, addr
+                            );
+                        }
+                        (broker_name, addr, None, false)
+                    }
+                }
+            };
+
+            tasks.push(task);
+        }
+
+        // Wait for all tasks with timeout (3 seconds)
+        let concurrency = self.client_config.concurrent_heartbeat_thread_pool_size;
+        let results = match tokio::time::timeout(Duration::from_millis(3000), collect_bounded(tasks, concurrency)).await
+        {
+            Ok(results) => results,
+            Err(_) => {
+                warn!(
+                    "Concurrent heartbeat timeout after 3000ms for client [{}]",
+                    self.client_id
+                );
+                return false;
+            }
+        };
+
+        // Update broker version table after all tasks complete
+        // This avoids lock contention during task execution
+        let mut success_count = 0;
+
+        for (broker_name, addr, version_opt, success) in results {
+            if success {
+                success_count += 1;
+                if let Some(version) = version_opt {
+                    self.broker_version_table
+                        .entry(broker_name.clone())
+                        .or_default()
+                        .insert(addr, version);
+                }
+            }
+        }
+
+        info!(
+            "Concurrent heartbeat completed for client [{}]: {}/{} succeeded",
+            self.client_id, success_count, task_count
+        );
+
+        // Return true if at least one heartbeat succeeded
+        success_count > 0
+    }
+
+    async fn send_heartbeat_to_all_broker(&self) -> bool {
+        let heartbeat_data = self.prepare_heartbeat_data(false).await;
+        let producer_empty = heartbeat_data.producer_data_set.is_empty();
+        let consumer_empty = heartbeat_data.consumer_data_set.is_empty();
+        if producer_empty && consumer_empty {
+            warn!(
+                "sending heartbeat, but no consumer and no producer. [{}]",
+                self.client_id
+            );
+            return false;
+        }
+        if self.broker_addr_table.is_empty() {
+            return false;
+        }
+        for (id, broker_name, addr) in self.broker_address_snapshot(consumer_empty) {
+            self.send_heartbeat_to_broker_inner(id, &broker_name, &addr, &heartbeat_data)
+                .await;
+        }
+
+        true
+    }
+
+    pub async fn send_heartbeat_to_broker(
+        &self,
+        id: u64,
+        broker_name: &CheetahString,
+        addr: &CheetahString,
+        strict_lock_mode: bool,
+    ) -> bool {
+        let _guard = match self.lock_heartbeat.try_lock().ok() {
+            Some(g) => g,
+            None => {
+                if strict_lock_mode {
+                    warn!("lock heartBeat, but failed. [{}]", self.client_id);
+                }
+                return false;
+            }
+        };
+
+        let heartbeat_data = self.prepare_heartbeat_data(false).await;
+        let producer_empty = heartbeat_data.producer_data_set.is_empty();
+        let consumer_empty = heartbeat_data.consumer_data_set.is_empty();
+        if producer_empty && consumer_empty {
+            warn!(
+                "sending heartbeat, but no consumer and no producer. [{}]",
+                self.client_id
+            );
+            return false;
+        }
+
+        if self.client_config.use_heartbeat_v2 {
+            self.send_heartbeat_to_broker_v2(id, broker_name, addr, heartbeat_data)
+                .await
+        } else {
+            let (result, _) = self
+                .send_heartbeat_to_broker_inner(id, broker_name, addr, &heartbeat_data)
+                .await;
+            result
+        }
+    }
+
+    /// Send HeartbeatV2 to broker
+    async fn send_heartbeat_to_broker_v2(
+        &self,
+        id: u64,
+        broker_name: &CheetahString,
+        addr: &CheetahString,
+        mut heartbeat_data_with_sub: HeartbeatData,
+    ) -> bool {
+        // Calculate current fingerprint
+        let current_fingerprint = heartbeat_data_with_sub.compute_heartbeat_fingerprint();
+        heartbeat_data_with_sub.heartbeat_fingerprint = current_fingerprint;
+
+        // Check if this broker supports V2
+        let broker_support_v2 = self.broker_support_v2_heartbeat_set.contains_key(addr);
+
+        // Get last fingerprint for this broker
+        let last_fingerprint = self
+            .broker_heartbeat_fingerprint_table
+            .get(addr)
+            .map(|entry| *entry.value());
+
+        // Determine if we should send minimal heartbeat (without subscription)
+        let should_send_minimal = broker_support_v2 && last_fingerprint == Some(current_fingerprint);
+
+        let heartbeat_data = if should_send_minimal {
+            // Send minimal heartbeat without subscription data
+            let mut minimal = self.prepare_heartbeat_data(true).await;
+            minimal.heartbeat_fingerprint = current_fingerprint;
+            minimal
+        } else {
+            // Send full heartbeat with subscription data
+            heartbeat_data_with_sub.clone()
+        };
+
+        let Some(mq_client_api_impl) = self.mq_client_api_impl.load_full() else {
+            warn!(
+                "send heart beat to broker[{} {} {}] skipped because mq_client_api_impl is None",
+                broker_name, id, addr
+            );
+            return false;
+        };
+
+        match mq_client_api_impl
+            .send_heartbeat_v2(addr, &heartbeat_data, self.client_config.mq_client_api_timeout)
+            .await
+        {
+            Ok(result) => {
+                self.broker_version_table
+                    .entry(broker_name.clone())
+                    .or_default()
+                    .insert(addr.clone(), result.version());
+                let times = self
+                    .send_heartbeat_times_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if times % 20 == 0 {
+                    info!("send heart beat to broker[{} {} {}] success", broker_name, id, addr);
+                }
+                if !result.is_support_v2() {
+                    self.broker_support_v2_heartbeat_set.remove(addr);
+                    self.broker_heartbeat_fingerprint_table.remove(addr);
+                    warn!("Broker {} does not support HeartbeatV2, downgrading to V1", addr);
+                } else {
+                    self.broker_support_v2_heartbeat_set.insert(addr.clone(), ());
+                    if result.is_sub_change() {
+                        self.broker_heartbeat_fingerprint_table.remove(addr);
+                    } else if !should_send_minimal {
+                        self.broker_heartbeat_fingerprint_table
+                            .insert(addr.clone(), current_fingerprint);
+                    }
+                }
+                true
+            }
+            Err(_) => {
+                if self.is_broker_in_name_server(addr) {
+                    warn!("send heart beat to broker[{} {} {}] failed", broker_name, id, addr);
+                } else {
+                    warn!(
+                        "send heart beat to broker[{} {} {}] exception, because the broker not up, forget it",
+                        broker_name, id, addr
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    async fn send_heartbeat_to_broker_inner(
+        &self,
+        id: u64,
+        broker_name: &CheetahString,
+        addr: &CheetahString,
+        heartbeat_data: &HeartbeatData,
+    ) -> (bool, Option<bool>) {
+        let Some(mq_client_api_impl) = self.mq_client_api_impl.load_full() else {
+            warn!(
+                "send heart beat to broker[{} {} {}] skipped because mq_client_api_impl is None",
+                broker_name, id, addr
+            );
+            return (false, None);
+        };
+
+        match mq_client_api_impl
+            .send_heartbeat(addr, heartbeat_data, self.client_config.mq_client_api_timeout)
+            .await
+        {
+            Ok((version, response)) => {
+                self.broker_version_table
+                    .entry(broker_name.clone())
+                    .or_default()
+                    .insert(addr.clone(), version);
+
+                let times = self
+                    .send_heartbeat_times_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if times % 20 == 0 {
+                    info!("send heart beat to broker[{} {} {}] success", broker_name, id, addr);
+                }
+
+                // Check if broker supports HeartbeatV2
+                let support_v2 = response.and_then(|resp| {
+                    resp.ext_fields().and_then(|fields| {
+                        fields
+                            .get(rocketmq_model::common::mix_all::IS_SUPPORT_HEART_BEAT_V2)
+                            .and_then(|v| v.parse::<bool>().ok())
+                    })
+                });
+
+                (true, support_v2)
+            }
+            Err(_) => {
+                if self.is_broker_in_name_server(addr) {
+                    warn!("send heart beat to broker[{} {} {}] failed", broker_name, id, addr);
+                } else {
+                    warn!(
+                        "send heart beat to broker[{} {} {}] exception, because the broker not up, forget it",
+                        broker_name, id, addr
+                    );
+                }
+                (false, None)
+            }
+        }
+    }
+
+    fn is_broker_in_name_server(&self, broker_name: &str) -> bool {
+        self.is_broker_addr_in_route_index(broker_name)
+    }
+
+    async fn prepare_heartbeat_data(&self, is_without_sub: bool) -> HeartbeatData {
+        self.prune_dead_producers();
+        let mut heartbeat_data = HeartbeatData {
+            client_id: self.client_id.clone(),
+            ..Default::default()
+        };
+
+        for entry in self.consumer_table.iter() {
+            let subscription_data_set = if is_without_sub {
+                HashSet::new()
+            } else {
+                entry.value().subscriptions()
+            };
+            let consumer_data = ConsumerData {
+                group_name: entry.value().group_name(),
+                consume_type: entry.value().consume_type(),
+                message_model: entry.value().message_model(),
+                consume_from_where: entry.value().consume_from_where(),
+                subscription_data_set,
+                unit_mode: entry.value().is_unit_mode(),
+            };
+            heartbeat_data.consumer_data_set.insert(consumer_data);
+        }
+        for entry in self.producer_table.iter() {
+            let producer_data = ProducerData {
+                group_name: entry.key().clone(),
+            };
+            heartbeat_data.producer_data_set.insert(producer_data);
+        }
+        heartbeat_data.is_without_sub = is_without_sub;
+        heartbeat_data
+    }
+
+    fn consumer_snapshot(&self) -> Vec<(CheetahString, MQConsumerInnerImpl)> {
+        self.consumer_table
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
+    }
+
+    /// Returns an owned, deterministically ordered snapshot of registered producer groups.
+    pub fn registered_producer_groups(&self) -> Vec<CheetahString> {
+        let mut groups = self
+            .producer_table
+            .iter()
+            .filter(|entry| entry.value().is_alive())
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        groups.sort_unstable();
+        groups
+    }
+
+    /// Returns an owned, deterministically ordered snapshot of registered consumer groups.
+    pub fn registered_consumer_groups(&self) -> Vec<CheetahString> {
+        let mut groups = self
+            .consumer_table
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        groups.sort_unstable();
+        groups
+    }
+
+    /// Returns an owned, deterministically ordered snapshot of registered admin groups.
+    pub fn registered_admin_groups(&self) -> Vec<CheetahString> {
+        let mut groups = self
+            .admin_ext_table
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        groups.sort_unstable();
+        groups
+    }
+
+    /// Returns an owned, weakly consistent snapshot of topic route data.
+    ///
+    /// Concurrent per-topic refreshes may be observed independently; the snapshot does not retain
+    /// any table guards.
+    pub fn topic_route_snapshot(&self) -> HashMap<CheetahString, TopicRouteData> {
+        self.topic_route_table
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
+    }
+
+    /// Returns an owned, weakly consistent snapshot of broker addresses keyed by broker name and
+    /// broker id. Concurrent per-broker refreshes may be observed independently.
+    pub fn broker_addr_snapshot(&self) -> HashMap<CheetahString, HashMap<u64, CheetahString>> {
+        self.broker_addr_table
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
+    }
+
+    fn broker_address_snapshot(&self, master_only: bool) -> Vec<(u64, CheetahString, CheetahString)> {
+        self.broker_addr_table
+            .iter()
+            .flat_map(|entry| {
+                let broker_name = entry.key().clone();
+                entry
+                    .value()
+                    .iter()
+                    .filter(move |(id, addr)| !addr.is_empty() && (!master_only || **id == mix_all::MASTER_ID))
+                    .map(move |(id, addr)| (*id, broker_name.clone(), addr.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    pub async fn register_consumer(&self, group: &CheetahString, consumer: MQConsumerInnerImpl) -> bool {
+        // Custom fork: concurrent registrations must never replace a live callback owner.
+        match self.consumer_table.entry(group.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(consumer);
+                true
+            }
+            Entry::Occupied(_) => {
+                warn!("the consumer group[{}] exist already.", group);
+                false
+            }
+        }
+    }
+
+    pub async fn check_client_in_broker(&self) -> crate::ClientResult<()> {
+        for (consumer_group, consumer) in self.consumer_snapshot() {
+            let subscription_inner = consumer.subscriptions();
+            if subscription_inner.is_empty() {
+                // Custom fork: check every group; an empty assignment must not
+                // bypass another group's SQL validation (also a Java 4.6.1 bug).
+                continue;
+            }
+            for subscription_data in subscription_inner.iter() {
+                self.check_subscription_in_broker(&consumer_group, subscription_data)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate a single proposed subscription before publishing a runtime change.
+    pub async fn check_subscription_in_broker(
+        &self,
+        group: &CheetahString,
+        subscription: &SubscriptionData,
+    ) -> ClientResult<()> {
+        if ExpressionType::is_tag_type(Some(subscription.expression_type.as_str())) {
+            return Ok(());
+        }
+        if self
+            .find_broker_addr_by_topic(subscription.topic.as_str())
+            .await
+            .is_none()
+        {
+            self.refresh_topic_route_data(&subscription.topic).await?;
+        }
+        let address = self
+            .find_broker_addr_by_topic(subscription.topic.as_str())
+            .await
+            .ok_or_else(|| crate::ClientError::route_not_found(subscription.topic.as_str()))?;
+        self.mq_client_api_impl
+            .load_full()
+            .ok_or_else(crate::ClientError::not_started)?
+            .check_client_in_broker(
+                &address,
+                group.as_str(),
+                self.client_id.as_str(),
+                subscription,
+                self.client_config.mq_client_api_timeout,
+            )
+            .await
+    }
+
+    pub async fn do_rebalance(&self) -> ClientResult<bool> {
+        let mut balanced = true;
+        for (consumer_group, consumer) in self.consumer_snapshot() {
+            match consumer.try_rebalance().await {
+                Ok(result) => {
+                    if !result {
+                        balanced = false;
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "doRebalance for consumer group [{}] exception:{}",
+                        consumer_group,
+                        e.to_string()
+                    );
+                    balanced = false;
+                }
+            }
+        }
+        Ok(balanced)
+    }
+
+    pub fn rebalance_later(&self, delay_millis: u64) {
+        schedule_rebalance_wakeup(
+            &self.service_context,
+            self.rebalance_service.clone(),
+            Duration::from_millis(delay_millis),
+            &self.rebalance_delay_tasks,
+            &self.rebalance_delay_shutdown,
+        );
+    }
+
+    pub async fn find_broker_address_in_subscribe(
+        &self,
+        broker_name: &CheetahString,
+        broker_id: u64,
+        only_this_broker: bool,
+    ) -> Option<FindBrokerResult> {
+        if broker_name.is_empty() {
+            return None;
+        }
+
+        let mut broker_addr: Option<CheetahString> = None;
+        let mut slave = false;
+        let mut found = false;
+
+        if let Some(map_ref) = self.broker_addr_table.get(broker_name) {
+            let map = map_ref.value();
+            if let Some(addr) = map.get(&broker_id) {
+                broker_addr = Some(addr.clone());
+                slave = broker_id != mix_all::MASTER_ID;
+                found = true;
+            } else if !found && broker_id != mix_all::MASTER_ID {
+                if let Some(addr) = map.get(&(broker_id + 1)) {
+                    broker_addr = Some(addr.clone());
+                    found = true;
+                }
+            }
+            if !found && !only_this_broker {
+                if let Some((key, value)) = map.iter().next() {
+                    broker_addr = Some(value.clone());
+                    slave = *key != mix_all::MASTER_ID;
+                    found = !value.is_empty();
+                }
+            }
+        }
+
+        if found {
+            let broker_addr = broker_addr?;
+            let broker_version = self.find_broker_version(broker_name, broker_addr.as_str()).await;
+            Some(FindBrokerResult {
+                broker_addr,
+                slave,
+                broker_version,
+            })
+        } else {
+            None
+        }
+    }
+    pub async fn find_broker_version(&self, broker_name: &str, broker_addr: &str) -> i32 {
+        if let Some(map) = self.broker_version_table.get(broker_name) {
+            if let Some(version) = map.value().get(broker_addr) {
+                return *version;
+            }
+        }
+        0
+    }
+
+    pub async fn select_consumer(&self, group: &str) -> Option<MQConsumerInnerImpl> {
+        self.consumer_table.get(group).map(|entry| entry.value().clone())
+    }
+
+    pub async fn reset_offset(
+        &self,
+        topic: &CheetahString,
+        group: &CheetahString,
+        offset_table: HashMap<MessageQueue, i64>,
+    ) -> bool {
+        let Some(consumer) = self.select_consumer(group).await else {
+            warn!("reset offset failed because consumer group does not exist. group={group}, topic={topic}");
+            return false;
+        };
+
+        // Custom fork: the fixed Java callback ignores actively consumed clients.
+        if !consumer.is_push_consumer() {
+            return false;
+        }
+        consumer.reset_offsets(topic, offset_table).await;
+        true
+    }
+
+    pub async fn get_consumer_status(
+        &self,
+        topic: &CheetahString,
+        group: &CheetahString,
+    ) -> Option<HashMap<MessageQueue, i64>> {
+        let Some(consumer) = self.select_consumer(group).await else {
+            warn!("get consumer status failed because consumer group does not exist. group={group}, topic={topic}");
+            return None;
+        };
+
+        if !consumer.supports_legacy_status() {
+            return Some(HashMap::new());
+        }
+        Some(consumer.consumer_status(topic).await)
+    }
+
+    pub async fn consumer_running_info(&self, consumer_group: &CheetahString) -> Option<ConsumerRunningInfo> {
+        let Some(consumer) = self.select_consumer(consumer_group).await else {
+            warn!("get consumer running info failed because consumer group does not exist. group={consumer_group}");
+            return None;
+        };
+
+        let mut info = consumer.consumer_running_info().await;
+        // Custom fork: report the current discovered transport addresses.
+        let addresses = self
+            .get_mq_client_api_impl()
+            .map(|api| api.get_name_server_address_list())
+            .unwrap_or_default();
+        let namesrv_addr = addresses
+            .iter()
+            .map(|address| format!("{address};"))
+            .collect::<String>();
+
+        info.set_property(ConsumerRunningInfo::PROP_NAMESERVER_ADDR, namesrv_addr);
+        info.set_property(
+            ConsumerRunningInfo::PROP_CONSUME_TYPE,
+            match consumer.consume_type() {
+                rocketmq_protocol::protocol::heartbeat::consume_type::ConsumeType::ConsumeActively => {
+                    "CONSUME_ACTIVELY"
+                }
+                rocketmq_protocol::protocol::heartbeat::consume_type::ConsumeType::ConsumePassively => {
+                    "CONSUME_PASSIVELY"
+                }
+                rocketmq_protocol::protocol::heartbeat::consume_type::ConsumeType::ConsumePop => "CONSUME_POP",
+            },
+        );
+        info.set_property(ConsumerRunningInfo::PROP_CLIENT_VERSION, CURRENT_VERSION.name());
+        info.sync_derived_fields_from_properties();
+
+        Some(info)
+    }
+
+    pub(crate) async fn native_task_diagnostics(&self, group: &str) -> Option<String> {
+        let consumer = self.select_consumer(group).await?;
+        let value = serde_json::json!({
+            "schema": "rocketmq.client-tasks.v1",
+            "factory": self.service_context.task_group().diagnostics_task_details(1024,64),
+            "consumer": consumer.native_task_details(),
+            "stackScope": "current request processor thread; arbitrary suspended Tokio task stacks are unavailable",
+        });
+        Some(value.to_string())
+    }
+
+    pub async fn select_producer(&self, group: &str) -> Option<MQProducerInnerImpl> {
+        let producer = self.producer_table.get(group).map(|entry| entry.value().clone())?;
+        if producer.is_alive() {
+            return Some(producer);
+        }
+
+        self.producer_table.remove_if(group, |_, current| !current.is_alive());
+        None
+    }
+
+    pub async fn unregister_consumer(&self, group: impl Into<CheetahString>) -> bool {
+        let group = group.into();
+        if group.is_empty() {
+            warn!("unregister_consumer: group name is empty");
+            return false;
+        }
+
+        let removed = self.consumer_table.remove(&group).is_some();
+
+        if removed {
+            info!("unregister consumer [{}] OK", group);
+            self.unregister_client(None, Some(group)).await;
+            true
+        } else {
+            warn!("unregister consumer [{}] failed: not found in consumer table", group);
+            false
+        }
+    }
+
+    /// Removes the current producer registration unconditionally by group.
+    ///
+    /// Producer lifecycle cleanup should use `Self::unregister_producer_if_owner`
+    /// so a delayed cleanup cannot remove a replacement producer.
+    pub async fn unregister_producer(&self, group: impl Into<CheetahString>) -> bool {
+        let group = group.into();
+        if group.is_empty() {
+            warn!("unregister_producer: group name is empty");
+            return false;
+        }
+
+        // Keep replacement registration behind the corresponding broker
+        // unregister notification. Otherwise a new owner could enter the table
+        // after removal and then be invalidated by the old owner's late RPC.
+        let _transition = self.producer_registry_transition.lock().await;
+        let removed = self.producer_table.remove(&group).is_some();
+
+        if removed {
+            info!("unregister producer [{}] OK", group);
+            self.unregister_client(Some(group), None).await;
+            true
+        } else {
+            warn!("unregister producer [{}] failed: not found in producer table", group);
+            false
+        }
+    }
+
+    /// Removes a producer only while the group still belongs to `expected_owner`.
+    pub(crate) async fn unregister_producer_if_owner(
+        &self,
+        group: impl Into<CheetahString>,
+        expected_owner: &MQProducerInnerImpl,
+    ) -> bool {
+        let group = group.into();
+        if group.is_empty() {
+            warn!("unregister_producer_if_owner: group name is empty");
+            return false;
+        }
+
+        // Serialize the table identity check, removal, and broker notification
+        // with replacement registration. This closes the post-remove/pre-RPC
+        // window while retaining owner-aware protection for late cleanup.
+        let _transition = self.producer_registry_transition.lock().await;
+        let removed = self
+            .producer_table
+            .remove_if(&group, |_, current| current.points_to_same_producer(expected_owner))
+            .is_some();
+
+        if removed {
+            info!("unregister producer [{}] for expected owner OK", group);
+            self.unregister_client(Some(group), None).await;
+            true
+        } else {
+            warn!(
+                "unregister producer [{}] for expected owner skipped: not found or owner changed",
+                group
+            );
+            false
+        }
+    }
+
+    pub async fn unregister_admin_ext(&self, group: impl Into<CheetahString>) {
+        self.unregister_admin_ext_owned(group.into().as_str(), 0);
+    }
+    async fn unregister_client(&self, producer_group: Option<CheetahString>, consumer_group: Option<CheetahString>) {
+        let Some(mq_client_api_impl) = self.mq_client_api_impl.load_full() else {
+            warn!(
+                "unregister client[Producer: {:?} Consumer: {:?}] skipped because mq_client_api_impl is None",
+                producer_group, consumer_group
+            );
+            return;
+        };
+        for (id, broker_name, addr) in self.broker_address_snapshot(false) {
+            if let Err(err) = mq_client_api_impl
+                .unregister_client(
+                    &addr,
+                    self.client_id.clone(),
+                    producer_group.clone(),
+                    consumer_group.clone(),
+                    self.client_config.mq_client_api_timeout,
+                )
+                .await
+            {
+                warn!(
+                    "unregister client[Producer: {:?} Consumer: {:?}] from broker[{} {} {}] failed: {}",
+                    producer_group, consumer_group, broker_name, id, addr, err
+                );
+            } else {
+                info!(
+                    "unregister client[Producer: {:?} Consumer: {:?}] from broker[{} {} {}] success",
+                    producer_group, consumer_group, broker_name, id, addr,
+                );
+            }
+        }
+    }
+
+    /// Performs one broker assignment query under an existing absolute deadline.
+    ///
+    /// Route selection and the broker request are a single attempt. A missing route is returned
+    /// as [`RetryInput::RouteUnavailable`] so the caller's retry policy remains the sole owner of
+    /// refresh and retry decisions.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - A reference to a `CheetahString` representing the topic to query.
+    /// * `consumer_group` - A reference to a `CheetahString` representing the consumer group.
+    /// * `strategy_name` - A reference to a `CheetahString` representing the allocation strategy
+    ///   name.
+    /// * `message_model` - The message model to use for the query.
+    /// * `deadline` - The absolute operation deadline shared by every attempt.
+    ///
+    /// # Returns
+    ///
+    /// The decoded assignment, or the typed input describing why this attempt did not complete.
+    pub(crate) async fn query_assignment(
+        &self,
+        topic: &CheetahString,
+        consumer_group: &CheetahString,
+        strategy_name: &CheetahString,
+        message_model: MessageModel,
+        deadline: RequestDeadline,
+    ) -> Result<Option<HashSet<MessageQueueAssignment>>, RetryInput> {
+        let broker_addr = self.find_broker_addr_by_topic(topic).await;
+        if let Some(broker_addr) = broker_addr {
+            let client_id = self.client_id.clone();
+            match self.mq_client_api_impl.load_full() {
+                Some(api_impl) => {
+                    api_impl
+                        .query_assignment(
+                            &broker_addr,
+                            topic.clone(),
+                            consumer_group.clone(),
+                            client_id,
+                            strategy_name.clone(),
+                            message_model,
+                            deadline,
+                        )
+                        .await
+                }
+                None => Err(RetryInput::BusinessError(mq_client_err!("mq_client_api_impl is None"))),
+            }
+        } else {
+            Err(RetryInput::RouteUnavailable)
+        }
+    }
+
+    pub async fn consume_message_directly(
+        &self,
+        message: MessageExt,
+        consumer_group: &CheetahString,
+        broker_name: Option<CheetahString>,
+    ) -> Option<ConsumeMessageDirectlyResult> {
+        let consumer = self
+            .consumer_table
+            .get(consumer_group)
+            .map(|entry| entry.value().clone());
+        if let Some(consumer) = consumer {
+            return consumer.consume_message_directly(message, broker_name).await;
+        }
+
+        None
+    }
+}
+
+fn new_probe_client_instance(
+    client_runtime: &Arc<ClientRuntime>,
+    client_config: ClientConfig,
+    scope: &'static str,
+) -> Arc<MQClientInstance> {
+    MQClientInstance::new_arc(
+        client_config,
+        0,
+        scope,
+        None,
+        client_runtime.component(scope),
+        client_runtime.telemetry_handle().clone(),
+        client_runtime.pool().request_future_holder(),
+    )
+}
+
+fn route_refresh_probe_topics(topic_count: usize) -> Vec<CheetahString> {
+    (0..topic_count)
+        .map(|index| CheetahString::from_string(format!("route-refresh-topic-{index:04}")))
+        .collect()
+}
+
+#[doc(hidden)]
+pub fn run_route_refresh_shard_probe(client_runtime: Arc<ClientRuntime>, topic_count: usize) -> RouteRefreshShardProbe {
+    let client_config = ClientConfig {
+        namesrv_addr: None,
+        ..Default::default()
+    };
+    let instance = new_probe_client_instance(&client_runtime, client_config, "route-refresh-shard-probe");
+    let topics = route_refresh_probe_topics(topic_count);
+    let started = Instant::now();
+    let (selected, skipped_topics) = instance.select_periodic_route_refresh_batch(&topics);
+    let elapsed_us = started.elapsed().as_micros();
+    let peak_topic_reduction_percent = if topic_count == 0 {
+        0.0
+    } else {
+        ((topic_count - selected.len()) as f64 / topic_count as f64) * 100.0
+    };
+
+    RouteRefreshShardProbe {
+        topic_count,
+        batch_size: ROUTE_REFRESH_MAX_TOPICS_PER_ROUND,
+        selected_topics: selected.len(),
+        skipped_topics,
+        peak_topic_reduction_percent,
+        elapsed_us,
+    }
+}
+
+#[doc(hidden)]
+pub async fn run_route_refresh_concurrent_stale_guard_probe(
+    client_runtime: Arc<ClientRuntime>,
+) -> RouteRefreshConcurrentProbe {
+    let client_config = ClientConfig {
+        namesrv_addr: None,
+        ..Default::default()
+    };
+    let instance = new_probe_client_instance(&client_runtime, client_config, "route-refresh-concurrent-probe");
+    let topic = CheetahString::from_static_str("route-refresh-concurrent-topic");
+    let current_route = TopicRouteData {
+        order_topic_conf: Some(CheetahString::from_static_str("broker-new:1")),
+        ..Default::default()
+    };
+    instance.topic_route_table.insert(topic.clone(), current_route);
+    instance.route_refresh_state.versions.insert(topic.clone(), 1);
+
+    let mut stale_route = TopicRouteData {
+        order_topic_conf: Some(CheetahString::from_static_str("broker-stale:1")),
+        ..Default::default()
+    };
+    let outcome = instance
+        .apply_topic_route_data_if_fresh(&topic, &mut stale_route, 0)
+        .await;
+
+    let final_order_topic_conf = instance
+        .topic_route_table
+        .get(&topic)
+        .and_then(|entry| entry.value().order_topic_conf.clone());
+    let route_version = instance.topic_route_version(&topic);
+    let stale_skipped = matches!(outcome, TopicRouteApplyOutcome::Stale);
+    let kept_current_route = final_order_topic_conf
+        .as_ref()
+        .is_some_and(|value| value.as_str() == "broker-new:1");
+
+    RouteRefreshConcurrentProbe {
+        healthy: stale_skipped && kept_current_route && route_version == 1,
+        stale_skipped,
+        final_order_topic_conf,
+        route_version,
+    }
+}
+
+#[doc(hidden)]
+pub fn run_heartbeat_route_index_probe(
+    client_runtime: Arc<ClientRuntime>,
+    topic_count: usize,
+    broker_count: usize,
+    lookup_count: usize,
+) -> HeartbeatRouteIndexProbe {
+    let client_config = ClientConfig {
+        namesrv_addr: None,
+        ..Default::default()
+    };
+    let instance = new_probe_client_instance(&client_runtime, client_config, "heartbeat-route-index-probe");
+    let broker_count = broker_count.max(1);
+
+    for topic_index in 0..topic_count {
+        let topic = CheetahString::from_string(format!("heartbeat-route-topic-{topic_index:04}"));
+        let broker_index = topic_index % broker_count;
+        let broker_name = CheetahString::from_string(format!("broker-{broker_index:04}"));
+        let broker_addr = CheetahString::from_string(format!(
+            "127.{}.{}.{}:10911",
+            broker_index / 65_536,
+            (broker_index / 256) % 256,
+            broker_index % 256
+        ));
+        let mut broker_addrs = HashMap::new();
+        broker_addrs.insert(mix_all::MASTER_ID, broker_addr);
+        let route = TopicRouteData {
+            broker_datas: vec![BrokerData::new(
+                CheetahString::from_static_str("heartbeat-route-cluster"),
+                broker_name,
+                broker_addrs,
+                None,
+            )],
+            ..Default::default()
+        };
+
+        instance.topic_route_table.insert(topic, route.clone());
+        instance
+            .route_update_coordinator
+            .update_broker_route_index(None, &route);
+    }
+
+    let lookup_addrs = (0..lookup_count)
+        .map(|index| {
+            if index.is_multiple_of(2) {
+                CheetahString::from_string(format!("198.51.100.{}:10911", index % 256))
+            } else {
+                let broker_index = (broker_count - 1).saturating_sub(index % broker_count);
+                CheetahString::from_string(format!(
+                    "127.{}.{}.{}:10911",
+                    broker_index / 65_536,
+                    (broker_index / 256) % 256,
+                    broker_index % 256
+                ))
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let scan_started = Instant::now();
+    let scan_found_count = lookup_addrs
+        .iter()
+        .filter(|addr| instance.scan_broker_addr_in_topic_route_table(addr.as_str()))
+        .count();
+    let scan_elapsed_us = scan_started.elapsed().as_micros();
+
+    let index_started = Instant::now();
+    let index_found_count = lookup_addrs
+        .iter()
+        .filter(|addr| instance.is_broker_addr_in_route_index(addr.as_str()))
+        .count();
+    let index_elapsed_us = index_started.elapsed().as_micros();
+
+    let improvement_percent = if scan_elapsed_us == 0 {
+        0.0
+    } else {
+        ((scan_elapsed_us.saturating_sub(index_elapsed_us)) as f64 / scan_elapsed_us as f64) * 100.0
+    };
+
+    HeartbeatRouteIndexProbe {
+        topic_count,
+        broker_count,
+        lookup_count,
+        scan_elapsed_us,
+        index_elapsed_us,
+        improvement_percent,
+        scan_found_count,
+        index_found_count,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::error_assertions::assert_invalid_state;
+    use crate::test_support::error_assertions::client_exception;
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use crate::ClientError;
+    use futures::FutureExt;
+    use rocketmq_protocol::code::request_code::RequestCode;
+    use rocketmq_protocol::code::response_code::ResponseCode;
+    use rocketmq_protocol::protocol::header::client_request_header::GetRouteInfoRequestHeader;
+    use rocketmq_protocol::protocol::heartbeat::subscription_data::SubscriptionData;
+    use rocketmq_protocol::protocol::route::route_data_view::BrokerData;
+    use rocketmq_protocol::protocol::route::route_data_view::QueueData;
+    use rocketmq_protocol::protocol::RemotingSerializable;
+    use rocketmq_protocol::RemotingCommand;
+    use rocketmq_runtime::RuntimeContext;
+    use rocketmq_runtime::ShutdownDeadline;
+    use rocketmq_transport::api::AdmissionController;
+    use rocketmq_transport::api::AdmissionLimits;
+    use rocketmq_transport::test_support::SessionProcessor;
+    use rocketmq_transport::test_support::SessionTransportServer;
+    use rocketmq_transport::test_support::SessionTransportServerConfig;
+
+    use super::*;
+    use crate::consumer::consumer_impl::default_mq_push_consumer_impl::DefaultMQPushConsumerImpl;
+    use crate::consumer::default_mq_push_consumer::ConsumerConfig;
+    use crate::consumer::mq_consumer_inner::MQConsumerInnerImpl;
+    use crate::producer::producer_impl::default_mq_producer_impl::DefaultMQProducerImpl;
+    use crate::producer::producer_impl::mq_producer_inner::MQProducerInner;
+
+    #[derive(Default)]
+    struct RoutePreparationProcessor {
+        responses: Mutex<VecDeque<RemotingCommand>>,
+        topics: Mutex<Vec<CheetahString>>,
+    }
+
+    impl RoutePreparationProcessor {
+        fn push(&self, response: RemotingCommand) {
+            self.responses
+                .lock()
+                .expect("route preparation responses")
+                .push_back(response);
+        }
+
+        fn topics(&self) -> Vec<CheetahString> {
+            self.topics.lock().expect("route preparation topics").clone()
+        }
+    }
+
+    impl SessionProcessor for RoutePreparationProcessor {
+        fn process(
+            &self,
+            request: RemotingCommand,
+        ) -> Pin<Box<dyn Future<Output = Result<RemotingCommand, rocketmq_error::SharedError>> + Send + '_>> {
+            Box::pin(async move {
+                if request.code() != RequestCode::GetRouteinfoByTopic.to_i32() {
+                    return Err(
+                        ClientError::illegal_argument(format!("unexpected request code {}", request.code())).into(),
+                    );
+                }
+                let header = request.decode_command_custom_header::<GetRouteInfoRequestHeader>()?;
+                self.topics.lock().expect("route preparation topics").push(header.topic);
+                let response = self
+                    .responses
+                    .lock()
+                    .expect("route preparation responses")
+                    .pop_front()
+                    .ok_or_else(|| ClientError::illegal_argument("unexpected route preparation request"))?;
+                Ok(response.set_opaque(request.opaque()))
+            })
+        }
+    }
+
+    fn test_instance(client_config: ClientConfig, client_id: &'static str) -> Arc<MQClientInstance> {
+        let runtime = crate::runtime::test_client_runtime("mq-client-instance-test");
+        MQClientInstance::new_arc(
+            client_config,
+            0,
+            client_id,
+            None,
+            runtime.component(client_id),
+            runtime.telemetry_handle().clone(),
+            runtime.pool().request_future_holder(),
+        )
+    }
+
+    fn default_topic_route_response(write_queues: u32) -> RemotingCommand {
+        let broker_name = CheetahString::from_static_str("broker-a");
+        let route = TopicRouteData {
+            queue_datas: vec![QueueData::new(
+                broker_name.clone(),
+                write_queues,
+                write_queues,
+                PermName::PERM_READ | PermName::PERM_WRITE,
+                0,
+            )],
+            broker_datas: vec![BrokerData::new(
+                CheetahString::from_static_str("cluster-a"),
+                broker_name,
+                [(mix_all::MASTER_ID, CheetahString::from_static_str("127.0.0.1:10911"))]
+                    .into_iter()
+                    .collect(),
+                None,
+            )],
+            ..Default::default()
+        };
+        RemotingCommand::create_success_response_command().set_body(route.encode().expect("encode default-topic route"))
+    }
+
+    #[tokio::test]
+    async fn producer_initial_route_preparation_uses_one_conditional_default_lookup() {
+        let server_runtime = RuntimeContext::from_current("producer-route-preparation-test");
+        let processor = Arc::new(RoutePreparationProcessor::default());
+        let server = SessionTransportServer::bind(
+            server_runtime.service_context("route-preparation-server"),
+            SessionTransportServerConfig::loopback(),
+            Arc::clone(&processor) as Arc<dyn SessionProcessor>,
+            Arc::new(AdmissionController::new(AdmissionLimits::default())),
+        )
+        .await
+        .expect("bind route preparation server");
+        let name_server_addr = CheetahString::from_string(server.local_addr().to_string());
+        server.start().expect("start route preparation server");
+        processor.push(RemotingCommand::create_response_command_with_code(
+            ResponseCode::TopicNotExist,
+        ));
+        processor.push(default_topic_route_response(8));
+
+        let client_runtime = crate::runtime::test_client_runtime("producer-route-preparation-test");
+        let mut client_config = ClientConfig::default();
+        client_config.set_vip_channel_enabled(false);
+        let instance = MQClientInstance::new_arc(
+            client_config,
+            0,
+            "producer-route-preparation-client",
+            None,
+            client_runtime.component("instance"),
+            client_runtime.telemetry_handle().clone(),
+            client_runtime.pool().request_future_holder(),
+        );
+        let api = instance.get_mq_client_api_impl().expect("client API");
+        api.update_name_server_address_list_sync(name_server_addr.as_str());
+        api.start().await.expect("start route preparation transport");
+        let topic = CheetahString::from_static_str("requested-topic");
+        let producer_config = ProducerConfig::default();
+        let deadline = RequestDeadline::from_timeout_millis(2_000);
+
+        let publish_info = instance
+            .prepare_topic_publish_info_once(&topic, &producer_config, deadline)
+            .await
+            .expect("route preparation should stay within the parent attempt")
+            .expect("default route should supply publish information");
+        assert_eq!(
+            publish_info.message_queue_list.len(),
+            4,
+            "configured queue cap is retained"
+        );
+        assert_eq!(
+            processor.topics(),
+            vec![
+                topic.clone(),
+                CheetahString::from_static_str(TopicValidator::AUTO_CREATE_TOPIC_KEY_TOPIC),
+            ],
+            "actual-topic absence alone authorizes one default-topic lookup"
+        );
+
+        processor.push(RemotingCommand::create_response_command_with_code_remark(
+            ResponseCode::SystemError,
+            "operational-route-failure",
+        ));
+        let failed_topic = CheetahString::from_static_str("failed-topic");
+        let error = match instance
+            .prepare_topic_publish_info_once(&failed_topic, &producer_config, deadline)
+            .await
+        {
+            Ok(_) => panic!("a real route failure must not fall back to the default topic"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RetryInput::Response {
+                code,
+                ..
+            } if code == ResponseCode::SystemError.to_i32()
+        ));
+        assert_eq!(
+            processor.topics(),
+            vec![
+                topic,
+                CheetahString::from_static_str(TopicValidator::AUTO_CREATE_TOPIC_KEY_TOPIC),
+                failed_topic,
+            ]
+        );
+
+        instance.shutdown().await;
+        client_runtime
+            .shutdown()
+            .await
+            .assert_no_task_leak()
+            .expect("client runtime tasks drained");
+        server
+            .shutdown_until(ShutdownDeadline::after(Duration::from_secs(5)))
+            .await
+            .assert_no_task_leak()
+            .expect("route preparation server tasks drained");
+        server_runtime
+            .shutdown_tasks(Duration::from_secs(5))
+            .await
+            .assert_no_task_leak()
+            .expect("route preparation runtime tasks drained");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_consumer_registration_preserves_one_callback_owner() {
+        let instance = test_instance(ClientConfig::default(), "consumer-registration-race");
+        let group = CheetahString::from_static_str("same-group");
+        let consumer = Arc::new(DefaultMQPushConsumerImpl::new(
+            crate::runtime::test_client_runtime("registration-consumer"),
+            ClientConfig::default(),
+            ConsumerConfig {
+                consumer_group: group.clone(),
+                ..Default::default()
+            },
+            None,
+        ));
+        let consumer = MQConsumerInnerImpl::from_push(consumer);
+        let barrier = Arc::new(tokio::sync::Barrier::new(32));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let instance = instance.clone();
+            let consumer = consumer.clone();
+            let group = group.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                instance.register_consumer(&group, consumer).await
+            });
+        }
+        let mut admitted = 0;
+        while let Some(result) = tasks.join_next().await {
+            admitted += usize::from(result.unwrap());
+        }
+        assert_eq!(admitted, 1);
+        assert_eq!(instance.consumer_table.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_without_subscriptions_omits_only_subscription_payloads() {
+        let instance = test_instance(ClientConfig::default(), "heartbeat-without-subscriptions");
+        let consumer_group = CheetahString::from_static_str("heartbeat-consumer");
+        let consumer = Arc::new(DefaultMQPushConsumerImpl::new(
+            crate::runtime::test_client_runtime("heartbeat-consumer-test"),
+            ClientConfig::default(),
+            ConsumerConfig {
+                consumer_group: consumer_group.clone(),
+                ..Default::default()
+            },
+            None,
+        ));
+        consumer.initialize_self_reference();
+        for topic in ["topic-a", "topic-b"] {
+            consumer.rebalance_impl.put_subscription_data(
+                topic.into(),
+                SubscriptionData {
+                    topic: topic.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(
+            instance
+                .register_consumer(&consumer_group, MQConsumerInnerImpl::from_push(consumer))
+                .await
+        );
+
+        let full = instance.prepare_heartbeat_data(false).await;
+        let minimal = instance.prepare_heartbeat_data(true).await;
+        let full_consumer = full.consumer_data_set.iter().next().expect("full consumer data");
+        let minimal_consumer = minimal.consumer_data_set.iter().next().expect("minimal consumer data");
+
+        assert!(!full.is_without_sub);
+        assert!(minimal.is_without_sub);
+        assert_eq!(full_consumer.subscription_data_set.len(), 2);
+        assert!(minimal_consumer.subscription_data_set.is_empty());
+        assert_eq!(minimal_consumer.group_name, full_consumer.group_name);
+        assert_eq!(minimal_consumer.consume_type, full_consumer.consume_type);
+        assert_eq!(minimal_consumer.message_model, full_consumer.message_model);
+        assert_eq!(minimal_consumer.consume_from_where, full_consumer.consume_from_where);
+        assert_eq!(minimal_consumer.unit_mode, full_consumer.unit_mode);
+    }
+
+    #[test]
+    fn client_scheduled_task_startup_failed_uses_service_descriptor() {
+        let error =
+            client_scheduled_task_startup_failed("fetchNameServerAddr", std::io::Error::other("scheduler closed"));
+
+        assert_eq!(error.descriptor().code(), rocketmq_error::CORE_SERVICE_FAILED.code());
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn sync_pull_result_missing_uses_client_invalid_state() {
+        let error = sync_pull_result_missing("MQClientInstance::pull_message");
+
+        assert_invalid_state(
+            &error,
+            "PullResultExt returned by sync pull_message",
+            "MQClientInstance::pull_message returned None",
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_heartbeat_work_respects_configured_bound() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let tasks = (0..6)
+            .map(|_| {
+                let active = active.clone();
+                let peak = peak.clone();
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    started.add_permits(1);
+                    let permit = release.acquire().await.expect("release heartbeat");
+                    permit.forget();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }
+            })
+            .collect();
+        let joined = tokio::spawn(collect_bounded(tasks, 2));
+
+        let first_two = started.acquire_many(2).await.expect("two heartbeats started");
+        first_two.forget();
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        release.add_permits(6);
+        joined.await.expect("heartbeat join");
+
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn disabled_heartbeat_listener_creates_no_event_task() {
+        let config = ClientConfig {
+            enable_heartbeat_channel_event_listener: false,
+            ..Default::default()
+        };
+        let instance = test_instance(config, "disabled-heartbeat-listener");
+
+        assert_eq!(instance.connection_event_task_count(), 0);
+        instance.shutdown().await;
+        assert_eq!(instance.connection_event_task_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn start_rejects_invalid_unvalidated_runtime_config() {
+        let config = ClientConfig {
+            client_callback_executor_threads: i32::MAX as usize + 1,
+            ..Default::default()
+        };
+        let instance = test_instance(config, "invalid-runtime-config");
+        let api = instance.get_mq_client_api_impl().expect("client API");
+
+        let error = api.start().await.expect_err("start must revalidate raw config");
+
+        assert!(error.is(&rocketmq_error::CORE_CONFIGURATION_INVALID));
+        instance.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn get_mq_client_api_impl_returns_client_not_started_instead_of_panicking() {
+        let instance = test_instance(ClientConfig::default(), "test-client");
+        instance.mq_client_api_impl.store(None);
+
+        let result = instance.get_mq_client_api_impl();
+
+        assert!(matches!(result, Err(error) if error.is(&rocketmq_error::CLIENT_LIFECYCLE_NOT_STARTED)));
+    }
+
+    #[tokio::test]
+    async fn standard_weak_callbacks_do_not_keep_client_root_alive() {
+        let instance = test_instance(ClientConfig::default(), "weak-client-root");
+        let weak = Arc::downgrade(&instance);
+
+        assert!(weak.upgrade().is_some());
+        drop(instance);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_registration_tracks_group_presence_without_a_marker_object() {
+        let instance = test_instance(ClientConfig::default(), "admin-registration");
+
+        assert!(instance.register_admin_ext("").await);
+        assert!(!instance.register_admin_ext("").await);
+        instance.unregister_admin_ext("").await;
+        assert!(instance.register_admin_ext("admin-group").await);
+        assert!(!instance.register_admin_ext("admin-group").await);
+        assert!(instance.admin_ext_table.contains_key("admin-group"));
+        assert_eq!(
+            instance.registered_admin_groups(),
+            vec![CheetahString::from_static_str("admin-group")]
+        );
+
+        instance.unregister_admin_ext("admin-group").await;
+
+        assert!(!instance.admin_ext_table.contains_key("admin-group"));
+    }
+
+    #[tokio::test]
+    async fn admin_registration_is_atomic_and_old_cleanup_cannot_remove_a_replacement() {
+        let instance = test_instance(ClientConfig::default(), "admin-owned-registration");
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let winners = std::sync::atomic::AtomicUsize::new(0);
+        let owner = std::sync::atomic::AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for candidate in 1..=16 {
+                let instance = Arc::clone(&instance);
+                let barrier = Arc::clone(&barrier);
+                let winners = &winners;
+                let owner = &owner;
+                scope.spawn(move || {
+                    barrier.wait();
+                    if instance.register_admin_ext_owned("admin", candidate) {
+                        winners.fetch_add(1, Ordering::SeqCst);
+                        owner.store(candidate, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(winners.load(Ordering::SeqCst), 1);
+        let previous = owner.load(Ordering::SeqCst);
+        assert!(!instance.unregister_admin_ext_owned("admin", 100));
+        assert!(instance.unregister_admin_ext_owned("admin", previous));
+        assert!(instance.register_admin_ext_owned("admin", 100));
+        assert!(!instance.unregister_admin_ext_owned("admin", previous));
+        assert_eq!(*instance.admin_ext_table.get("admin").unwrap(), 100);
+    }
+
+    #[tokio::test]
+    async fn canceled_admin_start_unregisters_only_itself_and_releases_its_shared_lease() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime = crate::runtime::test_client_runtime("cancel-admin-start");
+        let mut config = ClientConfig::default();
+        config.set_instance_name("cancel-admin-start".into());
+        config.set_namesrv_addr(listener.local_addr().unwrap().to_string().into());
+        let pooled = runtime.pool().get_or_create(config.clone(), None).unwrap();
+        let (instance, token) = pooled.into_parts();
+        instance.start().await.unwrap();
+        let transition = instance.lifecycle_transition.lock().await;
+        let mut admin = crate::DefaultMQAdminExt::with_admin_ext_group(runtime.clone(), "cancel-admin");
+        *admin.client_config_mut() = config.clone();
+        let mut future = Box::pin(admin.start());
+        tokio::select! { result = &mut future => panic!("startup must wait for the transition: {result:?}"), _ = tokio::time::sleep(Duration::from_millis(5)) => {} }
+        assert!(instance.admin_ext_table.contains_key("cancel-admin"));
+        drop(future);
+        assert!(!instance.admin_ext_table.contains_key("cancel-admin"));
+        assert_eq!(runtime.pool().instance_count(), 1);
+        drop(transition);
+        let mut replacement = crate::DefaultMQAdminExt::with_admin_ext_group(runtime.clone(), "cancel-admin");
+        *replacement.client_config_mut() = config;
+        replacement.start().await.unwrap();
+        replacement.shutdown().await;
+        assert_eq!(runtime.pool().instance_count(), 1);
+        runtime.pool().release(token).await;
+        assert_eq!(runtime.pool().instance_count(), 0);
+        assert_eq!(runtime.pool().retiring_count(), 0);
+        assert!(runtime.shutdown().await.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn canceled_admin_shutdown_continues_cleanup_in_its_owning_root() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime = crate::runtime::test_client_runtime("cancel-admin-shutdown");
+        let mut config = ClientConfig::default();
+        config.set_instance_name("cancel-admin-shutdown".into());
+        config.set_namesrv_addr(listener.local_addr().unwrap().to_string().into());
+        let mut admin = crate::DefaultMQAdminExt::with_admin_ext_group(runtime.clone(), "cancel-admin");
+        *admin.client_config_mut() = config;
+        admin.start().await.unwrap();
+        let instance = runtime.pool().inner_instance_for_test(admin.client_config()).unwrap();
+        let transition = instance.lifecycle_transition.lock().await;
+        let mut future = Box::pin(admin.shutdown());
+        tokio::select! { _ = &mut future => panic!("shutdown must wait for the transition"), _ = tokio::time::sleep(Duration::from_millis(5)) => {} }
+        assert_eq!(runtime.pool().instance_count(), 0);
+        assert_eq!(runtime.pool().retiring_count(), 1);
+        drop(future);
+        drop(transition);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime.pool().retiring_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(runtime.shutdown().await.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn same_live_producer_registration_is_idempotent_and_rejects_different_root() {
+        let instance = test_instance(ClientConfig::default(), "producer-idempotent");
+        let producer = Arc::new(DefaultMQProducerImpl::new(
+            crate::runtime::test_client_runtime("mq-client-instance-producer-test"),
+            ClientConfig::default(),
+            ProducerConfig::default(),
+            None,
+        ));
+        let same = MQProducerInnerImpl::new(Arc::downgrade(&producer));
+        let same_again = MQProducerInnerImpl::new(Arc::downgrade(&producer));
+        let other_producer = Arc::new(DefaultMQProducerImpl::new(
+            crate::runtime::test_client_runtime("mq-client-instance-producer-test"),
+            ClientConfig::default(),
+            ProducerConfig::default(),
+            None,
+        ));
+        let other = MQProducerInnerImpl::new(Arc::downgrade(&other_producer));
+
+        assert!(instance.register_producer("producer-group", same.clone()).await);
+        assert!(instance.register_producer("producer-group", same_again).await);
+        assert!(!instance.register_producer("producer-group", other).await);
+
+        let selected = instance
+            .select_producer("producer-group")
+            .await
+            .expect("the original live producer should stay registered");
+        assert!(selected.points_to_same_producer(&same));
+        assert_eq!(instance.producer_table.len(), 1);
+        assert_eq!(
+            instance.registered_producer_groups(),
+            vec![CheetahString::from_static_str("producer-group")]
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_and_route_snapshots_do_not_expose_live_tables() {
+        let instance = test_instance(ClientConfig::default(), "owned-table-snapshots");
+        let broker = CheetahString::from_static_str("broker-a");
+        instance.broker_addr_table.insert(
+            broker.clone(),
+            HashMap::from([(mix_all::MASTER_ID, CheetahString::from_static_str("127.0.0.1:10911"))]),
+        );
+        let topic = CheetahString::from_static_str("topic-a");
+        instance
+            .topic_route_table
+            .insert(topic.clone(), TopicRouteData::default());
+
+        let mut broker_snapshot = instance.broker_addr_snapshot();
+        let mut route_snapshot = instance.topic_route_snapshot();
+        broker_snapshot.clear();
+        route_snapshot.clear();
+
+        assert!(instance.broker_addr_table.contains_key(&broker));
+        assert!(instance.topic_route_table.contains_key(&topic));
+    }
+
+    #[tokio::test]
+    async fn producer_registration_waits_for_registry_transition() {
+        let instance = test_instance(ClientConfig::default(), "producer-transition");
+        let producer = Arc::new(DefaultMQProducerImpl::new(
+            crate::runtime::test_client_runtime("mq-client-instance-producer-test"),
+            ClientConfig::default(),
+            ProducerConfig::default(),
+            None,
+        ));
+        let owner = MQProducerInnerImpl::new(Arc::downgrade(&producer));
+        let transition = instance.producer_registry_transition.lock().await;
+        let mut registration = Box::pin(instance.register_producer("producer-group", owner));
+
+        assert!(
+            registration.as_mut().now_or_never().is_none(),
+            "registration must not overtake an unregister transition"
+        );
+        drop(transition);
+
+        assert!(registration.await);
+    }
+
+    #[tokio::test]
+    async fn dead_producer_registration_is_pruned_and_atomically_replaced() {
+        let instance = test_instance(ClientConfig::default(), "producer-replace");
+        let producer = Arc::new(DefaultMQProducerImpl::new(
+            crate::runtime::test_client_runtime("mq-client-instance-producer-test"),
+            ClientConfig::default(),
+            ProducerConfig::default(),
+            None,
+        ));
+        let dead = MQProducerInnerImpl::new(Arc::downgrade(&producer));
+        assert!(instance.register_producer("producer-group", dead).await);
+
+        drop(producer);
+        let replacement_root = Arc::new(DefaultMQProducerImpl::new(
+            crate::runtime::test_client_runtime("mq-client-instance-producer-test"),
+            ClientConfig::default(),
+            ProducerConfig::default(),
+            None,
+        ));
+        let replacement = MQProducerInnerImpl::new(Arc::downgrade(&replacement_root));
+        assert!(instance.register_producer("producer-group", replacement.clone()).await);
+
+        let selected = instance
+            .select_producer("producer-group")
+            .await
+            .expect("a live producer should replace the dead registry entry");
+        assert!(selected.points_to_same_producer(&replacement));
+
+        let heartbeat = instance.prepare_heartbeat_data(false).await;
+        assert_eq!(heartbeat.producer_data_set.len(), 1);
+
+        drop(replacement_root);
+        let heartbeat = instance.prepare_heartbeat_data(false).await;
+        assert!(heartbeat.producer_data_set.is_empty());
+        assert!(!instance.producer_table.contains_key("producer-group"));
+        assert!(instance.select_producer("producer-group").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn late_owner_aware_unregister_does_not_remove_replacement() {
+        let instance = test_instance(ClientConfig::default(), "producer-owner-guard");
+        let old_root = Arc::new(DefaultMQProducerImpl::new(
+            crate::runtime::test_client_runtime("mq-client-instance-producer-test"),
+            ClientConfig::default(),
+            ProducerConfig::default(),
+            None,
+        ));
+        let old_owner = MQProducerInnerImpl::new(Arc::downgrade(&old_root));
+        assert!(instance.register_producer("producer-group", old_owner).await);
+        let old_owner_snapshot = instance
+            .producer_table
+            .get("producer-group")
+            .expect("the old owner should be registered")
+            .value()
+            .clone();
+
+        drop(old_root);
+        let replacement_root = Arc::new(DefaultMQProducerImpl::new(
+            crate::runtime::test_client_runtime("mq-client-instance-producer-test"),
+            ClientConfig::default(),
+            ProducerConfig::default(),
+            None,
+        ));
+        let replacement = MQProducerInnerImpl::new(Arc::downgrade(&replacement_root));
+        assert!(instance.register_producer("producer-group", replacement.clone()).await);
+
+        assert!(
+            !instance
+                .unregister_producer_if_owner("producer-group", &old_owner_snapshot)
+                .await
+        );
+        let selected = instance
+            .select_producer("producer-group")
+            .await
+            .expect("late cleanup from the old owner must preserve the replacement");
+        assert!(selected.points_to_same_producer(&replacement));
+    }
+
+    #[tokio::test]
+    async fn producer_registration_remains_open_during_start_transition() {
+        let instance = test_instance(ClientConfig::default(), "producer-start-admission");
+        let _transition = instance.lifecycle_transition.lock().await;
+        let producer = Arc::new(DefaultMQProducerImpl::new(
+            crate::runtime::test_client_runtime("mq-client-instance-producer-test"),
+            ClientConfig::default(),
+            ProducerConfig::default(),
+            None,
+        ));
+        let owner = MQProducerInnerImpl::new(Arc::downgrade(&producer));
+
+        assert!(instance.register_producer("producer-group", owner).await);
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_producer_registration_and_prevents_later_start() {
+        let instance = test_instance(ClientConfig::default(), "producer-shutdown-admission");
+
+        instance.shutdown().await;
+
+        let producer = Arc::new(DefaultMQProducerImpl::new(
+            crate::runtime::test_client_runtime("mq-client-instance-producer-test"),
+            ClientConfig::default(),
+            ProducerConfig::default(),
+            None,
+        ));
+        let owner = MQProducerInnerImpl::new(Arc::downgrade(&producer));
+        assert!(!instance.register_producer("producer-group", owner).await);
+        assert!(!instance.producer_table.contains_key("producer-group"));
+
+        let error = instance
+            .start()
+            .await
+            .expect_err("a client whose registration admission is closed must not start");
+        assert!(client_exception(&error)
+            .to_string()
+            .contains("producer registration admission is closed"));
+        assert_eq!(instance.service_state(), ServiceState::CreateJust);
+    }
+
+    #[tokio::test]
+    async fn mq_client_api_impl_inherits_tls_flag_from_client_config() {
+        let mut client_config = ClientConfig::default();
+        client_config.set_use_tls(true);
+        client_config.set_tls_client_trust_cert_path("/certs/ca.pem");
+
+        let instance = test_instance(client_config, "test-client-tls");
+        let api_impl: Arc<MQClientAPIImpl> = instance
+            .get_mq_client_api_impl()
+            .expect("MQClientInstance should initialize MQClientAPIImpl");
+
+        assert!(api_impl.is_use_tls());
+        assert_eq!(
+            api_impl
+                .get_remoting_client()
+                .tls_config()
+                .client
+                .trust_cert_path
+                .as_deref(),
+            Some("/certs/ca.pem")
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_tcp_settings_reach_the_effective_transport_configuration() {
+        let config = ClientConfig::builder()
+            .connect_timeout(Duration::from_millis(321))
+            .idle_scan_interval(Some(Duration::from_secs(7)))
+            .idle_timeout(None)
+            .close_socket_if_timeout(true)
+            .socket_options(rocketmq_transport::api::SocketOptions {
+                tcp_nodelay: false,
+                ..Default::default()
+            })
+            .build()
+            .unwrap();
+        let instance = test_instance(config, "tcp-settings-snapshot");
+        let api = instance.get_mq_client_api_impl().unwrap();
+        let remoting = api.get_remoting_client();
+        let effective = remoting.configuration();
+        assert_eq!(effective.connect.timeout, Duration::from_millis(321));
+        assert_eq!(effective.maintenance.idle_scan_interval, Some(Duration::from_secs(7)));
+        assert_eq!(effective.maintenance.idle_timeout, None);
+        assert!(!effective.socket_options.tcp_nodelay);
+        assert!(effective.close_socket_if_timeout);
+    }
+
+    #[test]
+    fn new_arc_initializes_namesrv_inside_current_thread_runtime_without_block_in_place_panic() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let client_config = ClientConfig {
+                namesrv_addr: Some(CheetahString::from_static_str("127.0.0.1:9876;127.0.0.2:9876")),
+                ..Default::default()
+            };
+
+            let instance = test_instance(client_config, "current-thread-namesrv-test");
+            let api_impl = instance
+                .get_mq_client_api_impl()
+                .expect("MQClientInstance should initialize MQClientAPIImpl");
+            let addrs = api_impl.get_name_server_address_list();
+
+            assert_eq!(addrs.len(), 2);
+            assert!(addrs.contains(&CheetahString::from_static_str("127.0.0.1:9876")));
+            assert!(addrs.contains(&CheetahString::from_static_str("127.0.0.2:9876")));
+        });
+    }
+
+    #[test]
+    fn new_arc_applies_java_http_nameserver_endpoint_normalization() {
+        let client_config = ClientConfig {
+            namesrv_addr: Some(CheetahString::from_static_str("http://NameSrv.Example:9876")),
+            ..Default::default()
+        };
+
+        let instance = test_instance(client_config, "http-endpoint-namesrv-test");
+        let api_impl = instance
+            .get_mq_client_api_impl()
+            .expect("MQClientInstance should initialize MQClientAPIImpl");
+
+        assert_eq!(
+            api_impl.get_name_server_address_list(),
+            vec![CheetahString::from_static_str("namesrv.example:9876")]
+        );
+    }
+
+    #[test]
+    fn new_arc_without_tokio_runtime_initializes_client_without_spawn_panic() {
+        let client_config = ClientConfig {
+            namesrv_addr: None,
+            ..Default::default()
+        };
+
+        let instance = test_instance(client_config, "explicit-runtime-client-test");
+
+        assert!(instance.get_mq_client_api_impl().is_ok());
+    }
+
+    #[test]
+    fn delayed_rebalance_without_tokio_runtime_does_not_spawn_panic() {
+        let client_config = ClientConfig {
+            namesrv_addr: None,
+            ..Default::default()
+        };
+        let instance = test_instance(client_config, "explicit-runtime-rebalance-test");
+
+        instance.re_balance_later(Duration::from_millis(1));
+        instance.rebalance_later(1);
+
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_scheduled_tasks_to_exit() {
+        let client_config = ClientConfig {
+            namesrv_addr: None,
+            ..Default::default()
+        };
+        let instance = test_instance(client_config, "scheduled-shutdown-test");
+        instance.set_service_state(ServiceState::Running);
+        assert!(instance.connection_event_task_count() > 0);
+        instance
+            .scheduled_tasks
+            .schedule(
+                ScheduledTaskConfig::fixed_delay("client.shutdown-test", Duration::from_secs(60))
+                    .with_initial_delay(Duration::from_secs(60)),
+                ScheduledExecutionPolicy::default(),
+                || async {},
+            )
+            .expect("scheduled shutdown test task should start");
+
+        assert_eq!(instance.scheduled_tasks.group().task_count(), 1);
+
+        instance.shutdown().await;
+
+        assert_eq!(instance.service_state(), ServiceState::ShutdownAlready);
+        assert_eq!(instance.scheduled_tasks.group().task_count(), 0);
+        assert_eq!(instance.connection_event_task_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_start_stops_connection_event_listener() {
+        let client_config = ClientConfig {
+            namesrv_addr: None,
+            ..Default::default()
+        };
+        let instance = test_instance(client_config, "pre-start-shutdown-test");
+
+        assert_eq!(instance.service_state(), ServiceState::CreateJust);
+        assert!(instance.connection_event_task_count() > 0);
+        instance.re_balance_later(Duration::from_secs(60));
+        instance.rebalance_later(60_000);
+        tokio::task::yield_now().await;
+
+        instance.shutdown().await;
+
+        assert_eq!(instance.service_state(), ServiceState::CreateJust);
+        assert_eq!(instance.connection_event_task_count(), 0);
+        assert!(instance.rebalance_delay_shutdown.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), instance.rebalance_delay_tasks.wait())
+            .await
+            .expect("shutdown should cancel delayed rebalance tasks");
+    }
+
+    #[tokio::test]
+    async fn connection_event_listener_lifecycle_probe_reports_clean_shutdown() {
+        let probe = run_connection_event_listener_lifecycle_probe(crate::runtime::test_client_runtime(
+            "connection-event-probe-test",
+        ))
+        .await;
+
+        assert!(probe.healthy, "{probe:?}");
+        assert_eq!(probe.task_count_before_shutdown, 1);
+        assert_eq!(probe.task_count_after_shutdown, 0);
+    }
+
+    #[test]
+    fn periodic_route_refresh_batches_large_topic_sets() {
+        let client_config = ClientConfig {
+            namesrv_addr: None,
+            ..Default::default()
+        };
+        let instance = test_instance(client_config, "route-refresh-batch-test");
+        let topics = route_refresh_probe_topics(1_000);
+
+        let (first_batch, first_skipped) = instance.select_periodic_route_refresh_batch(&topics);
+        let (second_batch, second_skipped) = instance.select_periodic_route_refresh_batch(&topics);
+
+        assert_eq!(first_batch.len(), ROUTE_REFRESH_MAX_TOPICS_PER_ROUND);
+        assert_eq!(second_batch.len(), ROUTE_REFRESH_MAX_TOPICS_PER_ROUND);
+        assert_eq!(first_skipped, 1_000 - ROUTE_REFRESH_MAX_TOPICS_PER_ROUND);
+        assert_eq!(second_skipped, 1_000 - ROUTE_REFRESH_MAX_TOPICS_PER_ROUND);
+        assert_ne!(first_batch[0], second_batch[0]);
+
+        let small_topics = route_refresh_probe_topics(10);
+        let (small_batch, small_skipped) = instance.select_periodic_route_refresh_batch(&small_topics);
+        assert_eq!(small_batch.len(), 10);
+        assert_eq!(small_skipped, 0);
+    }
+
+    #[test]
+    fn route_refresh_shard_probe_reports_peak_topic_reduction() {
+        let probe = run_route_refresh_shard_probe(
+            crate::runtime::test_client_runtime("route-refresh-shard-probe-test"),
+            1_000,
+        );
+
+        assert_eq!(probe.batch_size, ROUTE_REFRESH_MAX_TOPICS_PER_ROUND);
+        assert_eq!(probe.selected_topics, ROUTE_REFRESH_MAX_TOPICS_PER_ROUND);
+        assert!(probe.peak_topic_reduction_percent > 90.0, "{probe:?}");
+    }
+
+    #[tokio::test]
+    async fn route_update_stale_snapshot_does_not_overwrite_current_route() {
+        let probe = run_route_refresh_concurrent_stale_guard_probe(crate::runtime::test_client_runtime(
+            "route-refresh-stale-probe-test",
+        ))
+        .await;
+
+        assert!(probe.healthy, "{probe:?}");
+        assert!(probe.stale_skipped);
+        assert_eq!(probe.route_version, 1);
+    }
+
+    #[tokio::test]
+    async fn route_update_applies_producer_and_consumer_views_outside_commit_lock() {
+        let client_config = ClientConfig {
+            namesrv_addr: None,
+            ..Default::default()
+        };
+        let instance = test_instance(client_config, "route-refresh-apply-test");
+        let topic = CheetahString::from_static_str("route-refresh-topic");
+
+        let producer = Arc::new(DefaultMQProducerImpl::new(
+            crate::runtime::test_client_runtime("route-refresh-producer-test"),
+            ClientConfig::default(),
+            ProducerConfig::default(),
+            None,
+        ));
+        let producer_inner = MQProducerInnerImpl::new(Arc::downgrade(&producer));
+        assert!(producer.is_publish_topic_need_update(&topic));
+        assert!(
+            instance
+                .register_producer("route-refresh-producer", producer_inner)
+                .await
+        );
+
+        let consumer_group = CheetahString::from_static_str("route-refresh-consumer");
+        let consumer = Arc::new(DefaultMQPushConsumerImpl::new(
+            crate::runtime::test_client_runtime("route-refresh-consumer-test"),
+            ClientConfig::default(),
+            ConsumerConfig {
+                consumer_group: consumer_group.clone(),
+                ..Default::default()
+            },
+            None,
+        ));
+        consumer.initialize_self_reference();
+        consumer.rebalance_impl.put_subscription_data(
+            topic.clone(),
+            SubscriptionData {
+                topic: topic.clone(),
+                ..Default::default()
+            },
+        );
+        assert!(consumer.is_subscribe_topic_need_update(topic.as_str()).await);
+        assert!(
+            instance
+                .register_consumer(&consumer_group, MQConsumerInnerImpl::from_push(consumer.clone()))
+                .await
+        );
+
+        let mut broker_addrs = HashMap::new();
+        broker_addrs.insert(mix_all::MASTER_ID, CheetahString::from_static_str("127.0.0.1:10911"));
+        let mut route = TopicRouteData {
+            queue_datas: vec![QueueData {
+                broker_name: CheetahString::from_static_str("broker-a"),
+                read_queue_nums: 1,
+                write_queue_nums: 1,
+                perm: PermName::PERM_READ | PermName::PERM_WRITE,
+                ..Default::default()
+            }],
+            broker_datas: vec![BrokerData::new(
+                CheetahString::from_static_str("cluster-a"),
+                CheetahString::from_static_str("broker-a"),
+                broker_addrs,
+                None,
+            )],
+            ..Default::default()
+        };
+
+        let outcome = instance.apply_topic_route_data_if_fresh(&topic, &mut route, 0).await;
+
+        assert_eq!(outcome, TopicRouteApplyOutcome::Applied);
+        assert!(!producer.is_publish_topic_need_update(&topic));
+        assert!(!consumer.is_subscribe_topic_need_update(topic.as_str()).await);
+        assert_eq!(instance.topic_route_version(&topic), 1);
+    }
+
+    fn heartbeat_route_with_addr(broker_name: &str, broker_addr: &str) -> TopicRouteData {
+        let mut broker_addrs = HashMap::new();
+        broker_addrs.insert(mix_all::MASTER_ID, CheetahString::from_string(broker_addr.to_string()));
+        TopicRouteData {
+            broker_datas: vec![BrokerData::new(
+                CheetahString::from_static_str("heartbeat-route-cluster"),
+                CheetahString::from_string(broker_name.to_string()),
+                broker_addrs,
+                None,
+            )],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_route_index_updates_on_route_refresh() {
+        let client_config = ClientConfig {
+            namesrv_addr: None,
+            ..Default::default()
+        };
+        let instance = test_instance(client_config, "heartbeat-route-index-test");
+        let topic = CheetahString::from_static_str("heartbeat-route-index-topic");
+        let mut first_route = heartbeat_route_with_addr("broker-a", "127.0.0.1:10911");
+        let mut second_route = heartbeat_route_with_addr("broker-b", "127.0.0.2:10911");
+
+        let first_outcome = instance
+            .apply_topic_route_data_if_fresh(&topic, &mut first_route, 0)
+            .await;
+        let second_outcome = instance
+            .apply_topic_route_data_if_fresh(&topic, &mut second_route, 1)
+            .await;
+
+        assert_eq!(first_outcome, TopicRouteApplyOutcome::Applied);
+        assert_eq!(second_outcome, TopicRouteApplyOutcome::Applied);
+        assert!(!instance.is_broker_addr_in_route_index("127.0.0.1:10911"));
+        assert!(instance.is_broker_addr_in_route_index("127.0.0.2:10911"));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_route_index_keeps_shared_broker_ref_counts() {
+        let client_config = ClientConfig {
+            namesrv_addr: None,
+            ..Default::default()
+        };
+        let instance = test_instance(client_config, "heartbeat-route-refcount-test");
+        let topic_a = CheetahString::from_static_str("heartbeat-route-refcount-a");
+        let topic_b = CheetahString::from_static_str("heartbeat-route-refcount-b");
+        let mut shared_a = heartbeat_route_with_addr("broker-shared", "127.0.0.9:10911");
+        let mut shared_b = heartbeat_route_with_addr("broker-shared", "127.0.0.9:10911");
+        let mut replacement_a = heartbeat_route_with_addr("broker-replacement-a", "127.0.0.10:10911");
+        let mut replacement_b = heartbeat_route_with_addr("broker-replacement-b", "127.0.0.11:10911");
+
+        instance
+            .apply_topic_route_data_if_fresh(&topic_a, &mut shared_a, 0)
+            .await;
+        instance
+            .apply_topic_route_data_if_fresh(&topic_b, &mut shared_b, 0)
+            .await;
+        instance
+            .apply_topic_route_data_if_fresh(&topic_a, &mut replacement_a, 1)
+            .await;
+        assert!(instance.is_broker_addr_in_route_index("127.0.0.9:10911"));
+
+        instance
+            .apply_topic_route_data_if_fresh(&topic_b, &mut replacement_b, 1)
+            .await;
+        assert!(!instance.is_broker_addr_in_route_index("127.0.0.9:10911"));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_clean_offline_broker_removes_addr_without_dirty_route_index() {
+        let client_config = ClientConfig {
+            namesrv_addr: None,
+            ..Default::default()
+        };
+        let instance = test_instance(client_config, "heartbeat-clean-index-test");
+        let broker_name = CheetahString::from_static_str("heartbeat-offline-broker");
+        let broker_addr = CheetahString::from_static_str("127.0.0.12:10911");
+        let mut broker_addrs = HashMap::new();
+        broker_addrs.insert(mix_all::MASTER_ID, broker_addr.clone());
+        instance.broker_addr_table.insert(broker_name.clone(), broker_addrs);
+        instance
+            .route_refresh_state
+            .broker_addr_route_index
+            .insert(broker_addr.clone(), 1);
+        instance
+            .route_refresh_state
+            .broker_addr_route_index
+            .remove(&broker_addr);
+
+        instance.clean_offline_broker().await;
+
+        assert!(!instance.broker_addr_table.contains_key(&broker_name));
+        assert!(!instance.is_broker_addr_in_route_index(broker_addr.as_str()));
+    }
+
+    #[test]
+    fn heartbeat_route_index_probe_matches_scan_baseline() {
+        let probe = run_heartbeat_route_index_probe(
+            crate::runtime::test_client_runtime("heartbeat-route-index-probe-test"),
+            1_000,
+            256,
+            512,
+        );
+
+        assert_eq!(probe.scan_found_count, probe.index_found_count);
+        assert!(probe.index_elapsed_us <= probe.scan_elapsed_us, "{probe:?}");
+    }
+
+    #[tokio::test]
+    async fn channel_event_methods_match_java_listener_contract_without_match() {
+        let client_config = ClientConfig {
+            namesrv_addr: None,
+            ..Default::default()
+        };
+        let instance = test_instance(client_config, "channel-event-test");
+
+        instance.on_channel_connect("127.0.0.1:10911");
+        instance.on_channel_close("127.0.0.1:10911");
+        instance.on_channel_exception("127.0.0.1:10911");
+        instance.on_channel_idle("127.0.0.1:10911");
+        instance.on_channel_active("127.0.0.1:10911").await;
+    }
+
+    #[test]
+    fn topic_publish_info_skips_invalid_order_topic_conf_without_panicking() {
+        let mut route = TopicRouteData {
+            order_topic_conf: Some(CheetahString::from("broker-a:not-a-number;broker-b:2")),
+            ..Default::default()
+        };
+
+        let info = topic_route_data2topic_publish_info("topic-a", &mut route);
+
+        assert!(info.order_topic);
+        assert_eq!(info.message_queue_list.len(), 2);
+        assert_eq!(info.message_queue_list[0].broker_name(), "broker-b");
+        assert_eq!(info.message_queue_list[0].queue_id(), 0);
+        assert_eq!(info.message_queue_list[1].broker_name(), "broker-b");
+        assert_eq!(info.message_queue_list[1].queue_id(), 1);
+    }
+
+    #[test]
+    fn default_topic_route_queue_nums_are_capped_like_broker_auto_create() {
+        let mut route = TopicRouteData {
+            queue_datas: vec![rocketmq_protocol::protocol::route::route_data_view::QueueData {
+                broker_name: CheetahString::from("broker-a"),
+                read_queue_nums: 8,
+                write_queue_nums: 8,
+                perm: PermName::PERM_READ | PermName::PERM_WRITE,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        cap_default_topic_route_queue_nums(&mut route, 4);
+
+        assert_eq!(route.queue_datas[0].read_queue_nums, 4);
+        assert_eq!(route.queue_datas[0].write_queue_nums, 4);
+    }
+
+    #[test]
+    fn java_named_topic_publish_info_alias_delegates_to_route_converter() {
+        let mut route = TopicRouteData {
+            order_topic_conf: Some(CheetahString::from("broker-a:1")),
+            ..Default::default()
+        };
+
+        let info = topic_route_data2_topic_publish_info("topic-a", &mut route);
+
+        assert!(info.order_topic);
+        assert_eq!(info.message_queue_list.len(), 1);
+        assert_eq!(info.message_queue_list[0].topic(), "topic-a");
+        assert_eq!(info.message_queue_list[0].broker_name(), "broker-a");
+        assert_eq!(info.message_queue_list[0].queue_id(), 0);
+    }
+
+    #[test]
+    fn java_named_topic_subscribe_info_alias_delegates_to_route_converter() {
+        let route = TopicRouteData {
+            queue_datas: vec![rocketmq_protocol::protocol::route::route_data_view::QueueData {
+                broker_name: CheetahString::from("broker-a"),
+                read_queue_nums: 2,
+                perm: PermName::PERM_READ,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let info = topic_route_data2_topic_subscribe_info("topic-a", &route);
+
+        assert_eq!(info.len(), 2);
+        assert!(info.contains(&MessageQueue::from_parts("topic-a", "broker-a", 0)));
+        assert!(info.contains(&MessageQueue::from_parts("topic-a", "broker-a", 1)));
+    }
+
+    #[tokio::test]
+    async fn rebalance_immediately_alias_matches_existing_wakeup_path() {
+        let client_config = ClientConfig {
+            namesrv_addr: None,
+            ..Default::default()
+        };
+        let instance = test_instance(client_config, "rebalance-alias-test");
+
+        instance.rebalance_immediately();
+    }
+
+    #[tokio::test]
+    async fn parse_offset_table_from_broker_removes_namespace_like_java() {
+        let client_config = ClientConfig {
+            namesrv_addr: None,
+            ..Default::default()
+        };
+        let instance = test_instance(client_config, "parse-offset-test");
+        let mut offsets = HashMap::new();
+        offsets.insert(MessageQueue::from_parts("ns%topic-a", "broker-a", 0), 42);
+
+        let parsed = instance.parse_offset_table_from_broker(offsets, "ns");
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed.get(&MessageQueue::from_parts("topic-a", "broker-a", 0)),
+            Some(&42)
+        );
+    }
+
+    #[tokio::test]
+    async fn find_broker_address_in_admin_returns_any_known_broker_like_java() {
+        let client_config = ClientConfig {
+            namesrv_addr: None,
+            ..Default::default()
+        };
+        let instance = test_instance(client_config, "admin-broker-test");
+        let broker_name = CheetahString::from_static_str("broker-a");
+        let broker_addr = CheetahString::from_static_str("127.0.0.1:10912");
+        let mut addrs = HashMap::new();
+        addrs.insert(1, broker_addr.clone());
+        instance.broker_addr_table.insert(broker_name.clone(), addrs);
+        let mut versions = HashMap::new();
+        versions.insert(broker_addr.clone(), 321);
+        instance.broker_version_table.insert(broker_name.clone(), versions);
+
+        let result = instance
+            .find_broker_address_in_admin(&broker_name)
+            .await
+            .expect("known broker should be returned");
+
+        assert_eq!(result.broker_addr, broker_addr);
+        assert!(result.slave);
+        assert_eq!(result.broker_version, 321);
+    }
+
+    #[tokio::test]
+    async fn query_topic_route_data_returns_cached_route_before_nameserver_lookup() {
+        let client_config = ClientConfig {
+            namesrv_addr: None,
+            ..Default::default()
+        };
+        let instance = test_instance(client_config, "query-route-test");
+        let topic = CheetahString::from_static_str("topic-a");
+        let route = TopicRouteData {
+            order_topic_conf: Some(CheetahString::from_static_str("broker-a:1")),
+            ..Default::default()
+        };
+        instance.topic_route_table.insert(topic.clone(), route.clone());
+
+        let result = instance
+            .query_topic_route_data(&topic)
+            .await
+            .expect("cached topic route should be returned");
+
+        assert_eq!(result, route);
+    }
+
+    #[test]
+    fn get_topic_config_request_header_sets_lo_like_java_client() {
+        let header = get_topic_config_request_header(CheetahString::from("TopicTest"));
+
+        assert_eq!(
+            rocketmq_protocol::protocol::header::message_operation_header::TopicRequestHeaderTrait::topic(&header),
+            "TopicTest"
+        );
+        assert_eq!(
+            rocketmq_protocol::protocol::header::message_operation_header::TopicRequestHeaderTrait::lo(&header),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_rolls_back_a_partially_started_client() {
+        let client_config = ClientConfig {
+            namesrv_addr: Some(CheetahString::from_static_str("127.0.0.1:9876")),
+            ..Default::default()
+        };
+        let instance = test_instance(client_config, "partial-start-shutdown");
+        instance.set_service_state(ServiceState::StartFailed);
+
+        instance.shutdown().await;
+
+        assert_eq!(instance.service_state(), ServiceState::ShutdownAlready);
+    }
+}
+
+// Custom fork: Java prefers replica ID1, then the master, for custom track records.
+impl MQClientInstance {
+    pub async fn report_track(
+        &self,
+        transfer: &rocketmq_protocol::track::TrackTransferBean,
+        timeout_millis: u64,
+    ) -> ClientResult<()> {
+        let broker = transfer
+            .broker_name
+            .as_ref()
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| ClientError::illegal_argument("track broker name is missing"))?;
+        let address = self
+            .broker_addr_table
+            .get(broker)
+            .and_then(|addresses| {
+                addresses
+                    .get(&1)
+                    .or_else(|| addresses.get(&mix_all::MASTER_ID))
+                    .cloned()
+            })
+            .ok_or_else(|| ClientError::invalid_state("tracked broker route", "missing"))?;
+        self.mq_client_api_impl
+            .load_full()
+            .ok_or_else(ClientError::not_started)?
+            .report_track(&address, transfer, timeout_millis)
+            .await
+    }
+}

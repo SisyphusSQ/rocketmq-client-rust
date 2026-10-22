@@ -1,0 +1,432 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Java-compatible ACL client RPC hook.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::fs;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
+
+use cheetah_string::CheetahString;
+use rocketmq_error::Error as CanonicalError;
+use rocketmq_error::SharedError;
+use rocketmq_protocol::protocol::remoting_command::RemotingCommand;
+use rocketmq_security_api::OutboundSigner;
+use rocketmq_security_api::Secret;
+use rocketmq_security_api::SecurityOperation;
+use rocketmq_security_api::SecurityProviderError;
+use rocketmq_security_api::SecurityProviderFailure;
+use rocketmq_security_api::SecurityRequestView;
+use rocketmq_security_api::Signature;
+use rocketmq_transport::api::RPCHook;
+use serde::Deserialize;
+
+use crate::authentication::builder::DefaultAuthenticationContextBuilder;
+use crate::authentication::chain::acl_signer;
+use crate::authentication::chain::acl_signer::SignatureAlgorithm;
+use crate::config::AuthConfig;
+use crate::AuthFailureKind;
+use crate::AuthOperation;
+use crate::AuthServiceError;
+use crate::AuthServiceResult;
+
+const ACCESS_KEY: &str = "AccessKey";
+const SECURITY_TOKEN: &str = "SecurityToken";
+const SIGNATURE: &str = "Signature";
+
+/// Optional mounted JSON credentials used when inline inner-client credentials are absent.
+pub const INNER_CLIENT_CREDENTIALS_FILE_ENV: &str = "ROCKETMQ_INNER_CLIENT_CREDENTIALS_FILE";
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AclClientRpcHook {
+    access_key: CheetahString,
+    secret_key: CheetahString,
+    security_token: Option<CheetahString>,
+    signature_algorithm: SignatureAlgorithm,
+}
+
+impl fmt::Debug for AclClientRpcHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AclClientRpcHook")
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"<redacted>")
+            .field("security_token", &self.security_token.as_ref().map(|_| "<redacted>"))
+            .field("signature_algorithm", &self.signature_algorithm)
+            .finish()
+    }
+}
+
+impl AclClientRpcHook {
+    pub fn new(
+        access_key: impl Into<CheetahString>,
+        secret_key: impl Into<CheetahString>,
+        security_token: Option<impl Into<CheetahString>>,
+        signature_algorithm: SignatureAlgorithm,
+    ) -> Option<Self> {
+        let access_key = access_key.into();
+        let secret_key = secret_key.into();
+        if access_key.trim().is_empty() || secret_key.trim().is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            access_key: CheetahString::from(access_key.trim()),
+            secret_key: CheetahString::from(secret_key.trim()),
+            security_token: security_token.and_then(|token| non_blank(token.into())),
+            signature_algorithm,
+        })
+    }
+
+    pub fn from_auth_config(config: &AuthConfig) -> AuthServiceResult<Option<Self>> {
+        if config.inner_client_authentication_credentials.trim().is_empty() {
+            if let Some(path) = std::env::var_os(INNER_CLIENT_CREDENTIALS_FILE_ENV) {
+                return Self::from_required_credentials_file(Path::new(&path), config.signature_algorithm).map(Some);
+            }
+        }
+        let signer = Self::from_credentials_json(
+            config.inner_client_authentication_credentials.as_str(),
+            config.signature_algorithm,
+        )?;
+        if signer.is_none() && !config.inner_client_authentication_credentials.trim().is_empty() {
+            return Err(AuthServiceError::new(
+                AuthOperation::Initialize,
+                AuthFailureKind::InvalidConfiguration,
+            ));
+        }
+        Ok(signer)
+    }
+
+    /// Loads an explicitly configured Secret file; missing or empty credentials fail startup.
+    pub fn from_required_credentials_file(
+        path: impl AsRef<Path>,
+        signature_algorithm: SignatureAlgorithm,
+    ) -> AuthServiceResult<Self> {
+        let content = fs::read_to_string(path).map_err(|error| {
+            AuthServiceError::with_source(AuthOperation::LoadSecret, AuthFailureKind::Unavailable, error)
+        })?;
+        Self::from_credentials_json(&content, signature_algorithm)?
+            .ok_or_else(|| AuthServiceError::new(AuthOperation::Initialize, AuthFailureKind::InvalidConfiguration))
+    }
+
+    pub fn from_credentials_json(
+        credentials_json: &str,
+        signature_algorithm: SignatureAlgorithm,
+    ) -> AuthServiceResult<Option<Self>> {
+        if credentials_json.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let credentials = serde_json::from_str::<ClientCredentials>(credentials_json).map_err(|error| {
+            AuthServiceError::with_source(AuthOperation::Initialize, AuthFailureKind::InvalidConfiguration, error)
+        })?;
+        Ok(Self::from_credentials(credentials, signature_algorithm))
+    }
+
+    pub fn from_tools_file(
+        path: impl AsRef<Path>,
+        signature_algorithm: SignatureAlgorithm,
+    ) -> AuthServiceResult<Option<Self>> {
+        let path = path.as_ref();
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(AuthServiceError::with_source(
+                    AuthOperation::LoadSecret,
+                    AuthFailureKind::Unavailable,
+                    error,
+                ));
+            }
+        };
+        let credentials = serde_yaml::from_str::<ClientCredentials>(&content).map_err(|error| {
+            AuthServiceError::with_source(AuthOperation::Initialize, AuthFailureKind::InvalidConfiguration, error)
+        })?;
+        Ok(Self::from_credentials(credentials, signature_algorithm))
+    }
+
+    pub fn into_rpc_hook(self) -> Arc<dyn RPCHook> {
+        Arc::new(self)
+    }
+
+    pub fn into_outbound_signer(self) -> Arc<dyn OutboundSigner> {
+        Arc::new(self)
+    }
+
+    pub fn access_key(&self) -> &CheetahString {
+        &self.access_key
+    }
+
+    pub fn secret_key(&self) -> &CheetahString {
+        &self.secret_key
+    }
+
+    pub fn security_token(&self) -> Option<&CheetahString> {
+        self.security_token.as_ref()
+    }
+
+    fn from_credentials(credentials: ClientCredentials, signature_algorithm: SignatureAlgorithm) -> Option<Self> {
+        Self::new(
+            credentials.access_key?,
+            credentials.secret_key?,
+            credentials.security_token,
+            signature_algorithm,
+        )
+    }
+}
+
+impl RPCHook for AclClientRpcHook {
+    fn do_before_request(&self, _remote_addr: SocketAddr, request: &mut RemotingCommand) -> Result<(), SharedError> {
+        request.ensure_ext_fields_initialized();
+        request.add_ext_field(ACCESS_KEY, self.access_key.clone());
+        if let Some(security_token) = &self.security_token {
+            request.add_ext_field(SECURITY_TOKEN, security_token.clone());
+        }
+        request.make_custom_header_to_net();
+
+        let sorted_fields = request
+            .ext_fields()
+            .into_iter()
+            .flat_map(|fields| fields.iter())
+            .filter(|(key, _)| key.as_str() != SIGNATURE)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let content = DefaultAuthenticationContextBuilder::combine_request_content(request, &sorted_fields);
+        let signature = acl_signer::cal_signature_with_algorithm(
+            content.as_slice(),
+            self.secret_key.as_str(),
+            self.signature_algorithm,
+        )
+        .map_err(|error| Arc::new(CanonicalError::from(error)))?;
+        request.add_ext_field(SIGNATURE, signature);
+        Ok(())
+    }
+
+    fn do_after_response(
+        &self,
+        _remote_addr: SocketAddr,
+        _request: &RemotingCommand,
+        _response: &mut RemotingCommand,
+    ) -> Result<(), SharedError> {
+        Ok(())
+    }
+}
+
+impl OutboundSigner for AclClientRpcHook {
+    fn sign(&self, request: SecurityRequestView<'_>) -> Result<Signature, SecurityProviderError> {
+        let mut sorted_fields = request
+            .fields()
+            .iter()
+            .filter(|(key, _)| key.as_str() != SIGNATURE)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        sorted_fields.insert(CheetahString::from(ACCESS_KEY), self.access_key.clone());
+        if let Some(security_token) = &self.security_token {
+            sorted_fields.insert(CheetahString::from(SECURITY_TOKEN), security_token.clone());
+        }
+
+        let mut content = Vec::new();
+        for value in sorted_fields.values() {
+            content.extend_from_slice(value.as_bytes());
+        }
+        if let Some(body) = request.body() {
+            content.extend_from_slice(body);
+        }
+        let signature = acl_signer::cal_signature_with_algorithm(
+            content.as_slice(),
+            self.secret_key.as_str(),
+            self.signature_algorithm,
+        )
+        .map_err(|source| {
+            SecurityProviderError::caused_by(
+                SecurityProviderFailure::OperationFailed,
+                SecurityOperation::SignRequest,
+                source,
+            )
+        })?;
+
+        let mut fields = vec![(CheetahString::from(ACCESS_KEY), Secret::new(self.access_key.clone()))];
+        if let Some(security_token) = &self.security_token {
+            fields.push((CheetahString::from(SECURITY_TOKEN), Secret::new(security_token.clone())));
+        }
+        fields.push((
+            CheetahString::from(SIGNATURE),
+            Secret::new(CheetahString::from(signature)),
+        ));
+        Ok(Signature::new(fields))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientCredentials {
+    #[serde(alias = "AccessKey", alias = "access_key")]
+    access_key: Option<String>,
+    #[serde(alias = "SecretKey", alias = "secret_key")]
+    secret_key: Option<String>,
+    #[serde(alias = "SecurityToken", alias = "security_token")]
+    security_token: Option<String>,
+}
+
+fn non_blank(value: CheetahString) -> Option<CheetahString> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(CheetahString::from(value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+
+    use rocketmq_protocol::protocol::header::empty_header::EmptyHeader;
+
+    use super::*;
+
+    fn remote_addr() -> SocketAddr {
+        "127.0.0.1:9876".parse().unwrap()
+    }
+
+    #[test]
+    fn required_secret_file_rejects_missing_malformed_and_incomplete_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("inner-client.json");
+        assert!(AclClientRpcHook::from_required_credentials_file(&path, SignatureAlgorithm::HmacSha1).is_err());
+        for invalid in [
+            "",
+            "not-json",
+            r#"{"accessKey":"inner"}"#,
+            r#"{"accessKey":"inner","secretKey":" "}"#,
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            let error =
+                AclClientRpcHook::from_required_credentials_file(&path, SignatureAlgorithm::HmacSha1).unwrap_err();
+            assert!(!error.to_string().contains("not-json"));
+        }
+        std::fs::write(&path, r#"{"accessKey":"inner","secretKey":"mounted-secret"}"#).unwrap();
+        let signer = AclClientRpcHook::from_required_credentials_file(&path, SignatureAlgorithm::HmacSha1).unwrap();
+        assert_eq!(signer.access_key().as_str(), "inner");
+        assert!(!format!("{signer:?}").contains("mounted-secret"));
+    }
+
+    #[test]
+    fn from_auth_config_skips_blank_or_incomplete_credentials() {
+        assert!(AclClientRpcHook::from_auth_config(&AuthConfig::default())
+            .unwrap()
+            .is_none());
+        assert!(
+            AclClientRpcHook::from_credentials_json(r#"{"accessKey":"ak"}"#, SignatureAlgorithm::HmacSha1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(AclClientRpcHook::from_credentials_json(
+            r#"{"accessKey":" ","secretKey":"sk"}"#,
+            SignatureAlgorithm::HmacSha1
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn from_auth_config_parses_inner_client_credentials() {
+        let hook = AclClientRpcHook::from_credentials_json(
+            r#"{"accessKey":" inner ","secretKey":" secret ","securityToken":" token "}"#,
+            SignatureAlgorithm::HmacSha1,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(hook.access_key().as_str(), "inner");
+        assert_eq!(hook.secret_key().as_str(), "secret");
+        assert_eq!(hook.security_token().map(CheetahString::as_str), Some("token"));
+    }
+
+    #[test]
+    fn from_tools_file_reads_java_tools_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let tools_file = temp.path().join("tools.yml");
+        fs::write(&tools_file, "accessKey: tools-ak\nsecretKey: tools-sk\n").unwrap();
+
+        let hook = AclClientRpcHook::from_tools_file(&tools_file, SignatureAlgorithm::HmacSha1)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(hook.access_key().as_str(), "tools-ak");
+        assert_eq!(hook.secret_key().as_str(), "tools-sk");
+    }
+
+    #[test]
+    fn do_before_request_adds_java_acl_fields_and_signature() {
+        let hook = AclClientRpcHook::new("alice", "secret", Some("token"), SignatureAlgorithm::HmacSha1).unwrap();
+        let mut request =
+            RemotingCommand::create_request_command(10, EmptyHeader {}).set_ext_fields(HashMap::from([(
+                CheetahString::from("topic"),
+                CheetahString::from("topic-a"),
+            )]));
+
+        hook.do_before_request(remote_addr(), &mut request).unwrap();
+
+        let fields = request.ext_fields().unwrap();
+        let expected_signature = acl_signer::cal_signature(b"alicetokentopic-a", "secret").unwrap();
+        assert_eq!(fields.get("AccessKey").map(CheetahString::as_str), Some("alice"));
+        assert_eq!(fields.get("SecurityToken").map(CheetahString::as_str), Some("token"));
+        assert_eq!(
+            fields.get("Signature").map(CheetahString::as_str),
+            Some(expected_signature.as_str())
+        );
+    }
+
+    #[test]
+    fn do_before_request_excludes_existing_signature_when_resigning_like_java() {
+        let hook = AclClientRpcHook::new("alice", "secret", Some("token"), SignatureAlgorithm::HmacSha1).unwrap();
+        let mut request = RemotingCommand::create_request_command(10, EmptyHeader {}).set_ext_fields(HashMap::from([
+            (CheetahString::from("topic"), CheetahString::from("topic-a")),
+            (CheetahString::from(SIGNATURE), CheetahString::from("stale-signature")),
+        ]));
+
+        hook.do_before_request(remote_addr(), &mut request).unwrap();
+
+        let fields = request.ext_fields().unwrap();
+        let expected_signature = acl_signer::cal_signature(b"alicetokentopic-a", "secret").unwrap();
+        assert_eq!(
+            fields.get(SIGNATURE).map(CheetahString::as_str),
+            Some(expected_signature.as_str())
+        );
+    }
+
+    #[test]
+    fn outbound_signer_matches_java_rpc_hook_signature_fields() {
+        let signer = AclClientRpcHook::new("alice", "secret", Some("token"), SignatureAlgorithm::HmacSha1).unwrap();
+        let fields = HashMap::from([(CheetahString::from("topic"), CheetahString::from("topic-a"))]);
+
+        let signature = signer
+            .sign(SecurityRequestView::new(10, 0, &fields, None, None))
+            .unwrap();
+        let signed_fields = signature
+            .fields()
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.expose_secret().as_str()))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(signed_fields.get(ACCESS_KEY), Some(&"alice"));
+        assert_eq!(signed_fields.get(SECURITY_TOKEN), Some(&"token"));
+        let expected = acl_signer::cal_signature(b"alicetokentopic-a", "secret").unwrap();
+        assert_eq!(signed_fields.get(SIGNATURE), Some(&expected.as_str()));
+    }
+}

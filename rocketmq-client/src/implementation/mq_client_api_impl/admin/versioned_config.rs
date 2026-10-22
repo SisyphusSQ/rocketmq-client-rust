@@ -1,0 +1,782 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Custom fork: Java 4.6.1 network lifecycle and preserved physical request failures.
+
+use super::*;
+#[cfg(feature = "admin-mutation")]
+use crate::admin::BrokerConfigPatchOutcome;
+#[cfg(feature = "admin-mutation")]
+use crate::admin::MutationTopicConfigVersioned;
+#[cfg(feature = "admin-mutation")]
+use crate::admin::SubscriptionGroupConfigPatch;
+#[cfg(feature = "admin-mutation")]
+use crate::admin::SubscriptionGroupConfigPatchOutcome;
+#[cfg(feature = "admin-read")]
+use crate::admin::SubscriptionGroupConfigVersioned;
+#[cfg(feature = "admin-mutation")]
+use crate::admin::TopicConfigPatch;
+#[cfg(feature = "admin-mutation")]
+use crate::admin::TopicConfigPatchOutcome;
+#[cfg(feature = "admin-read")]
+use crate::admin::TopicConfigVersioned;
+use rocketmq_protocol::protocol::header::get_broker_config_response_header::GetBrokerConfigResponseHeader;
+#[cfg(feature = "admin-mutation")]
+use rocketmq_protocol::protocol::header::update_broker_config_request_header::UpdateBrokerConfigRequestHeader;
+#[cfg(feature = "admin-mutation")]
+use rocketmq_protocol::protocol::header::update_broker_config_response_header::UpdateBrokerConfigResponseHeader;
+#[cfg(feature = "admin-mutation")]
+use rocketmq_protocol::protocol::header::update_subscription_group_config_cas_request_header::UpdateSubscriptionGroupConfigCasRequestHeader;
+#[cfg(any(feature = "admin-read", feature = "admin-mutation"))]
+use rocketmq_protocol::protocol::header::update_subscription_group_config_cas_response_header::UpdateSubscriptionGroupConfigCasResponseHeader;
+#[cfg(feature = "admin-mutation")]
+use rocketmq_protocol::protocol::header::update_topic_config_cas_request_header::UpdateTopicConfigCasRequestHeader;
+#[cfg(any(feature = "admin-read", feature = "admin-mutation"))]
+use rocketmq_protocol::protocol::header::update_topic_config_cas_response_header::UpdateTopicConfigCasResponseHeader;
+
+pub(crate) struct BrokerConfigSnapshot {
+    pub(crate) generation: Option<u64>,
+    pub(crate) properties: HashMap<CheetahString, CheetahString>,
+}
+
+fn broker_config_snapshot_from_response(response: &RemotingCommand) -> ClientResult<BrokerConfigSnapshot> {
+    // Custom: malformed/absent remote properties are protocol failures, never caller arguments.
+    let properties = resource_properties(response, "getBrokerConfig")?;
+    let generation = response
+        .decode_command_custom_header::<GetBrokerConfigResponseHeader>()
+        .ok()
+        .map(|header| header.config_generation)
+        .filter(|generation| *generation > 0);
+    Ok(BrokerConfigSnapshot { generation, properties })
+}
+
+#[cfg(feature = "admin-read")]
+fn topic_config_versioned_from_response(response: &RemotingCommand) -> ClientResult<TopicConfigVersioned> {
+    let body = response.get_body().ok_or(ClientError::response_process_failed(
+        "get_topic_config_with_version",
+        "Topic config response body is empty",
+    ))?;
+    let mapping = serde_json::from_slice::<TopicConfigAndQueueMapping>(body.as_ref())
+        .map_err(|error| ClientError::response_process_source("get_topic_config_with_version", error))?;
+    let header = response
+        .decode_command_custom_header::<UpdateTopicConfigCasResponseHeader>()
+        .map_err(|error| ClientError::response_process_source("get_topic_config_with_version", error))?;
+    Ok(TopicConfigVersioned {
+        version: header.topic_version,
+        config: mapping.topic_config,
+    })
+}
+
+#[cfg(feature = "admin-mutation")]
+pub(super) fn mutation_topic_config_versioned_from_response(
+    response: &RemotingCommand,
+) -> ClientResult<MutationTopicConfigVersioned> {
+    let body = response.get_body().ok_or(ClientError::response_process_failed(
+        "get_topic_config_with_version",
+        "Topic config response body is empty",
+    ))?;
+    let mapping = serde_json::from_slice::<TopicConfigAndQueueMapping>(body.as_ref())
+        .map_err(|error| ClientError::response_process_source("get_topic_config_with_version", error))?;
+    let header = response
+        .decode_command_custom_header::<UpdateTopicConfigCasResponseHeader>()
+        .map_err(|error| ClientError::response_process_source("get_topic_config_with_version", error))?;
+    Ok(MutationTopicConfigVersioned {
+        version: header.topic_version,
+        config: mapping.topic_config,
+    })
+}
+
+#[cfg(feature = "admin-read")]
+fn subscription_group_config_versioned_from_response(
+    response: &RemotingCommand,
+) -> ClientResult<SubscriptionGroupConfigVersioned> {
+    let body = response.get_body().ok_or(ClientError::response_process_failed(
+        "get_subscription_group_config_with_version",
+        "Subscription Group config response body is empty",
+    ))?;
+    let config = rocketmq_protocol::protocol::subscription::subscription_group_config::SubscriptionGroupConfig::decode(
+        body.as_ref(),
+    )
+    .map_err(|error| ClientError::response_process_source("get_subscription_group_config_with_version", error))?;
+    let header = response
+        .decode_command_custom_header::<UpdateSubscriptionGroupConfigCasResponseHeader>()
+        .map_err(|error| ClientError::response_process_source("get_subscription_group_config_with_version", error))?;
+    Ok(SubscriptionGroupConfigVersioned {
+        version: header.subscription_group_version,
+        config,
+    })
+}
+
+#[cfg(feature = "admin-mutation")]
+fn topic_config_patch_outcome_from_response(
+    response: &RemotingCommand,
+    expected_version: u64,
+) -> ClientResult<TopicConfigPatchOutcome> {
+    match ResponseCode::from(response.code()) {
+        ResponseCode::Success => {
+            let header = response
+                .decode_command_custom_header::<UpdateTopicConfigCasResponseHeader>()
+                .map_err(|error| ClientError::response_process_source("patch_topic_config_if_version", error))?;
+            let expected_next = expected_version
+                .checked_add(1)
+                .ok_or(ClientError::response_process_failed(
+                    "patch_topic_config_if_version",
+                    "Broker accepted a Topic patch after the version counter was exhausted",
+                ))?;
+            if header.topic_version != expected_next {
+                return Err(ClientError::response_process_failed(
+                    "patch_topic_config_if_version",
+                    format!(
+                        "Broker returned Topic config version {}, expected {}",
+                        header.topic_version, expected_next
+                    ),
+                ));
+            }
+            Ok(TopicConfigPatchOutcome::Applied {
+                previous_version: expected_version,
+                version: header.topic_version,
+            })
+        }
+        ResponseCode::InvalidParameter => {
+            if let Ok(header) = response.decode_command_custom_header::<UpdateTopicConfigCasResponseHeader>() {
+                return Ok(TopicConfigPatchOutcome::VersionConflict {
+                    expected_version,
+                    actual_version: header.topic_version,
+                });
+            }
+            Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string())
+            ))
+        }
+        _ => Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or_else(String::new, |remark| remark.to_string())
+        )),
+    }
+}
+
+#[cfg(feature = "admin-mutation")]
+fn subscription_group_config_patch_outcome_from_response(
+    response: &RemotingCommand,
+    expected_version: u64,
+) -> ClientResult<SubscriptionGroupConfigPatchOutcome> {
+    match ResponseCode::from(response.code()) {
+        ResponseCode::Success => {
+            let header = response
+                .decode_command_custom_header::<UpdateSubscriptionGroupConfigCasResponseHeader>()
+                .map_err(|error| {
+                    ClientError::response_process_source("patch_subscription_group_config_if_version", error)
+                })?;
+            let expected_next = expected_version
+                .checked_add(1)
+                .ok_or(ClientError::response_process_failed(
+                    "patch_subscription_group_config_if_version",
+                    "Broker accepted a Subscription Group patch after the version counter was exhausted",
+                ))?;
+            if header.subscription_group_version != expected_next {
+                return Err(ClientError::response_process_failed(
+                    "patch_subscription_group_config_if_version",
+                    format!(
+                        "Broker returned Subscription Group config version {}, expected {}",
+                        header.subscription_group_version, expected_next
+                    ),
+                ));
+            }
+            Ok(SubscriptionGroupConfigPatchOutcome::Applied {
+                previous_version: expected_version,
+                version: header.subscription_group_version,
+            })
+        }
+        ResponseCode::InvalidParameter => {
+            if let Ok(header) =
+                response.decode_command_custom_header::<UpdateSubscriptionGroupConfigCasResponseHeader>()
+            {
+                return Ok(SubscriptionGroupConfigPatchOutcome::VersionConflict {
+                    expected_version,
+                    actual_version: header.subscription_group_version,
+                });
+            }
+            Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string())
+            ))
+        }
+        _ => Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or_else(String::new, |remark| remark.to_string())
+        )),
+    }
+}
+
+impl MQClientAPIImpl {
+    #[cfg(feature = "admin-read")]
+    pub(crate) async fn get_topic_config_with_version(
+        &self,
+        addr: &CheetahString,
+        topic: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<TopicConfigVersioned> {
+        let request = self.create_request_command(
+            RequestCode::GetTopicConfig,
+            GetTopicConfigRequestHeader {
+                topic,
+                topic_request_header: None,
+            },
+        );
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_topic_config_with_version",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_topic_config_with_version",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            return topic_config_versioned_from_response(&response);
+        }
+        Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or_else(String::new, |remark| remark.to_string())
+        ))
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn get_topic_config_with_version_for_mutation(
+        &self,
+        addr: &CheetahString,
+        topic: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<MutationTopicConfigVersioned> {
+        let request = self.create_request_command(
+            RequestCode::GetTopicConfig,
+            GetTopicConfigRequestHeader {
+                topic,
+                topic_request_header: None,
+            },
+        );
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_topic_config_with_version_for_mutation",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_topic_config_with_version_for_mutation",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            return mutation_topic_config_versioned_from_response(&response);
+        }
+        Err(mq_client_err!(
+            response.code(),
+            response.remark().map_or_else(String::new, |remark| remark.to_string())
+        ))
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn update_broker_config_if_generation(
+        &self,
+        addr: &CheetahString,
+        expected_generation: u64,
+        properties: HashMap<CheetahString, CheetahString>,
+        timeout_millis: u64,
+    ) -> ClientResult<BrokerConfigPatchOutcome> {
+        if expected_generation == 0 {
+            return Err(ClientError::illegal_argument(
+                "expected broker config generation must be greater than zero",
+            ));
+        }
+        let validator_input = properties
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect::<HashMap<String, String>>();
+        crate::base::validators::Validators::check_broker_config(&validator_input)?;
+
+        let body = mix_all::properties_to_string(&properties);
+        if body.is_empty() {
+            return Err(ClientError::illegal_argument(
+                "generation-checked broker config patch must not be empty",
+            ));
+        }
+
+        let request = self
+            .create_request_command(
+                RequestCode::UpdateBrokerConfigCas,
+                UpdateBrokerConfigRequestHeader { expected_generation },
+            )
+            .set_body(body.to_string());
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "update_broker_config_if_generation",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "update_broker_config_if_generation",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => {
+                let header = response
+                    .decode_command_custom_header::<UpdateBrokerConfigResponseHeader>()
+                    .map_err(|error| {
+                        ClientError::response_process_source("update_broker_config_if_generation", error)
+                    })?;
+                let expected_next = expected_generation
+                    .checked_add(1)
+                    .ok_or(ClientError::response_process_failed(
+                        "update_broker_config_if_generation",
+                        "broker accepted a patch after the generation counter was exhausted",
+                    ))?;
+                if header.config_generation != expected_next {
+                    return Err(ClientError::response_process_failed(
+                        "update_broker_config_if_generation",
+                        format!(
+                            "broker returned generation {}, expected {}",
+                            header.config_generation, expected_next
+                        ),
+                    ));
+                }
+                Ok(BrokerConfigPatchOutcome::Applied {
+                    previous_generation: expected_generation,
+                    generation: header.config_generation,
+                })
+            }
+            ResponseCode::InvalidParameter => {
+                if let Ok(header) = response.decode_command_custom_header::<UpdateBrokerConfigResponseHeader>() {
+                    return Ok(BrokerConfigPatchOutcome::GenerationConflict {
+                        expected_generation,
+                        actual_generation: header.config_generation,
+                    });
+                }
+                Err(mq_client_err!(
+                    response.code(),
+                    response.remark().map_or_else(String::new, |remark| remark.to_string())
+                ))
+            }
+            _ => Err(mq_client_err!(
+                response.code(),
+                response.remark().map_or_else(String::new, |remark| remark.to_string())
+            )),
+        }
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn update_topic_config_if_version(
+        &self,
+        addr: &CheetahString,
+        topic: CheetahString,
+        expected_version: u64,
+        patch: TopicConfigPatch,
+        timeout_millis: u64,
+    ) -> ClientResult<TopicConfigPatchOutcome> {
+        if patch.is_empty() {
+            return Err(ClientError::illegal_argument(
+                "version-checked Topic config patch must not be empty",
+            ));
+        }
+        let read_queue_nums = patch
+            .read_queue_nums
+            .map(|value| {
+                if !(1..=128).contains(&value) {
+                    return Err(ClientError::illegal_argument("readQueueNums must be between 1 and 128"));
+                }
+                i32::try_from(value).map_err(|_| ClientError::illegal_argument("readQueueNums exceeds Java int range"))
+            })
+            .transpose()?;
+        let write_queue_nums = patch
+            .write_queue_nums
+            .map(|value| {
+                if !(1..=128).contains(&value) {
+                    return Err(ClientError::illegal_argument(
+                        "writeQueueNums must be between 1 and 128",
+                    ));
+                }
+                i32::try_from(value).map_err(|_| ClientError::illegal_argument("writeQueueNums exceeds Java int range"))
+            })
+            .transpose()?;
+        let request = self.create_request_command(
+            RequestCode::UpdateTopicConfigCas,
+            UpdateTopicConfigCasRequestHeader {
+                topic,
+                expected_version,
+                read_queue_nums,
+                write_queue_nums,
+                order: patch.order,
+            },
+        );
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "update_topic_config_if_version",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "update_topic_config_if_version",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        topic_config_patch_outcome_from_response(&response, expected_version)
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    pub(crate) async fn update_subscription_group_config_if_version(
+        &self,
+        addr: &CheetahString,
+        group: CheetahString,
+        expected_version: u64,
+        patch: SubscriptionGroupConfigPatch,
+        timeout_millis: u64,
+    ) -> ClientResult<SubscriptionGroupConfigPatchOutcome> {
+        if patch.is_empty() {
+            return Err(ClientError::illegal_argument(
+                "version-checked Subscription Group config patch must not be empty",
+            ));
+        }
+        let retry_max_times = patch
+            .retry_max_times
+            .map(|value| {
+                if !(1..=16).contains(&value) {
+                    return Err(ClientError::illegal_argument("retryMaxTimes must be between 1 and 16"));
+                }
+                i32::try_from(value).map_err(|_| ClientError::illegal_argument("retryMaxTimes exceeds Java int range"))
+            })
+            .transpose()?;
+        let retry_queue_nums = patch
+            .retry_queue_nums
+            .map(|value| {
+                if !(1..=8).contains(&value) {
+                    return Err(ClientError::illegal_argument("retryQueueNums must be between 1 and 8"));
+                }
+                i32::try_from(value).map_err(|_| ClientError::illegal_argument("retryQueueNums exceeds Java int range"))
+            })
+            .transpose()?;
+        let consume_timeout_minutes = patch
+            .consume_timeout_minutes
+            .map(|value| {
+                if !(1..=1_440).contains(&value) {
+                    return Err(ClientError::illegal_argument(
+                        "consumeTimeoutMinutes must be between 1 and 1440",
+                    ));
+                }
+                i32::try_from(value)
+                    .map_err(|_| ClientError::illegal_argument("consumeTimeoutMinutes exceeds Java int range"))
+            })
+            .transpose()?;
+        let request = self.create_request_command(
+            RequestCode::UpdateSubscriptionGroupConfigCas,
+            UpdateSubscriptionGroupConfigCasRequestHeader {
+                group,
+                expected_version,
+                retry_max_times,
+                retry_queue_nums,
+                consume_timeout_minutes,
+            },
+        );
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "update_subscription_group_config_if_version",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "update_subscription_group_config_if_version",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        subscription_group_config_patch_outcome_from_response(&response, expected_version)
+    }
+
+    pub(crate) async fn get_broker_config_snapshot(
+        &self,
+        addr: &CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<BrokerConfigSnapshot> {
+        let request = self.create_remoting_command(RequestCode::GetBrokerConfig);
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_broker_config_snapshot",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_broker_config_snapshot",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+
+        match ResponseCode::from(response.code()) {
+            ResponseCode::Success => broker_config_snapshot_from_response(&response),
+            _ => Err(admin_broker_response_error("getBrokerConfig", &response, addr.as_str())),
+        }
+    }
+
+    #[cfg(feature = "admin-read")]
+    pub(crate) async fn get_subscription_group_config_with_version(
+        &self,
+        addr: &CheetahString,
+        group: CheetahString,
+        timeout_millis: u64,
+    ) -> ClientResult<SubscriptionGroupConfigVersioned> {
+        let request = self.create_request_command(
+            RequestCode::GetSubscriptionGroupConfig,
+            rocketmq_protocol::protocol::header::get_subscription_group_config_request_header::GetSubscriptionGroupConfigRequestHeader {
+                group,
+                rpc_request_header: None,
+            },
+        );
+        let broker_addr = mix_all::broker_vip_channel(self.client_config.vip_channel_enabled, addr.as_str());
+        let outcome = self
+            .remoting_client
+            .invoke_request(Some(&broker_addr), request, timeout_millis)
+            .await;
+        let response = match outcome {
+            Ok(OutboundRequestOutcome::Response(response)) => response,
+            Ok(OutboundRequestOutcome::Rejected(rejection)) => {
+                return Err(admin_request_error(
+                    "get_subscription_group_config_with_version",
+                    RetryInput::Rejected(rejection),
+                ));
+            }
+            Ok(OutboundRequestOutcome::Contract(contract)) => {
+                return Err(admin_request_error(
+                    "get_subscription_group_config_with_version",
+                    RetryInput::Contract(contract),
+                ));
+            }
+            Err(error) => return Err(ClientError::from_transport(error)),
+        };
+        if ResponseCode::from(response.code()) == ResponseCode::Success {
+            return subscription_group_config_versioned_from_response(&response);
+        }
+        Err(client_broker_err!(
+            response.code(),
+            response.remark().map_or_else(String::new, |remark| remark.to_string()),
+            broker_addr
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_is_bound_to_the_same_allowlisted_response_body() {
+        let mut response =
+            RemotingCommand::create_success_response_command_with_header(GetBrokerConfigResponseHeader {
+                version: Some("{\"stateVersion\":0,\"timestamp\":6,\"counter\":7}".into()),
+                config_generation: 7,
+            })
+            .set_body("sendMessageThreadPoolNums=32\naccessKey=must-not-escape");
+        response.make_custom_header_to_net();
+
+        let snapshot = broker_config_snapshot_from_response(&response).expect("snapshot");
+        assert_eq!(snapshot.generation, Some(7));
+        assert_eq!(
+            snapshot
+                .properties
+                .get("sendMessageThreadPoolNums")
+                .map(CheetahString::as_str),
+            Some("32")
+        );
+    }
+
+    #[test]
+    fn legacy_response_remains_readable_without_claiming_a_generation() {
+        let response = RemotingCommand::create_success_response_command().set_body("sendMessageThreadPoolNums=32");
+
+        let snapshot = broker_config_snapshot_from_response(&response).expect("legacy snapshot");
+        assert_eq!(snapshot.generation, None);
+    }
+
+    #[cfg(feature = "admin-read")]
+    #[test]
+    fn topic_config_response_binds_body_to_version() {
+        let config = TopicConfig::with_queues("orders", 4, 6);
+        let mut response =
+            RemotingCommand::create_success_response_command_with_header(UpdateTopicConfigCasResponseHeader {
+                topic_version: 9,
+            })
+            .set_body(
+                serde_json::to_vec(&TopicConfigAndQueueMapping::new(config.clone(), None))
+                    .expect("Topic response body"),
+            );
+        response.make_custom_header_to_net();
+
+        let snapshot = topic_config_versioned_from_response(&response).expect("versioned Topic config");
+        assert_eq!(snapshot.version, 9);
+        assert_eq!(snapshot.config, config);
+    }
+
+    #[cfg(feature = "admin-read")]
+    #[test]
+    fn topic_config_response_preserves_body_decode_source() {
+        let response = RemotingCommand::create_success_response_command().set_body("{");
+
+        let error = topic_config_versioned_from_response(&response).expect_err("invalid body must fail");
+
+        assert!(error.is(&rocketmq_error::PROTOCOL_RESPONSE_FAILED));
+        assert!(error.source_ref::<serde_json::Error>().is_some());
+    }
+
+    #[cfg(feature = "admin-read")]
+    #[test]
+    fn subscription_group_config_response_binds_body_to_version() {
+        let config = rocketmq_protocol::protocol::subscription::subscription_group_config::SubscriptionGroupConfig::new(
+            "orders-consumer".into(),
+        );
+        let mut response = RemotingCommand::create_success_response_command_with_header(
+            UpdateSubscriptionGroupConfigCasResponseHeader {
+                subscription_group_version: 9,
+            },
+        )
+        .set_body(config.encode().expect("Subscription Group response body"));
+        response.make_custom_header_to_net();
+
+        let snapshot =
+            subscription_group_config_versioned_from_response(&response).expect("versioned Subscription Group config");
+        assert_eq!(snapshot.version, 9);
+        assert_eq!(snapshot.config.group_name(), config.group_name());
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    #[test]
+    fn topic_config_patch_response_distinguishes_commit_and_conflict() {
+        let mut applied =
+            RemotingCommand::create_success_response_command_with_header(UpdateTopicConfigCasResponseHeader {
+                topic_version: 10,
+            });
+        applied.make_custom_header_to_net();
+        assert_eq!(
+            topic_config_patch_outcome_from_response(&applied, 9).expect("applied outcome"),
+            TopicConfigPatchOutcome::Applied {
+                previous_version: 9,
+                version: 10,
+            }
+        );
+
+        let mut conflict = RemotingCommand::create_response_command_with_code_and_header(
+            ResponseCode::InvalidParameter,
+            UpdateTopicConfigCasResponseHeader { topic_version: 11 },
+        );
+        conflict.make_custom_header_to_net();
+        assert_eq!(
+            topic_config_patch_outcome_from_response(&conflict, 9).expect("conflict outcome"),
+            TopicConfigPatchOutcome::VersionConflict {
+                expected_version: 9,
+                actual_version: 11,
+            }
+        );
+    }
+
+    #[cfg(feature = "admin-mutation")]
+    #[test]
+    fn subscription_group_patch_response_distinguishes_commit_and_conflict() {
+        let mut applied = RemotingCommand::create_success_response_command_with_header(
+            UpdateSubscriptionGroupConfigCasResponseHeader {
+                subscription_group_version: 10,
+            },
+        );
+        applied.make_custom_header_to_net();
+        assert_eq!(
+            subscription_group_config_patch_outcome_from_response(&applied, 9).expect("applied outcome"),
+            SubscriptionGroupConfigPatchOutcome::Applied {
+                previous_version: 9,
+                version: 10,
+            }
+        );
+
+        let mut conflict = RemotingCommand::create_response_command_with_code_and_header(
+            ResponseCode::InvalidParameter,
+            UpdateSubscriptionGroupConfigCasResponseHeader {
+                subscription_group_version: 11,
+            },
+        );
+        conflict.make_custom_header_to_net();
+        assert_eq!(
+            subscription_group_config_patch_outcome_from_response(&conflict, 9).expect("conflict outcome"),
+            SubscriptionGroupConfigPatchOutcome::VersionConflict {
+                expected_version: 9,
+                actual_version: 11,
+            }
+        );
+    }
+}

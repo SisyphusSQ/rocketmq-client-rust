@@ -1,0 +1,305 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::any::Any;
+use std::collections::HashMap;
+
+use cheetah_string::CheetahString;
+
+use crate::protocol::header_codec::HeaderFieldSource;
+use crate::protocol::header_codec::ResolvedHeaderKey;
+use crate::rocketmq_serializable::RocketMQSerializable;
+use crate::ProtocolContractViolation;
+
+/// Wire-format extension fields carried by a RocketMQ remoting command.
+pub type HeaderMap = HashMap<CheetahString, CheetahString>;
+
+/// Encoding paths available for a custom header.
+///
+/// This capability is intentionally limited to encoding. Legacy fast decode
+/// remains a separate compatibility concern until all handwritten decoders
+/// have migrated to the typed [`crate::HeaderCodec`] path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum HeaderEncodeCapability {
+    /// Materialize the header into extension fields before serialization.
+    #[default]
+    MapOnly,
+    /// Encode the header directly into the ROCKETMQ extension-field payload.
+    DirectBinary,
+}
+
+pub trait CommandCustomHeader: AsAny {
+    /// Checks the fields of the implementing type.  
+    ///  
+    /// Returns a typed result indicating whether the fields are valid.
+    ///
+    /// If the fields are valid, the `Ok` variant is returned with an empty `()` value.
+    /// If the fields are invalid, an error governed by a stable
+    /// [`rocketmq_error::ErrorDescriptor`] is returned.
+    fn check_fields(&self) -> rocketmq_error::Result<()> {
+        Ok(())
+    }
+
+    /// Converts the implementing type to a map.  
+    ///  
+    /// Returns an `Option` that contains a `HashMap` of string keys and string values,  
+    /// representing the implementing type's fields.  
+    /// If the conversion is successful, a map is returned; explicitly audited
+    /// fieldless headers return an empty map. If conversion fails, `None` is
+    /// returned.
+    fn to_map(&self) -> Option<HashMap<CheetahString, CheetahString>>;
+
+    /// Appends this header's extension fields to an existing map.
+    ///
+    /// Generated implementations write directly into `out`. The default preserves compatibility
+    /// for handwritten implementations.
+    fn encode_into_map(&self, out: &mut HeaderMap) {
+        if let Some(fields) = self.to_map() {
+            out.extend(fields);
+        }
+    }
+
+    /// Validates and appends this header's fields to an existing map.
+    ///
+    /// Typed codecs override this method to preserve classified failures. The
+    /// default adapts handwritten implementations without changing their object-safe
+    /// trait surface or silently treating `None` as a successful conversion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolContractViolation::LegacyValidation`] when `check_fields`
+    /// fails, or [`ProtocolContractViolation::LegacyMapConversionFailed`] when a legacy
+    /// `to_map` implementation returns `None`.
+    fn try_encode_into_map(&self, out: &mut HeaderMap) -> Result<(), ProtocolContractViolation> {
+        self.check_fields()
+            .map_err(|_| ProtocolContractViolation::LegacyValidation {
+                header: std::any::type_name::<Self>(),
+            })?;
+        let fields = self
+            .to_map()
+            .ok_or(ProtocolContractViolation::LegacyMapConversionFailed {
+                header: std::any::type_name::<Self>(),
+            })?;
+        out.extend(fields);
+        Ok(())
+    }
+
+    /// Resolves a canonical key or decode alias for typed headers.
+    fn resolve_wire_key(&self, _key: &str) -> Option<ResolvedHeaderKey> {
+        None
+    }
+
+    /// Resolves a key and returns its canonical wire key.
+    fn canonical_wire_key(&self, key: &str) -> Option<&'static str> {
+        self.resolve_wire_key(key).map(|resolved| resolved.canonical)
+    }
+
+    /// Returns whether a canonical key or alias belongs to this header schema.
+    fn contains_wire_key(&self, key: &str) -> bool {
+        self.resolve_wire_key(key).is_some()
+    }
+
+    /// Returns a saturating extension-field payload capacity hint.
+    fn encoded_len_hint(&self) -> usize {
+        0
+    }
+
+    /// Returns the authoritative encoding path for this header.
+    fn encode_capability(&self) -> HeaderEncodeCapability {
+        HeaderEncodeCapability::MapOnly
+    }
+
+    /// Appends this header directly to a ROCKETMQ extension-field payload.
+    ///
+    /// Implementations must require only shared access so cloned remoting
+    /// commands can encode the same immutable header. Callers must check
+    /// [`Self::encode_capability`] before invoking this method. Implementations
+    /// are responsible for validating the header before the first write; the
+    /// frame entrypoint does not pre-validate because map and binary encoders
+    /// already own the authoritative validation boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified header codec error when validation or binary
+    /// representation fails. The default reports that direct encoding is
+    /// unavailable.
+    fn encode_direct_binary(&self, _out: &mut bytes::BytesMut) -> Result<(), ProtocolContractViolation> {
+        Err(ProtocolContractViolation::FastCodecUnavailable {
+            header: std::any::type_name::<Self>(),
+        })
+    }
+
+    /// Returns whether this header can write its complete JSON extension-field
+    /// object without first materializing a [`HeaderMap`].
+    fn supports_direct_json_fields(&self) -> bool {
+        false
+    }
+
+    /// Writes this header as one complete JSON extension-field object.
+    ///
+    /// Callers must check [`Self::supports_direct_json_fields`] before invoking
+    /// this method. Implementations must validate before writing and must leave
+    /// rollback to the enclosing frame encoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified header codec error when direct JSON encoding is
+    /// unavailable or validation fails.
+    fn encode_direct_json_fields(&self, _out: &mut bytes::BytesMut) -> Result<(), ProtocolContractViolation> {
+        Err(ProtocolContractViolation::FastCodecUnavailable {
+            header: std::any::type_name::<Self>(),
+        })
+    }
+
+    /// Writes the provided `key` to the `out` buffer if the `value` is not empty.
+    ///
+    /// # Arguments
+    ///
+    /// * `out` - A mutable reference to a `BytesMut` buffer where the `key` will be written.
+    /// * `key` - A string slice that represents the key to be written.
+    /// * `value` - A string slice that represents the value associated with the key.
+    ///
+    /// # Behavior
+    ///
+    /// If `value` is not empty, the function will write the `key` to the `out` buffer twice,
+    /// first with a short length prefix and then with a long length prefix.
+    fn write_if_not_null(&self, out: &mut bytes::BytesMut, key: &str, value: &str) {
+        if !value.is_empty() {
+            RocketMQSerializable::write_str(out, true, key);
+            RocketMQSerializable::write_str(out, false, value);
+        }
+    }
+
+    /// Compatibility adapter for the legacy mutable fast-encoding API.
+    ///
+    /// Production serialization uses [`Self::encode_capability`] and
+    /// [`Self::encode_direct_binary`] directly. This adapter cannot propagate
+    /// errors and remains only for existing callers during migration.
+    fn encode_fast(&mut self, out: &mut bytes::BytesMut) {
+        let _ = self.encode_direct_binary(out);
+    }
+
+    /// A placeholder function for fast decoding.
+    ///
+    /// This function currently does nothing and can be overridden by implementing types.
+    ///
+    /// # Arguments
+    ///
+    /// * `_fields` - A reference to a `HashMap` that contains the fields to be decoded.
+    fn decode_fast(&mut self, _fields: &HashMap<CheetahString, CheetahString>) -> rocketmq_error::Result<()> {
+        Ok(())
+    }
+
+    /// Indicates whether the implementing type supports fast codec.
+    ///
+    /// # Returns
+    ///
+    /// This legacy capability is limited to hand-written fast decoding. Direct
+    /// binary encoding is reported independently by [`Self::encode_capability`].
+    /// The default remains `false` so enabling generated direct encoding cannot
+    /// route decoding through an unimplemented legacy hook.
+    fn support_fast_codec(&self) -> bool {
+        false
+    }
+
+    /// Retrieves the value associated with the specified field from the provided map.
+    ///
+    /// # Arguments
+    ///
+    /// * `map` - A reference to a `HashMap` containing `CheetahString` keys and values.
+    /// * `field` - A reference to a `CheetahString` representing the field to retrieve.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(CheetahString)` - If the field is found in the map, returns the associated value.
+    /// * `Err(Error)` - If the field is not found in the map, returns an error indicating the
+    ///   field is required.
+    ///
+    /// # Errors
+    ///
+    /// This function returns a serialization error if the specified field is not found in the
+    /// map.
+    #[inline(always)]
+    fn get_and_check_not_none(
+        &self,
+        map: &HashMap<CheetahString, CheetahString>,
+        field: &CheetahString,
+    ) -> rocketmq_error::Result<CheetahString> {
+        match map.get(field) {
+            Some(value) => Ok(value.clone()),
+            None => Err(crate::error::serialization_decode_failed(
+                "header",
+                format!("The field {field} is required."),
+            )),
+        }
+    }
+
+    /// Retrieves a borrowed value associated with the specified field from the provided map.
+    #[inline(always)]
+    fn get_and_check_not_none_ref<'a>(
+        &self,
+        map: &'a HashMap<CheetahString, CheetahString>,
+        field: &CheetahString,
+    ) -> rocketmq_error::Result<&'a CheetahString> {
+        match map.get(field) {
+            Some(value) => Ok(value),
+            None => Err(crate::error::serialization_decode_failed(
+                "header",
+                format!("The field {field} is required."),
+            )),
+        }
+    }
+}
+
+pub trait AsAny: Any {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: CommandCustomHeader> AsAny for T {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+pub trait FromMap {
+    type Error: From<rocketmq_error::Error>;
+
+    type Target;
+
+    /// Whether production decode may call [`Self::from_field_source`] without
+    /// first materializing the compatibility map.
+    const SUPPORTS_HEADER_FIELD_SOURCE: bool = false;
+
+    /// Converts the implementing type from a map.
+    ///
+    /// Returns an instance of `Self::Target` that is created from the provided map.
+    fn from(map: &HashMap<CheetahString, CheetahString>) -> Result<Self::Target, Self::Error>;
+
+    /// Converts the implementing type from a borrowed field source.
+    ///
+    /// Generated request-header implementations override this method. The default is an
+    /// additive compatibility fallback for existing implementations and is not
+    /// selected by production dispatch while the capability remains `false`.
+    fn from_field_source(source: &dyn HeaderFieldSource) -> Result<Self::Target, Self::Error> {
+        let map = source.to_header_map();
+        Self::from(&map)
+    }
+}

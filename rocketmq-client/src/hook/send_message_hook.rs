@@ -1,0 +1,37 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::hook::send_message_context::SendMessageContext;
+
+pub trait SendMessageHook: Send + Sync {
+    fn hook_name(&self) -> &'static str;
+
+    fn send_message_before(&self, context: &Option<SendMessageContext<'_>>);
+
+    fn send_message_after(&self, context: &Option<SendMessageContext<'_>>);
+
+    /// Custom: mutable Java-equivalent before hook. The message is the actual
+    /// outbound value; context state is retained until the corresponding after hook.
+    fn send_message_before_mut(
+        &self,
+        context: &mut Option<SendMessageContext<'_>>,
+        _message: &mut (dyn rocketmq_model::common::message::MessageTrait + Send + Sync),
+    ) {
+        self.send_message_before(context);
+    }
+
+    fn send_message_after_mut(&self, context: &mut Option<SendMessageContext<'_>>) {
+        self.send_message_after(context);
+    }
+}

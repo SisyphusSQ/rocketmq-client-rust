@@ -1,0 +1,814 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use cheetah_string::CheetahString;
+use rocketmq_model::common::consumer::consume_from_where::ConsumeFromWhere;
+use rocketmq_model::common::message::message_ext::MessageExt;
+use rocketmq_model::common::message::message_queue::MessageQueue;
+use rocketmq_protocol::protocol::heartbeat::message_model::MessageModel;
+use rocketmq_protocol::protocol::heartbeat::subscription_data::SubscriptionData;
+
+use crate::consumer::allocate_message_queue_strategy::AllocateMessageQueueStrategy;
+use crate::consumer::message_queue_listener::ArcMessageQueueListener;
+use crate::consumer::message_queue_listener::MessageQueueListener;
+use crate::consumer::message_selector::MessageSelector;
+use crate::consumer::store::offset_store::OffsetStore;
+use crate::consumer::topic_message_queue_change_listener::TopicMessageQueueChangeListener;
+
+/// A consumer that pulls messages from brokers on demand, providing explicit control over
+/// fetch timing, offset management, and queue assignment.
+///
+/// Unlike the push consumer, the caller drives message retrieval through [`poll`] or
+/// [`poll_with_timeout`], and may manage offsets manually when auto-commit is disabled.
+/// Queue assignment can be controlled either by subscribing to topics (client-side rebalance)
+/// or by calling [`assign`] directly (client-controlled assignment).
+///
+/// All methods are asynchronous and do not block the calling thread.
+///
+/// [`poll`]: MessagePoll::poll
+/// [`poll_with_timeout`]: MessagePoll::poll_with_timeout
+/// [`assign`]: AssignmentControl::assign
+#[allow(async_fn_in_trait)]
+pub trait SubscriptionControl: Send + Sync {
+    /// Subscribes to the specified topic using the default subscription expression.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The name of the topic to subscribe to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the topic name is invalid or if the subscription cannot be
+    /// registered with the broker.
+    async fn subscribe(&self, topic: &str) -> crate::ClientResult<()>;
+
+    /// Subscribes to the specified topic with a tag-based or SQL-based filter expression.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The name of the topic to subscribe to.
+    /// * `sub_expression` - A tag expression (e.g. `"TagA || TagB"`) or SQL-92 predicate. Pass
+    ///   `"*"` to receive all messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the topic name is invalid, the expression cannot be parsed,
+    /// or the subscription cannot be registered with the broker.
+    async fn subscribe_with_expression(&self, topic: &str, sub_expression: &str) -> crate::ClientResult<()>;
+
+    /// Subscribes to the specified topic with a filter expression and a queue-change listener.
+    ///
+    /// The listener is invoked whenever the set of assigned [`MessageQueue`]s changes for
+    /// this topic due to rebalance.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The name of the topic to subscribe to.
+    /// * `sub_expression` - A tag expression or SQL-92 predicate. Pass `"*"` for all messages.
+    /// * `listener` - A [`MessageQueueListener`] notified on queue assignment changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the topic name is invalid, the expression cannot be parsed,
+    /// or the subscription cannot be registered with the broker.
+    async fn subscribe_with_listener<MQL>(
+        &self,
+        topic: &str,
+        sub_expression: &str,
+        listener: MQL,
+    ) -> crate::ClientResult<()>
+    where
+        MQL: MessageQueueListener + 'static;
+
+    /// Subscribes to the specified topic using a [`MessageSelector`] for server-side filtering.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The name of the topic to subscribe to.
+    /// * `selector` - The filter selector. Pass `None` to receive all messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the topic name is invalid, the selector expression is rejected
+    /// by the broker, or the subscription cannot be registered.
+    async fn subscribe_with_selector(&self, topic: &str, selector: Option<MessageSelector>) -> crate::ClientResult<()>;
+
+    /// Removes the subscription for the specified topic.
+    ///
+    /// Messages for this topic will no longer be fetched after the next rebalance cycle.
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The name of the topic to unsubscribe from.
+    async fn unsubscribe(&self, topic: &str);
+
+    /// Populates `sub_expression_map` with the filter selector for each subscribed topic,
+    /// providing the subscription metadata required for heartbeat payloads.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `sub_expression_map` - Output map from topic name to its [`MessageSelector`]. Entries are
+    ///   inserted for every topic that has an active subscription with a selector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription metadata cannot be retrieved.
+    async fn build_subscriptions_for_heartbeat(
+        &self,
+        sub_expression_map: &mut HashMap<String, MessageSelector>,
+    ) -> crate::ClientResult<()>;
+
+    /// Returns the subscriptions currently advertised in heartbeat payloads.
+    async fn subscriptions_for_heartbeat(&self) -> HashSet<SubscriptionData>;
+
+    /// Returns the configured message model.
+    async fn message_model(&self) -> MessageModel;
+
+    /// Sets the message model.
+    ///
+    /// This mirrors Java `DefaultLitePullConsumer.setMessageModel`.
+    async fn set_message_model(&self, message_model: MessageModel);
+
+    /// Returns where consumption starts when no offset exists.
+    async fn consume_from_where(&self) -> ConsumeFromWhere;
+
+    /// Sets where consumption starts when no offset exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for legacy `ConsumeFromWhere` values that Java LitePull rejects.
+    async fn set_consume_from_where(&self, consume_from_where: ConsumeFromWhere) -> crate::ClientResult<()>;
+
+    /// Returns the timestamp used by `ConsumeFromWhere::ConsumeFromTimestamp`.
+    async fn consume_timestamp(&self) -> Option<CheetahString>;
+
+    /// Sets the timestamp used by `ConsumeFromWhere::ConsumeFromTimestamp`.
+    async fn set_consume_timestamp(&self, consume_timestamp: Option<CheetahString>);
+
+    /// Returns the message queue allocation strategy used during rebalance.
+    async fn allocate_message_queue_strategy(&self) -> Arc<dyn AllocateMessageQueueStrategy + Send + Sync>;
+
+    /// Sets the message queue allocation strategy used during rebalance.
+    ///
+    /// This mirrors Java `DefaultLitePullConsumer.setAllocateMessageQueueStrategy`.
+    async fn set_allocate_message_queue_strategy(
+        &self,
+        allocate_message_queue_strategy: Arc<dyn AllocateMessageQueueStrategy + Send + Sync>,
+    );
+
+    /// Returns the listener notified when rebalance changes assigned message queues.
+    async fn message_queue_listener(&self) -> Option<ArcMessageQueueListener>;
+
+    /// Sets the listener notified when rebalance changes assigned message queues.
+    ///
+    /// Passing `None` clears the listener, matching Java's nullable
+    /// `DefaultLitePullConsumer.setMessageQueueListener`.
+    async fn set_message_queue_listener(&self, message_queue_listener: Option<ArcMessageQueueListener>);
+
+    /// Returns the topic metadata check interval in milliseconds.
+    async fn topic_metadata_check_interval_millis(&self) -> u64;
+
+    /// Sets the topic metadata check interval in milliseconds.
+    ///
+    /// Like Java, this applies directly to the stored configuration. If the
+    /// metadata task is already scheduled, the existing task keeps its start-time interval.
+    async fn set_topic_metadata_check_interval_millis(&self, interval_millis: u64);
+
+    /// Returns whether pulls always use the configured default broker ID.
+    async fn is_connect_broker_by_user(&self) -> bool;
+
+    /// Sets whether pulls always use the configured default broker ID.
+    ///
+    /// This mirrors Java `DefaultLitePullConsumer.setConnectBrokerByUser`.
+    async fn set_connect_broker_by_user(&self, connect_broker_by_user: bool);
+
+    /// Returns the broker ID used when user-controlled broker selection is enabled.
+    async fn default_broker_id(&self) -> u64;
+
+    /// Sets the broker ID used when user-controlled broker selection is enabled.
+    ///
+    /// This mirrors Java `DefaultLitePullConsumer.setDefaultBrokerId`.
+    async fn set_default_broker_id(&self, broker_id: u64);
+
+    /// Returns whether the subscription group runs in unit mode.
+    async fn is_unit_mode(&self) -> bool;
+
+    /// Sets whether the subscription group runs in unit mode.
+    ///
+    /// This mirrors Java `DefaultLitePullConsumer.setUnitMode`.
+    async fn set_unit_mode(&self, unit_mode: bool);
+
+    /// Registers a listener that is notified when the set of [`MessageQueue`]s for a topic changes.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic to monitor for queue changes.
+    /// * `listener` - A [`TopicMessageQueueChangeListener`] invoked when the queue set changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a listener is already registered for the given topic, or if the
+    /// registration fails due to an internal error.
+    async fn register_topic_message_queue_change_listener<TL>(
+        &self,
+        topic: &str,
+        listener: TL,
+    ) -> crate::ClientResult<()>
+    where
+        TL: TopicMessageQueueChangeListener + 'static;
+
+    /// Updates the name server address used for topic route discovery.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `name_server_address` - The new semicolon-separated name server address list.
+    async fn update_name_server_address(&self, name_server_address: &str) -> crate::ClientResult<()>;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait AssignmentControl: Send + Sync {
+    /// Returns the set of [`MessageQueue`]s currently assigned to this consumer.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the consumer is not in the running state.
+    async fn assignment(&self) -> crate::ClientResult<HashSet<MessageQueue>>;
+
+    /// Manually assigns the given [`MessageQueue`]s to this consumer, bypassing broker rebalance.
+    ///
+    /// Any previously assigned queues not present in `message_queues` are removed.
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_queues` - The complete set of queues to assign to this consumer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `message_queues` is empty or the assignment cannot be applied.
+    async fn assign(&self, message_queues: Vec<MessageQueue>) -> crate::ClientResult<()>;
+
+    /// Sets the subscription filter expression applied when fetching from manually assigned queues.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic for which the filter expression applies.
+    /// * `sub_expression` - A tag expression or SQL-92 predicate used to filter messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the expression is blank, the consumer has already started, or
+    /// the subscription cannot be switched to manual assignment mode.
+    async fn set_sub_expression_for_assign(&self, topic: &str, sub_expression: &str) -> crate::ClientResult<()>;
+
+    /// Seeks the fetch position of the specified [`MessageQueue`] to the given offset.
+    ///
+    /// The next [`poll`] invocation will return messages starting from `offset`.
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_queue` - The queue whose fetch position is to be updated.
+    /// * `offset` - The target offset. Must be within the queue's valid range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the queue is not currently assigned to this consumer,
+    /// or if the specified offset is out of the valid range.
+    ///
+    /// [`poll`]: MessagePoll::poll
+    async fn seek(&self, message_queue: &MessageQueue, offset: i64) -> crate::ClientResult<()>;
+
+    /// Suspends message fetching for the specified [`MessageQueue`]s.
+    ///
+    /// Paused queues are excluded from subsequent [`poll`] results until [`resume`] is called.
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_queues` - The queues to pause.
+    ///
+    /// [`poll`]: MessagePoll::poll
+    /// [`resume`]: AssignmentControl::resume
+    async fn pause(&self, message_queues: Vec<MessageQueue>);
+
+    /// Resumes message fetching for the specified [`MessageQueue`]s.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_queues` - The queues to resume.
+    async fn resume(&self, message_queues: Vec<MessageQueue>);
+
+    /// Seeks the fetch position of the specified [`MessageQueue`] to its earliest available offset.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_queue` - The queue to seek to the beginning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the queue is not assigned to this consumer or if the earliest
+    /// offset cannot be retrieved from the broker.
+    async fn seek_to_begin(&self, message_queue: &MessageQueue) -> crate::ClientResult<()>;
+
+    /// Seeks the fetch position of the specified [`MessageQueue`] to its latest available offset.
+    ///
+    /// The next [`poll`] call will return only messages published after this point.
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_queue` - The queue to seek to the end.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the queue is not assigned to this consumer or if the latest
+    /// offset cannot be retrieved from the broker.
+    ///
+    /// [`poll`]: MessagePoll::poll
+    async fn seek_to_end(&self, message_queue: &MessageQueue) -> crate::ClientResult<()>;
+
+    /// Checks whether a specific [`MessageQueue`] is currently paused.
+    ///
+    /// A paused queue will not be fetched from during [`poll`] operations until it is resumed.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_queue` - The queue to check.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the queue is paused, `false` otherwise.
+    ///
+    /// [`poll`]: MessagePoll::poll
+    async fn is_paused(&self, message_queue: &MessageQueue) -> bool;
+}
+
+#[allow(async_fn_in_trait)]
+// Custom fork: lifecycle, permission and transport failures remain typed Results.
+pub trait MessagePoll: Send + Sync {
+    /// Fetches the next batch of messages without allocating owned copies.
+    ///
+    /// Returns immutable `Arc<MessageExt>` handles without heap allocation or deep cloning.
+    /// The returned handles remain valid until
+    /// they are dropped. Messages that need to outlive the poll scope must be cloned explicitly.
+    ///
+    /// This method uses the default poll timeout configured for the consumer.
+    ///
+    /// # Performance
+    ///
+    /// Message contents are not copied. For workloads processing messages without long-term
+    /// storage, this eliminates allocation overhead compared to [`poll()`](Self::poll).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let messages = consumer.poll_zero_copy().await?;
+    /// for msg in &messages {
+    ///     process_message(msg);
+    /// }
+    ///
+    /// // Clone only filtered messages
+    /// let messages = consumer.poll_zero_copy().await?;
+    /// let important: Vec<MessageExt> = messages.into_iter()
+    ///     .filter(|msg| is_important(msg))
+    ///     .map(|msg| (*msg).clone())
+    ///     .collect();
+    /// ```
+    ///
+    /// Returns an empty vector if no messages are available within the default timeout period.
+    /// This function does not block the calling thread.
+    async fn poll_zero_copy(&self) -> crate::ClientResult<Vec<std::sync::Arc<MessageExt>>>;
+
+    /// Fetches the next batch of messages without allocating owned copies, with a specified
+    /// timeout.
+    ///
+    /// Behaves identically to [`poll_zero_copy()`](Self::poll_zero_copy), but waits up to `timeout` milliseconds
+    /// for messages to become available.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for messages, in milliseconds.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let messages = consumer.poll_with_timeout_zero_copy(1000).await?;
+    /// ```
+    ///
+    /// Returns an empty vector if no messages are available before the timeout expires.
+    /// This function does not block the calling thread.
+    async fn poll_with_timeout_zero_copy(&self, timeout: u64) -> crate::ClientResult<Vec<std::sync::Arc<MessageExt>>>;
+
+    /// Fetches the next batch of messages, returning owned copies.
+    ///
+    /// Each returned message is cloned from the internal message store. The caller
+    /// owns the returned messages and may store them beyond the poll scope.
+    ///
+    /// This method uses the default poll timeout configured for the consumer.
+    ///
+    /// # Performance
+    ///
+    /// Clones message metadata while the Bytes payload remains shared.
+    ///
+    /// For workloads that do not require owned messages, [`poll_zero_copy()`](Self::poll_zero_copy) avoids
+    /// this allocation overhead.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let messages = consumer.poll().await?;
+    /// my_store.save(messages);
+    /// ```
+    ///
+    /// Returns an empty vector if no messages are available within the timeout period.
+    /// This function does not block the calling thread.
+    async fn poll(&self) -> crate::ClientResult<Vec<MessageExt>>;
+
+    /// Fetches the next batch of messages with a specified timeout, returning owned copies.
+    ///
+    /// Behaves identically to [`poll()`](Self::poll), but waits up to `timeout` milliseconds for
+    /// messages to become available. All messages are deep-cloned.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for messages, in milliseconds.
+    ///
+    /// Returns an empty vector if no messages are available before the timeout expires.
+    /// This function does not block the calling thread.
+    async fn poll_with_timeout(&self, timeout: u64) -> crate::ClientResult<Vec<MessageExt>>;
+
+    /// Returns the default timeout used by [`poll`] in milliseconds.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// [`poll`]: MessagePoll::poll
+    async fn poll_timeout_millis(&self) -> u64;
+
+    /// Sets the default timeout used by [`poll`] in milliseconds.
+    ///
+    /// This follows the Java client setter and applies the value directly. Use
+    /// [`poll_with_timeout`] for a per-call timeout override.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// [`poll`]: MessagePoll::poll
+    /// [`poll_with_timeout`]: MessagePoll::poll_with_timeout
+    async fn set_poll_timeout_millis(&self, timeout_millis: u64);
+
+    /// Returns the maximum time that the broker may suspend a long-poll pull request.
+    async fn broker_suspend_max_time_millis(&self) -> u64;
+
+    /// Sets the maximum time that the broker may suspend a long-poll pull request.
+    ///
+    /// This follows Java `DefaultLitePullConsumer.setBrokerSuspendMaxTimeMillis`
+    /// and applies the value directly.
+    async fn set_broker_suspend_max_time_millis(&self, timeout_millis: u64);
+
+    /// Returns the consumer-side timeout for suspended long-poll pull requests.
+    async fn consumer_timeout_millis_when_suspend(&self) -> u64;
+
+    /// Sets the consumer-side timeout for suspended long-poll pull requests.
+    ///
+    /// This follows Java `DefaultLitePullConsumer.setConsumerTimeoutMillisWhenSuspend`
+    /// and applies the value directly.
+    async fn set_consumer_timeout_millis_when_suspend(&self, timeout_millis: u64);
+
+    /// Returns the RPC timeout used by lite pull requests in milliseconds.
+    async fn consumer_pull_timeout_millis(&self) -> u64;
+
+    /// Sets the RPC timeout used by lite pull requests in milliseconds.
+    ///
+    /// This follows Java `DefaultLitePullConsumer.setConsumerPullTimeoutMillis`
+    /// and applies the value directly.
+    async fn set_consumer_pull_timeout_millis(&self, timeout_millis: u64);
+
+    /// Returns the maximum number of messages requested in a single pull.
+    async fn pull_batch_size(&self) -> i32;
+
+    /// Sets the maximum number of messages requested in a single pull.
+    ///
+    /// This follows the Java client setter and applies the value directly.
+    async fn set_pull_batch_size(&self, pull_batch_size: i32);
+
+    /// Returns the configured number of pull worker threads.
+    async fn pull_thread_nums(&self) -> usize;
+
+    /// Sets the configured number of pull worker threads.
+    ///
+    /// This mirrors Java `DefaultLitePullConsumer.setPullThreadNums`.
+    async fn set_pull_thread_nums(&self, pull_thread_nums: usize);
+
+    /// Returns the maximum total number of cached messages across all queues.
+    async fn pull_threshold_for_all(&self) -> i64;
+
+    /// Sets the maximum total number of cached messages across all queues.
+    ///
+    /// This follows the Java client setter and applies the value directly.
+    async fn set_pull_threshold_for_all(&self, pull_threshold_for_all: i64);
+
+    /// Returns the maximum cached message count for each queue.
+    async fn pull_threshold_for_queue(&self) -> i64;
+
+    /// Sets the maximum cached message count for each queue.
+    ///
+    /// This follows the Java client setter and applies the value directly.
+    async fn set_pull_threshold_for_queue(&self, pull_threshold_for_queue: i64);
+
+    /// Returns the maximum cached message size in MiB for each queue.
+    async fn pull_threshold_size_for_queue(&self) -> i32;
+
+    /// Sets the maximum cached message size in MiB for each queue.
+    ///
+    /// This follows the Java client setter and applies the value directly.
+    async fn set_pull_threshold_size_for_queue(&self, pull_threshold_size_for_queue: i32);
+
+    /// Returns the maximum allowed offset span in a cached process queue.
+    async fn consume_max_span(&self) -> i64;
+
+    /// Sets the maximum allowed offset span in a cached process queue.
+    ///
+    /// This follows the Java client setter and applies the value directly.
+    async fn set_consume_max_span(&self, consume_max_span: i64);
+}
+
+#[allow(async_fn_in_trait)]
+pub trait ConsumerOffsetControl: Send + Sync {
+    /// Returns the configured offset store, if one has been set or initialized.
+    async fn offset_store(&self) -> Option<Arc<OffsetStore>>;
+
+    /// Sets the offset store used by the consumer.
+    ///
+    /// This mirrors Java `DefaultLitePullConsumer.setOffsetStore`. The store
+    /// should be set before startup so load, rebalance, and commit paths share
+    /// the same backend.
+    async fn set_offset_store(&self, offset_store: Option<Arc<OffsetStore>>) -> crate::ClientResult<()>;
+
+    /// Returns whether automatic offset commit is enabled.
+    ///
+    /// This function does not block the calling thread.
+    async fn is_auto_commit(&self) -> bool;
+
+    /// Enables or disables automatic offset commit.
+    ///
+    /// When auto-commit is enabled, offsets are committed periodically without explicit calls
+    /// to [`commit`] or [`commit_sync`]. When disabled, the caller is responsible for committing
+    /// offsets.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `auto_commit` - `true` to enable automatic offset commit; `false` to disable it.
+    ///
+    /// [`commit`]: ConsumerOffsetControl::commit
+    /// [`commit_sync`]: ConsumerOffsetControl::commit_sync
+    async fn set_auto_commit(&self, auto_commit: bool);
+
+    /// Returns the interval between automatic offset commits in milliseconds.
+    ///
+    /// This function does not block the calling thread.
+    async fn auto_commit_interval_millis(&self) -> u64;
+
+    /// Sets the interval between automatic offset commits in milliseconds.
+    ///
+    /// Values below the Java client minimum of 1000ms are ignored, matching
+    /// `DefaultLitePullConsumer.setAutoCommitIntervalMillis`.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `interval_millis` - The new auto-commit interval in milliseconds.
+    async fn set_auto_commit_interval_millis(&self, interval_millis: u64);
+
+    /// Queries the broker for all [`MessageQueue`]s belonging to the specified topic.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The name of the topic to query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the topic does not exist, if the name server is unreachable,
+    /// or if the consumer is not in the running state.
+    async fn fetch_message_queues(&self, topic: &str) -> crate::ClientResult<Vec<MessageQueue>>;
+
+    /// Queries the broker for the offset corresponding to the given timestamp in a queue.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_queue` - The queue to query.
+    /// * `timestamp` - The Unix timestamp in milliseconds. The broker returns the offset of the
+    ///   first message stored at or after this timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the queue is not found on the broker or the query fails.
+    async fn offset_for_timestamp(&self, message_queue: &MessageQueue, timestamp: u64) -> crate::ClientResult<i64>;
+
+    /// Queries the broker for the earliest message store time of the specified queue.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_queue` - The queue to query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the queue is not found on the broker, the consumer is not running,
+    /// or this LitePull implementation does not support broker offset metadata queries.
+    async fn earliest_msg_store_time(&self, message_queue: &MessageQueue) -> crate::ClientResult<i64>;
+
+    /// Queries the broker for the current maximum offset of the specified queue.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_queue` - The queue to query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the queue is not found on the broker, the consumer is not running,
+    /// or this LitePull implementation does not support broker offset metadata queries.
+    async fn max_offset(&self, message_queue: &MessageQueue) -> crate::ClientResult<i64>;
+
+    /// Queries the broker for the current minimum offset of the specified queue.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_queue` - The queue to query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the queue is not found on the broker, the consumer is not running,
+    /// or this LitePull implementation does not support broker offset metadata queries.
+    async fn min_offset(&self, message_queue: &MessageQueue) -> crate::ClientResult<i64>;
+
+    /// Commits all consumed offsets to the consumer offset store.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Deprecation
+    ///
+    /// This method is deprecated. The name implies broker-synchronous persistence, but Java
+    /// `DefaultLitePullConsumer.commitSync()` delegates to `commitAll()` and only updates the
+    /// consumer offset store. Use [`commit`] for the modern equivalent.
+    ///
+    /// [`commit`]: ConsumerOffsetControl::commit
+    async fn commit_sync(&self) -> crate::ClientResult<()>;
+
+    /// Commits the provided offsets and optionally persists them to the broker.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Deprecation
+    ///
+    /// This method is deprecated. The name implies synchronous behavior, but the underlying
+    /// implementation relies on a background thread to commit offsets rather than committing
+    /// synchronously. Use [`commit_with_map`] instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset_map` - A map from [`MessageQueue`] to the offset to commit.
+    /// * `persist` - When `true`, the committed offsets are persisted to the broker immediately.
+    ///
+    /// [`commit_with_map`]: ConsumerOffsetControl::commit_with_map
+    async fn commit_sync_with_map(
+        &self,
+        offset_map: HashMap<MessageQueue, i64>,
+        persist: bool,
+    ) -> crate::ClientResult<()>;
+
+    /// Commits all consumed offsets to the consumer offset store.
+    ///
+    /// This function does not block the calling thread. Broker or local-file persistence is
+    /// performed by the normal periodic persistence task, shutdown, or explicit
+    /// `commit_with_map` / `commit_with_set` calls with `persist = true`.
+    ///
+    /// [`commit_sync`]: ConsumerOffsetControl::commit_sync
+    async fn commit(&self) -> crate::ClientResult<()>;
+
+    /// Commits the provided offsets asynchronously, optionally persisting them to the broker.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset_map` - A map from [`MessageQueue`] to the offset to commit.
+    /// * `persist` - When `true`, the committed offsets are persisted to the broker.
+    async fn commit_with_map(&self, offset_map: HashMap<MessageQueue, i64>, persist: bool) -> crate::ClientResult<()>;
+
+    /// Commits the offsets for the specified subset of assigned queues.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_queues` - The queues whose current offsets are to be committed.
+    /// * `persist` - When `true`, the committed offsets are persisted to the broker.
+    async fn commit_with_set(&self, message_queues: HashSet<MessageQueue>, persist: bool) -> crate::ClientResult<()>;
+
+    /// Returns the last committed offset for the specified [`MessageQueue`].
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_queue` - The queue to query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the queue is not assigned to this consumer or if the offset
+    /// cannot be retrieved from the offset store.
+    async fn committed(&self, message_queue: &MessageQueue) -> crate::ClientResult<i64>;
+
+    /// Commits all consumed offsets for all assigned queues to the local offset store.
+    ///
+    /// This method commits the current consumption offset for every assigned [`MessageQueue`].
+    /// It follows the Java client `commitAll()` behavior: offsets are updated in the consumer's
+    /// offset store, while broker or local-file persistence is handled by the normal periodic
+    /// persistence task, shutdown, or explicit `commit_with_map` / `commit_with_set` calls with
+    /// `persist = true`.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the consumer is not in the running state.
+    ///
+    /// [`commit`]: ConsumerOffsetControl::commit
+    async fn commit_all(&self) -> crate::ClientResult<()>;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait ConsumerLifecycle: Send + Sync {
+    /// Starts the consumer and establishes connections to the broker and name server.
+    ///
+    /// This function does not block the calling thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the consumer is already running, if required configuration is
+    /// invalid, or if the connection to the name server cannot be established.
+    async fn start(&self) -> crate::ClientResult<()>;
+
+    /// Shuts down the consumer and releases all associated resources.
+    ///
+    /// This function does not block the calling thread. After shutdown, the consumer
+    /// cannot be restarted.
+    async fn shutdown(&self);
+
+    /// Returns whether the consumer is currently in the running state.
+    ///
+    /// This function does not block the calling thread.
+    async fn is_running(&self) -> bool;
+}

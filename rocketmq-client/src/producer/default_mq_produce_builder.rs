@@ -1,0 +1,391 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use cheetah_string::CheetahString;
+use rocketmq_model::common::compression::compression_type::CompressionType;
+use rocketmq_protocol::common::compression::compressor::Compressor;
+use rocketmq_transport::api::RPCHook;
+
+use crate::base::client_config::ClientConfig;
+use crate::base::client_options::ClientOptions;
+use crate::nameserver_discovery::NameServerDiscoveryConfig;
+use crate::producer::default_mq_producer::DefaultMQProducer;
+use crate::producer::produce_accumulator::ProduceAccumulator;
+use crate::runtime::ClientRuntime;
+use crate::session::ClientSession;
+use crate::trace::trace_dispatcher::ArcTraceDispatcher;
+
+pub struct DefaultMQProducerBuilder {
+    client_runtime: Arc<ClientRuntime>,
+    client_config: ClientConfig,
+    nameserver_discovery: Option<NameServerDiscoveryConfig>,
+    retry_response_codes: Option<HashSet<i32>>,
+    producer_group: Option<CheetahString>,
+    topics: Option<Vec<CheetahString>>,
+    create_topic_key: Option<CheetahString>,
+    default_topic_queue_nums: Option<u32>,
+    send_msg_timeout: Option<u32>,
+    send_msg_max_timeout_per_request: Option<u32>,
+    compress_msg_body_over_howmuch: Option<u32>,
+    retry_times_when_send_failed: Option<u32>,
+    retry_times_when_send_async_failed: Option<u32>,
+    retry_another_broker_when_not_store_ok: Option<bool>,
+    max_message_size: Option<u32>,
+    trace_dispatcher: Option<ArcTraceDispatcher>,
+    auto_batch: Option<bool>,
+    batch_max_delay_ms: Option<u32>,
+    batch_max_bytes: Option<u64>,
+    total_batch_max_bytes: Option<u64>,
+    produce_accumulator: Option<ProduceAccumulator>,
+    enable_backpressure_for_async_mode: Option<bool>,
+    back_pressure_for_async_send_num: Option<u32>,
+    back_pressure_for_async_send_size: Option<u32>,
+    rpc_hook: Option<Arc<dyn RPCHook>>,
+    compress_level: Option<i32>,
+    compress_type: Option<CompressionType>,
+    compressor: Option<&'static (dyn Compressor + Send + Sync)>,
+}
+
+impl DefaultMQProducerBuilder {
+    #[must_use]
+    pub fn new(client_runtime: Arc<ClientRuntime>) -> Self {
+        Self {
+            client_runtime,
+            client_config: ClientConfig::default(),
+            nameserver_discovery: None,
+            retry_response_codes: None,
+            producer_group: None,
+            topics: None,
+            create_topic_key: None,
+            default_topic_queue_nums: None,
+            send_msg_timeout: None,
+            send_msg_max_timeout_per_request: None,
+            compress_msg_body_over_howmuch: None,
+            retry_times_when_send_failed: None,
+            retry_times_when_send_async_failed: None,
+            retry_another_broker_when_not_store_ok: None,
+            max_message_size: None,
+            trace_dispatcher: None,
+            auto_batch: None,
+            batch_max_delay_ms: None,
+            batch_max_bytes: None,
+            total_batch_max_bytes: None,
+            produce_accumulator: None,
+            enable_backpressure_for_async_mode: None,
+            back_pressure_for_async_send_num: None,
+            back_pressure_for_async_send_size: None,
+            rpc_hook: None,
+            compress_level: None,
+            compress_type: None,
+            compressor: None,
+        }
+    }
+
+    #[inline]
+    pub fn client_config(mut self, client_config: ClientConfig) -> Self {
+        self.client_config = client_config;
+        self.nameserver_discovery = None;
+        self
+    }
+
+    /// Sets the complete client options, including typed NameServer discovery.
+    #[inline]
+    pub fn client_options(mut self, options: ClientOptions) -> Self {
+        self.client_config = options.client_config().clone();
+        self.nameserver_discovery = options.nameserver_discovery().cloned();
+        self
+    }
+
+    /// Sets typed NameServer discovery while retaining the current client configuration.
+    #[inline]
+    pub fn nameserver_discovery(mut self, discovery: NameServerDiscoveryConfig) -> Self {
+        self.nameserver_discovery = Some(discovery);
+        self
+    }
+
+    #[inline]
+    pub fn retry_response_codes(mut self, retry_response_codes: HashSet<i32>) -> Self {
+        self.retry_response_codes = Some(retry_response_codes);
+        self
+    }
+
+    #[inline]
+    pub fn producer_group(mut self, producer_group: impl Into<CheetahString>) -> Self {
+        self.producer_group = Some(producer_group.into());
+        self
+    }
+
+    #[inline]
+    pub fn topics(mut self, topics: Vec<CheetahString>) -> Self {
+        self.topics = Some(topics);
+        self
+    }
+
+    #[inline]
+    pub fn name_server_addr(mut self, name_server_addr: impl Into<CheetahString>) -> Self {
+        self.client_config.namesrv_addr = Some(name_server_addr.into());
+        self.client_config
+            .namespace_initialized
+            .store(false, std::sync::atomic::Ordering::Release);
+        self
+    }
+
+    #[inline]
+    pub fn use_tls(mut self, use_tls: bool) -> Self {
+        self.client_config.set_use_tls(use_tls);
+        self
+    }
+
+    #[inline]
+    pub fn create_topic_key(mut self, create_topic_key: impl Into<CheetahString>) -> Self {
+        self.create_topic_key = Some(create_topic_key.into());
+        self
+    }
+
+    #[inline]
+    pub fn default_topic_queue_nums(mut self, default_topic_queue_nums: u32) -> Self {
+        self.default_topic_queue_nums = Some(default_topic_queue_nums);
+        self
+    }
+
+    #[inline]
+    pub fn send_msg_timeout(mut self, send_msg_timeout: u32) -> Self {
+        self.send_msg_timeout = Some(send_msg_timeout);
+        self
+    }
+
+    #[inline]
+    pub fn compress_msg_body_over_howmuch(mut self, compress_msg_body_over_howmuch: u32) -> Self {
+        self.compress_msg_body_over_howmuch = Some(compress_msg_body_over_howmuch);
+        self
+    }
+
+    #[inline]
+    pub fn retry_times_when_send_failed(mut self, retry_times_when_send_failed: u32) -> Self {
+        self.retry_times_when_send_failed = Some(retry_times_when_send_failed);
+        self
+    }
+
+    #[inline]
+    pub fn retry_times_when_send_async_failed(mut self, retry_times_when_send_async_failed: u32) -> Self {
+        self.retry_times_when_send_async_failed = Some(retry_times_when_send_async_failed);
+        self
+    }
+
+    #[inline]
+    pub fn retry_another_broker_when_not_store_ok(mut self, retry_another_broker_when_not_store_ok: bool) -> Self {
+        self.retry_another_broker_when_not_store_ok = Some(retry_another_broker_when_not_store_ok);
+        self
+    }
+
+    #[inline]
+    pub fn max_message_size(mut self, max_message_size: u32) -> Self {
+        self.max_message_size = Some(max_message_size);
+        self
+    }
+
+    #[inline]
+    pub fn trace_dispatcher(mut self, trace_dispatcher: ArcTraceDispatcher) -> Self {
+        self.trace_dispatcher = Some(trace_dispatcher);
+        self
+    }
+
+    #[inline]
+    pub fn auto_batch(mut self, auto_batch: bool) -> Self {
+        self.auto_batch = Some(auto_batch);
+        self
+    }
+
+    #[inline]
+    pub fn produce_accumulator(mut self, produce_accumulator: ProduceAccumulator) -> Self {
+        self.produce_accumulator = Some(produce_accumulator);
+        self
+    }
+
+    #[inline]
+    pub fn enable_backpressure_for_async_mode(mut self, enable_backpressure_for_async_mode: bool) -> Self {
+        self.enable_backpressure_for_async_mode = Some(enable_backpressure_for_async_mode);
+        self
+    }
+
+    #[inline]
+    pub fn back_pressure_for_async_send_num(mut self, back_pressure_for_async_send_num: u32) -> Self {
+        self.back_pressure_for_async_send_num = Some(back_pressure_for_async_send_num);
+        self
+    }
+
+    #[inline]
+    pub fn back_pressure_for_async_send_size(mut self, back_pressure_for_async_send_size: u32) -> Self {
+        self.back_pressure_for_async_send_size = Some(back_pressure_for_async_send_size);
+        self
+    }
+
+    #[inline]
+    pub fn rpc_hook(mut self, rpc_hook: Arc<dyn RPCHook>) -> Self {
+        self.rpc_hook = Some(rpc_hook);
+        self
+    }
+
+    #[inline]
+    pub fn compress_level(mut self, compress_level: i32) -> Self {
+        self.compress_level = Some(compress_level);
+        self
+    }
+
+    #[inline]
+    pub fn compress_type(mut self, compress_type: CompressionType) -> Self {
+        self.compress_type = Some(compress_type);
+        self
+    }
+
+    #[inline]
+    pub fn compressor(mut self, compressor: &'static (dyn Compressor + Send + Sync)) -> Self {
+        self.compressor = Some(compressor);
+        self
+    }
+
+    /// Set the maximum timeout per request (milliseconds).
+    /// None means no limit
+    #[inline]
+    pub fn send_msg_max_timeout_per_request(mut self, timeout: u32) -> Self {
+        self.send_msg_max_timeout_per_request = Some(timeout);
+        self
+    }
+
+    /// Set the maximum hold time for message batching (milliseconds).
+    /// None means no delay
+    #[inline]
+    pub fn batch_max_delay_ms(mut self, delay_ms: u32) -> Self {
+        self.batch_max_delay_ms = Some(delay_ms);
+        self
+    }
+
+    /// Set the maximum message body size for a single batch (bytes).
+    /// None means no limit
+    #[inline]
+    pub fn batch_max_bytes(mut self, bytes: u64) -> Self {
+        self.batch_max_bytes = Some(bytes);
+        self
+    }
+
+    /// Set the maximum total message body size for the accumulator (bytes).
+    /// None means no limit
+    #[inline]
+    pub fn total_batch_max_bytes(mut self, bytes: u64) -> Self {
+        self.total_batch_max_bytes = Some(bytes);
+        self
+    }
+
+    pub fn build(self) -> DefaultMQProducer {
+        let client_session = ClientSession::new(Arc::clone(&self.client_runtime));
+        let mut mq_producer = DefaultMQProducer::unbound();
+        mq_producer.set_client_session(client_session);
+        mq_producer.set_client_config(self.client_config);
+
+        // Set optional fields
+        if let Some(value) = self.retry_response_codes {
+            mq_producer.set_retry_response_codes(value);
+        }
+        if let Some(value) = self.producer_group {
+            mq_producer.set_producer_group(value);
+        }
+        if let Some(value) = self.topics {
+            mq_producer.set_topics(value);
+        }
+        if let Some(value) = self.create_topic_key {
+            mq_producer.set_create_topic_key(value);
+        }
+        if let Some(value) = self.default_topic_queue_nums {
+            mq_producer.set_default_topic_queue_nums(value);
+        }
+        if let Some(value) = self.send_msg_timeout {
+            mq_producer.set_send_msg_timeout(value);
+        }
+        if let Some(value) = self.send_msg_max_timeout_per_request {
+            mq_producer.set_send_msg_max_timeout_per_request(value);
+        }
+        if let Some(value) = self.compress_msg_body_over_howmuch {
+            mq_producer.set_compress_msg_body_over_howmuch(value);
+        }
+        if let Some(value) = self.retry_times_when_send_failed {
+            mq_producer.set_retry_times_when_send_failed(value);
+        }
+        if let Some(value) = self.retry_times_when_send_async_failed {
+            mq_producer.set_retry_times_when_send_async_failed(value);
+        }
+        if let Some(value) = self.retry_another_broker_when_not_store_ok {
+            mq_producer.set_retry_another_broker_when_not_store_ok(value);
+        }
+        if let Some(value) = self.max_message_size {
+            mq_producer.set_max_message_size(value);
+        }
+        if let Some(value) = self.trace_dispatcher {
+            mq_producer.set_trace_dispatcher(value);
+        }
+        if let Some(value) = self.auto_batch {
+            mq_producer.set_auto_batch(value);
+        }
+        if let Some(value) = self.batch_max_delay_ms {
+            mq_producer.set_batch_max_delay_ms(value);
+        }
+        if let Some(value) = self.batch_max_bytes {
+            mq_producer.set_batch_max_bytes(value);
+        }
+        if let Some(value) = self.total_batch_max_bytes {
+            mq_producer.set_total_batch_max_bytes(value);
+        }
+        if let Some(value) = self.produce_accumulator {
+            mq_producer.set_produce_accumulator(value);
+        }
+        if let Some(value) = self.enable_backpressure_for_async_mode {
+            mq_producer.set_enable_backpressure_for_async_mode(value);
+        }
+        if let Some(value) = self.back_pressure_for_async_send_num {
+            mq_producer.set_back_pressure_for_async_send_num(value);
+        }
+        if let Some(value) = self.back_pressure_for_async_send_size {
+            mq_producer.set_back_pressure_for_async_send_size(value);
+        }
+        if let Some(value) = self.rpc_hook {
+            mq_producer.set_rpc_hook(value);
+        }
+        if let Some(value) = self.compress_level {
+            mq_producer.set_compress_level(value);
+        }
+        if let Some(value) = self.compress_type {
+            mq_producer.set_compress_type(value);
+        }
+        if let Some(value) = self.compressor {
+            mq_producer.set_compressor(Some(value));
+        }
+
+        // Create and set the producer implementation
+        let producer_impl =
+            crate::producer::producer_impl::default_mq_producer_impl::DefaultMQProducerImpl::new_with_options(
+                self.client_runtime,
+                ClientOptions::from_parts(
+                    mq_producer.client_config_snapshot().as_ref().clone(),
+                    self.nameserver_discovery,
+                ),
+                mq_producer.producer_config_snapshot().as_ref().clone(),
+                mq_producer.rpc_hook(),
+            );
+        mq_producer.set_default_mqproducer_impl(producer_impl);
+
+        mq_producer
+    }
+}

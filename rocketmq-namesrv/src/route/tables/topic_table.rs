@@ -1,0 +1,833 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Topic queue table with concurrent access
+//!
+//! Manages topic -> broker -> queue data mappings using nested DashMap.
+
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use dashmap::DashMap;
+use rocketmq_protocol::protocol::route::route_data_view::QueueData;
+
+use crate::route::types::public_name_from_route;
+use crate::route::types::route_broker_name;
+use crate::route::types::route_topic_name;
+use crate::route::types::BrokerName;
+use crate::route::types::RouteBrokerName;
+use crate::route::types::RouteTopicName;
+use crate::route::types::TopicName;
+
+/// Topic queue table: Topic -> (Broker -> QueueData)
+///
+/// This table maintains the mapping of topics to their queue configurations
+/// across different brokers. Uses nested DashMap for fine-grained concurrency.
+///
+/// # Performance
+/// - Read operations: O(1) average with sharded locking
+/// - Write operations: O(1) average, per-entry lock
+/// - Memory: ~40 bytes overhead per entry (DashMap metadata)
+///
+/// # Example
+/// ```no_run
+/// use std::sync::Arc;
+///
+/// use rocketmq_namesrv::route::tables::TopicQueueTable;
+///
+/// let table = TopicQueueTable::new();
+/// // Operations are thread-safe without explicit locking
+/// ```
+#[derive(Clone)]
+pub struct TopicQueueTable {
+    /// Outer map: Topic name -> Broker map
+    /// Inner map: Broker name -> Queue data
+    inner: DashMap<RouteTopicName, DashMap<RouteBrokerName, Arc<QueueData>>>,
+    /// Reverse index: Broker name -> topic set
+    broker_topics: DashMap<RouteBrokerName, HashSet<RouteTopicName>>,
+}
+
+impl TopicQueueTable {
+    /// Create a new topic queue table
+    pub fn new() -> Self {
+        Self {
+            inner: DashMap::new(),
+            broker_topics: DashMap::new(),
+        }
+    }
+
+    /// Create with estimated capacity
+    ///
+    /// Pre-allocates space to avoid rehashing for better performance.
+    ///
+    /// # Arguments
+    /// * `capacity` - Expected number of topics
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: DashMap::with_capacity(capacity),
+            broker_topics: DashMap::with_capacity(capacity),
+        }
+    }
+
+    /// Insert or update queue data for a topic-broker pair
+    ///
+    /// # Arguments
+    /// * `topic` - Topic name
+    /// * `broker` - Broker name
+    /// * `queue_data` - Queue configuration
+    ///
+    /// # Returns
+    /// Previous queue data if existed
+    pub fn insert(&self, topic: TopicName, broker: BrokerName, queue_data: QueueData) -> Option<Arc<QueueData>> {
+        let route_topic = route_topic_name(topic);
+        let route_broker = route_broker_name(broker);
+        let index_topic = route_topic.clone();
+        let previous = self
+            .inner
+            .entry(route_topic)
+            .or_default()
+            .insert(route_broker.clone(), Arc::new(queue_data));
+        self.broker_topics.entry(route_broker).or_default().insert(index_topic);
+        previous
+    }
+
+    /// Get queue data for a specific topic-broker pair
+    ///
+    /// # Arguments
+    /// * `topic` - Topic name
+    /// * `broker` - Broker name
+    ///
+    /// # Returns
+    /// Cloned Arc to queue data if exists
+    pub fn get(&self, topic: &str, broker: &str) -> Option<Arc<QueueData>> {
+        self.inner
+            .get(topic)
+            .and_then(|brokers| brokers.get(broker).map(|entry| Arc::clone(entry.value())))
+    }
+
+    /// Get all queue data for a topic
+    ///
+    /// # Arguments
+    /// * `topic` - Topic name
+    ///
+    /// # Returns
+    /// Vector of (broker_name, queue_data) pairs
+    pub fn get_topic_queues(&self, topic: &str) -> Vec<(BrokerName, Arc<QueueData>)> {
+        self.inner
+            .get(topic)
+            .map(|brokers| {
+                brokers
+                    .iter()
+                    .map(|entry| (public_name_from_route(entry.key()), Arc::clone(entry.value())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get the broker-to-queue mapping for a specific topic
+    ///
+    /// This method retrieves the `DashMap` containing the mapping of brokers to their
+    /// respective `QueueData` for a given topic. The returned value is an `Option`
+    /// that contains a reference to the inner `DashMap` if the topic exists.
+    ///
+    /// # Arguments
+    /// * `topic` - A string slice representing the name of the topic to look up.
+    ///
+    /// # Returns
+    /// * `Option<HashMap<BrokerName, Arc<QueueData>>>`
+    ///   - `Some` if the topic exists, containing a public snapshot of brokers and their queue
+    ///     data.
+    ///   - `None` if the topic does not exist.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let topic_map = table.get_topic_queues_map("example_topic");
+    /// if let Some(broker_map) = topic_map {
+    ///     // Access broker-specific queue data
+    /// }
+    pub fn get_topic_queues_map(&self, topic: &str) -> Option<HashMap<BrokerName, Arc<QueueData>>> {
+        self.inner.get(topic).map(|brokers| {
+            brokers
+                .iter()
+                .map(|entry| (public_name_from_route(entry.key()), Arc::clone(entry.value())))
+                .collect()
+        })
+    }
+
+    /// Remove a broker from a topic
+    ///
+    /// # Arguments
+    /// * `topic` - Topic name
+    /// * `broker` - Broker name
+    ///
+    /// # Returns
+    /// Removed queue data if existed
+    pub fn remove_broker(&self, topic: &str, broker: &str) -> Option<Arc<QueueData>> {
+        let removed = self
+            .inner
+            .get(topic)
+            .and_then(|brokers| brokers.remove(broker).map(|(_, v)| v));
+        if removed.is_some() {
+            self.remove_topic_from_broker_index(topic, broker);
+        }
+        removed
+    }
+
+    /// Remove entire topic
+    ///
+    /// # Arguments
+    /// * `topic` - Topic name
+    ///
+    /// # Returns
+    /// true if topic existed and was removed
+    pub fn remove_topic(&self, topic: &str) -> bool {
+        if let Some((_, brokers)) = self.inner.remove(topic) {
+            for broker_entry in brokers.iter() {
+                self.remove_topic_from_broker_index(topic, broker_entry.key().as_str());
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if topic exists
+    pub fn contains_topic(&self, topic: &str) -> bool {
+        self.inner.contains_key(topic)
+    }
+
+    /// Get all topic names
+    ///
+    /// # Returns
+    /// Vector of public topic names.
+    pub fn get_all_topics(&self) -> Vec<TopicName> {
+        self.inner
+            .iter()
+            .map(|entry| public_name_from_route(entry.key()))
+            .collect()
+    }
+
+    /// Get number of topics
+    pub fn topic_count(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Get total number of topic-broker pairs
+    pub fn total_queue_count(&self) -> usize {
+        self.inner.iter().map(|entry| entry.value().len()).sum()
+    }
+
+    /// Clear all data
+    pub fn clear(&self) {
+        self.inner.clear();
+        self.broker_topics.clear();
+    }
+
+    /// Clean up empty topic entries
+    ///
+    /// Removes topics that have no brokers registered.
+    /// Returns number of topics removed.
+    pub fn cleanup_empty_topics(&self) -> usize {
+        let mut removed = 0;
+        self.inner.retain(|_, brokers| {
+            let is_empty = brokers.is_empty();
+            if is_empty {
+                removed += 1;
+            }
+            !is_empty
+        });
+        removed
+    }
+
+    /// Update queue data permission for a specific topic-broker.
+    ///
+    /// # Arguments
+    /// * `topic` - Topic name
+    /// * `broker_name` - Broker name
+    /// * `perm` - New permission value
+    ///
+    /// # Returns
+    /// true if update succeeded, false if topic-broker not found
+    pub fn update_queue_data_perm(&self, topic: &str, broker_name: &str, perm: i32) -> bool {
+        if let Some(brokers) = self.inner.get(topic) {
+            if let Some(mut entry) = brokers.get_mut(broker_name) {
+                // Create new QueueData with updated permission
+                let old_data = entry.value();
+                let new_data = QueueData::new(
+                    old_data.broker_name().clone(),
+                    // Custom: preserve the Java int bit pattern through the native constructor.
+                    old_data.read_queue_nums() as u32,
+                    old_data.write_queue_nums() as u32,
+                    perm as u32,
+                    old_data.topic_sys_flag(),
+                );
+                *entry.value_mut() = Arc::new(new_data);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Iterate over all topics and their queue data (for permission updates)
+    ///
+    /// # Returns
+    /// Iterator yielding (topic_name, vec of queue_data)
+    pub fn iter_all_with_data(&self) -> Vec<(String, Vec<Arc<QueueData>>)> {
+        self.inner
+            .iter()
+            .map(|entry| {
+                let topic = entry.key().as_str().to_string();
+                let queue_datas: Vec<Arc<QueueData>> = entry
+                    .value()
+                    .iter()
+                    .map(|broker_entry| Arc::clone(broker_entry.value()))
+                    .collect();
+                (topic, queue_datas)
+            })
+            .collect()
+    }
+
+    /// Filter topics by inspecting only the first queue entry for each topic.
+    ///
+    /// This avoids cloning the full per-topic queue vector on read-heavy paths that
+    /// only care about a single representative queue flag.
+    pub fn filter_topics_by_first_queue<F>(&self, mut predicate: F) -> Vec<TopicName>
+    where
+        F: FnMut(&QueueData) -> bool,
+    {
+        self.inner
+            .iter()
+            .filter_map(|entry| {
+                let first_queue = entry.value().iter().next()?;
+                predicate(first_queue.value().as_ref()).then(|| public_name_from_route(entry.key()))
+            })
+            .collect()
+    }
+
+    /// Collect all topics that contain queue data for a specific broker.
+    pub fn topics_for_broker(&self, broker_name: &str) -> Vec<TopicName> {
+        self.broker_topics
+            .get(broker_name)
+            .map(|topics| {
+                topics
+                    .iter()
+                    .filter(|topic| self.get(topic.as_str(), broker_name).is_some())
+                    .map(public_name_from_route)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Collect topics for a broker set, preserving duplicate hits per matching broker.
+    ///
+    /// This matches Java NameServer semantics for `getTopicsByCluster`, where the same
+    /// topic can appear multiple times if multiple brokers in the cluster host it.
+    pub fn topics_for_brokers_with_duplicates(&self, broker_names: &HashSet<BrokerName>) -> Vec<TopicName> {
+        let mut topics = Vec::new();
+
+        for broker_name in broker_names {
+            if let Some(broker_topics) = self.broker_topics.get(broker_name.as_str()) {
+                for topic in broker_topics.iter() {
+                    if self.get(topic.as_str(), broker_name.as_str()).is_some() {
+                        topics.push(public_name_from_route(topic));
+                    }
+                }
+            }
+        }
+
+        topics
+    }
+
+    /// Collect exact topic-broker pairs that match a broker set.
+    ///
+    /// This is useful for cleanup paths that only need to touch the queue entries
+    /// belonging to a broker subset, without scanning every broker name for every topic.
+    pub fn topic_broker_pairs_for_brokers(&self, broker_names: &HashSet<BrokerName>) -> Vec<(TopicName, BrokerName)> {
+        let mut pairs = Vec::new();
+
+        for broker_name in broker_names {
+            if let Some(broker_topics) = self.broker_topics.get(broker_name.as_str()) {
+                for topic in broker_topics.iter() {
+                    if self.get(topic.as_str(), broker_name.as_str()).is_some() {
+                        pairs.push((public_name_from_route(topic), broker_name.clone()));
+                    }
+                }
+            }
+        }
+
+        pairs
+    }
+
+    /// Collect exact topic-queue pairs for a specific broker.
+    pub fn topic_queue_pairs_for_broker(&self, broker_name: &str) -> Vec<(TopicName, Arc<QueueData>)> {
+        self.broker_topics
+            .get(broker_name)
+            .map(|topics| {
+                topics
+                    .iter()
+                    .filter_map(|topic| {
+                        self.get(topic.as_str(), broker_name)
+                            .map(|queue_data| (public_name_from_route(topic), queue_data))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn remove_topic_from_broker_index(&self, topic: &str, broker: &str) {
+        if let Some(mut broker_topics) = self.broker_topics.get_mut(broker) {
+            broker_topics.remove(topic);
+            let is_empty = broker_topics.is_empty();
+            drop(broker_topics);
+            if is_empty {
+                self.broker_topics.remove(broker);
+            }
+        }
+    }
+}
+
+impl Default for TopicQueueTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use cheetah_string::CheetahString;
+    use rocketmq_model::common::TopicSysFlag;
+
+    use super::*;
+
+    fn create_test_queue_data(read_count: u32, write_count: u32) -> QueueData {
+        QueueData::new("test-broker".into(), read_count, write_count, 6, 0)
+    }
+
+    fn create_test_queue_data_with_flag(read_count: u32, write_count: u32, topic_sys_flag: u32) -> QueueData {
+        QueueData::new("test-broker".into(), read_count, write_count, 6, topic_sys_flag)
+    }
+
+    #[test]
+    fn test_insert_and_get() {
+        let table = TopicQueueTable::new();
+        let topic: TopicName = CheetahString::from_string("TestTopic".to_string());
+        let broker: BrokerName = CheetahString::from_string("broker-a".to_string());
+        let queue_data = create_test_queue_data(8, 8);
+
+        // Insert
+        let old = table.insert(topic.clone(), broker.clone(), queue_data);
+        assert!(old.is_none());
+
+        // Get
+        let retrieved = table.get("TestTopic", "broker-a").unwrap();
+        assert_eq!(retrieved.read_queue_nums(), 8);
+        assert_eq!(retrieved.write_queue_nums(), 8);
+    }
+
+    #[test]
+    fn test_get_topic_queues() {
+        let table = TopicQueueTable::new();
+        let topic: TopicName = CheetahString::from_string("TestTopic".to_string());
+
+        // Insert multiple brokers
+        table.insert(
+            topic.clone(),
+            CheetahString::from_string("broker-a".to_string()),
+            create_test_queue_data(8, 8),
+        );
+        table.insert(
+            topic.clone(),
+            CheetahString::from_string("broker-b".to_string()),
+            create_test_queue_data(16, 16),
+        );
+
+        let queues = table.get_topic_queues("TestTopic");
+        assert_eq!(queues.len(), 2);
+    }
+
+    #[test]
+    fn test_update_queue_data_perm_updates_only_target() {
+        let table = TopicQueueTable::new();
+
+        table.insert(
+            CheetahString::from_static_str("topic-a"),
+            CheetahString::from_static_str("broker-a"),
+            create_test_queue_data(8, 8),
+        );
+        table.insert(
+            CheetahString::from_static_str("topic-a"),
+            CheetahString::from_static_str("broker-b"),
+            create_test_queue_data(16, 16),
+        );
+        table.insert(
+            CheetahString::from_static_str("topic-b"),
+            CheetahString::from_static_str("broker-a"),
+            create_test_queue_data(32, 32),
+        );
+
+        assert!(table.update_queue_data_perm("topic-a", "broker-a", 4));
+
+        let updated = table.get("topic-a", "broker-a").expect("updated queue data");
+        assert_eq!(updated.read_queue_nums(), 8);
+        assert_eq!(updated.write_queue_nums(), 8);
+        assert_eq!(updated.perm(), 4);
+        assert_eq!(table.get("topic-a", "broker-b").expect("broker-b queue data").perm(), 6);
+        assert_eq!(table.get("topic-b", "broker-a").expect("topic-b queue data").perm(), 6);
+    }
+
+    #[test]
+    fn test_update_queue_data_perm_returns_false_for_missing_entry() {
+        let table = TopicQueueTable::new();
+        table.insert(
+            CheetahString::from_static_str("topic-a"),
+            CheetahString::from_static_str("broker-a"),
+            create_test_queue_data(8, 8),
+        );
+
+        assert!(!table.update_queue_data_perm("missing-topic", "broker-a", 4));
+        assert!(!table.update_queue_data_perm("topic-a", "missing-broker", 4));
+        assert_eq!(table.get("topic-a", "broker-a").expect("queue data").perm(), 6);
+    }
+
+    #[test]
+    fn test_get_topic_queues_map_returns_public_snapshot() {
+        let table = TopicQueueTable::new();
+        let broker_a = CheetahString::from_static_str("broker-a");
+        let broker_b = CheetahString::from_static_str("broker-b");
+
+        table.insert(
+            CheetahString::from_static_str("topic-a"),
+            broker_a.clone(),
+            create_test_queue_data(8, 8),
+        );
+        table.insert(
+            CheetahString::from_static_str("topic-a"),
+            broker_b.clone(),
+            create_test_queue_data(16, 16),
+        );
+        table.insert(
+            CheetahString::from_static_str("topic-b"),
+            CheetahString::from_static_str("broker-c"),
+            create_test_queue_data(32, 32),
+        );
+        let queue_a = table.get("topic-a", "broker-a").expect("broker-a queue data");
+        let queue_b = table.get("topic-a", "broker-b").expect("broker-b queue data");
+
+        let queues = table.get_topic_queues_map("topic-a").expect("topic snapshot");
+
+        assert_eq!(queues.len(), 2);
+        assert!(Arc::ptr_eq(
+            queues.get(&broker_a).expect("public broker-a key"),
+            &queue_a
+        ));
+        assert!(Arc::ptr_eq(
+            queues.get(&broker_b).expect("public broker-b key"),
+            &queue_b
+        ));
+    }
+
+    #[test]
+    fn test_iter_all_with_data_returns_all_entries() {
+        let table = TopicQueueTable::new();
+
+        table.insert(
+            CheetahString::from_static_str("topic-a"),
+            CheetahString::from_static_str("broker-a"),
+            create_test_queue_data(8, 8),
+        );
+        table.insert(
+            CheetahString::from_static_str("topic-a"),
+            CheetahString::from_static_str("broker-b"),
+            create_test_queue_data(16, 16),
+        );
+        table.insert(
+            CheetahString::from_static_str("topic-b"),
+            CheetahString::from_static_str("broker-c"),
+            create_test_queue_data(32, 32),
+        );
+
+        let all_entries = table.iter_all_with_data();
+
+        assert_eq!(all_entries.len(), 2);
+        let topic_a = all_entries
+            .iter()
+            .find(|(topic, _)| topic == "topic-a")
+            .expect("topic-a entries");
+        assert_eq!(
+            topic_a
+                .1
+                .iter()
+                .map(|queue_data| queue_data.read_queue_nums())
+                .collect::<HashSet<_>>(),
+            HashSet::from([8, 16])
+        );
+        let topic_b = all_entries
+            .iter()
+            .find(|(topic, _)| topic == "topic-b")
+            .expect("topic-b entries");
+        assert_eq!(topic_b.1.len(), 1);
+        assert_eq!(topic_b.1[0].read_queue_nums(), 32);
+    }
+
+    #[test]
+    fn test_remove_broker() {
+        let table = TopicQueueTable::new();
+        let topic: TopicName = CheetahString::from_string("TestTopic".to_string());
+
+        table.insert(
+            topic.clone(),
+            CheetahString::from_string("broker-a".to_string()),
+            create_test_queue_data(8, 8),
+        );
+
+        // Remove
+        let removed = table.remove_broker("TestTopic", "broker-a");
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().read_queue_nums(), 8);
+
+        // Verify removed
+        assert!(table.get("TestTopic", "broker-a").is_none());
+    }
+
+    #[test]
+    fn test_cleanup_empty_topics() {
+        let table = TopicQueueTable::new();
+
+        // Insert and then remove broker, leaving empty topic
+        let topic: TopicName = CheetahString::from_string("EmptyTopic".to_string());
+        table.insert(
+            topic.clone(),
+            CheetahString::from_string("broker-a".to_string()),
+            create_test_queue_data(8, 8),
+        );
+        table.remove_broker("EmptyTopic", "broker-a");
+
+        // Cleanup
+        let removed = table.cleanup_empty_topics();
+        assert_eq!(removed, 1);
+        assert!(!table.contains_topic("EmptyTopic"));
+    }
+
+    #[test]
+    fn test_filter_topics_by_first_queue_predicate() {
+        let table = TopicQueueTable::new();
+
+        table.insert(
+            CheetahString::from_static_str("unit-topic"),
+            CheetahString::from_static_str("broker-a"),
+            create_test_queue_data_with_flag(8, 8, TopicSysFlag::build_sys_flag(true, false)),
+        );
+        table.insert(
+            CheetahString::from_static_str("normal-topic"),
+            CheetahString::from_static_str("broker-b"),
+            create_test_queue_data_with_flag(8, 8, 0),
+        );
+
+        let topics =
+            table.filter_topics_by_first_queue(|queue_data| TopicSysFlag::has_unit_flag(queue_data.topic_sys_flag()));
+
+        assert_eq!(topics, vec![CheetahString::from_static_str("unit-topic")]);
+    }
+
+    #[test]
+    fn test_topics_for_broker_returns_matching_topics() {
+        let table = TopicQueueTable::new();
+
+        table.insert(
+            CheetahString::from_static_str("topic-a"),
+            CheetahString::from_static_str("broker-a"),
+            create_test_queue_data(8, 8),
+        );
+        table.insert(
+            CheetahString::from_static_str("topic-b"),
+            CheetahString::from_static_str("broker-b"),
+            create_test_queue_data(8, 8),
+        );
+        table.insert(
+            CheetahString::from_static_str("topic-c"),
+            CheetahString::from_static_str("broker-a"),
+            create_test_queue_data(8, 8),
+        );
+
+        let topics = table.topics_for_broker("broker-a");
+
+        assert_eq!(topics.len(), 2);
+        assert!(topics.contains(&CheetahString::from_static_str("topic-a")));
+        assert!(topics.contains(&CheetahString::from_static_str("topic-c")));
+    }
+
+    #[test]
+    fn test_topics_for_brokers_with_duplicates_preserves_match_count() {
+        let table = TopicQueueTable::new();
+        let broker_a = CheetahString::from_static_str("broker-a");
+        let broker_b = CheetahString::from_static_str("broker-b");
+
+        table.insert(
+            CheetahString::from_static_str("shared-topic"),
+            broker_a.clone(),
+            create_test_queue_data(8, 8),
+        );
+        table.insert(
+            CheetahString::from_static_str("shared-topic"),
+            broker_b.clone(),
+            create_test_queue_data(8, 8),
+        );
+        table.insert(
+            CheetahString::from_static_str("broker-a-only"),
+            broker_a.clone(),
+            create_test_queue_data(8, 8),
+        );
+
+        let broker_names = HashSet::from([broker_a, broker_b]);
+        let topics = table.topics_for_brokers_with_duplicates(&broker_names);
+
+        assert_eq!(
+            topics.iter().filter(|topic| topic.as_str() == "shared-topic").count(),
+            2
+        );
+        assert!(topics.contains(&CheetahString::from_static_str("broker-a-only")));
+    }
+
+    #[test]
+    fn test_topic_broker_pairs_for_brokers_returns_exact_matches() {
+        let table = TopicQueueTable::new();
+        let broker_a = CheetahString::from_static_str("broker-a");
+        let broker_b = CheetahString::from_static_str("broker-b");
+
+        table.insert(
+            CheetahString::from_static_str("shared-topic"),
+            broker_a.clone(),
+            create_test_queue_data(8, 8),
+        );
+        table.insert(
+            CheetahString::from_static_str("shared-topic"),
+            broker_b.clone(),
+            create_test_queue_data(8, 8),
+        );
+        table.insert(
+            CheetahString::from_static_str("broker-a-only"),
+            broker_a.clone(),
+            create_test_queue_data(8, 8),
+        );
+
+        let broker_names = HashSet::from([broker_a.clone(), broker_b.clone()]);
+        let pairs = table.topic_broker_pairs_for_brokers(&broker_names);
+
+        assert_eq!(pairs.len(), 3);
+        assert!(pairs.contains(&(CheetahString::from_static_str("shared-topic"), broker_a)));
+        assert!(pairs.contains(&(CheetahString::from_static_str("shared-topic"), broker_b)));
+        assert!(pairs.contains(&(
+            CheetahString::from_static_str("broker-a-only"),
+            CheetahString::from_static_str("broker-a"),
+        )));
+    }
+
+    #[test]
+    fn test_topic_queue_pairs_for_broker_returns_exact_matches() {
+        let table = TopicQueueTable::new();
+
+        table.insert(
+            CheetahString::from_static_str("topic-a"),
+            CheetahString::from_static_str("broker-a"),
+            create_test_queue_data(8, 8),
+        );
+        table.insert(
+            CheetahString::from_static_str("topic-b"),
+            CheetahString::from_static_str("broker-b"),
+            create_test_queue_data(4, 4),
+        );
+        table.insert(
+            CheetahString::from_static_str("topic-c"),
+            CheetahString::from_static_str("broker-a"),
+            create_test_queue_data(16, 16),
+        );
+
+        let pairs = table.topic_queue_pairs_for_broker("broker-a");
+
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs
+            .iter()
+            .any(|(topic, queue_data)| topic.as_str() == "topic-a" && queue_data.read_queue_nums() == 8));
+        assert!(pairs
+            .iter()
+            .any(|(topic, queue_data)| topic.as_str() == "topic-c" && queue_data.read_queue_nums() == 16));
+    }
+
+    #[test]
+    fn test_remove_topic_updates_broker_topic_view() {
+        let table = TopicQueueTable::new();
+
+        table.insert(
+            CheetahString::from_static_str("topic-a"),
+            CheetahString::from_static_str("broker-a"),
+            create_test_queue_data(8, 8),
+        );
+        table.insert(
+            CheetahString::from_static_str("topic-b"),
+            CheetahString::from_static_str("broker-a"),
+            create_test_queue_data(16, 16),
+        );
+
+        assert!(table.remove_topic("topic-a"));
+
+        let topics = table.topics_for_broker("broker-a");
+        assert_eq!(topics, vec![CheetahString::from_static_str("topic-b")]);
+    }
+
+    #[test]
+    fn test_clear_removes_broker_topic_view() {
+        let table = TopicQueueTable::new();
+
+        table.insert(
+            CheetahString::from_static_str("topic-a"),
+            CheetahString::from_static_str("broker-a"),
+            create_test_queue_data(8, 8),
+        );
+
+        table.clear();
+
+        assert!(table.topics_for_broker("broker-a").is_empty());
+        assert!(table.topic_queue_pairs_for_broker("broker-a").is_empty());
+    }
+
+    #[test]
+    fn test_concurrent_access() {
+        use std::thread;
+
+        let table = Arc::new(TopicQueueTable::new());
+        let mut handles = vec![];
+
+        // Spawn multiple threads
+        for i in 0..10 {
+            let table_clone = table.clone();
+            handles.push(thread::spawn(move || {
+                let topic: TopicName = CheetahString::from_string(format!("Topic{}", i % 3));
+                let broker: BrokerName = CheetahString::from_string(format!("broker-{}", i));
+                table_clone.insert(topic, broker, create_test_queue_data(8, 8));
+            }));
+        }
+
+        // Wait for completion
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify data
+        assert!(table.topic_count() <= 3); // At most 3 topics
+        assert_eq!(table.total_queue_count(), 10); // 10 total entries
+    }
+}

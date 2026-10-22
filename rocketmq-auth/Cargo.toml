@@ -1,0 +1,86 @@
+# Copyright 2023 The RocketMQ Rust Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+[package]
+name                   = "rocketmq-auth"
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+license.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+readme                 = "README.md"
+description.workspace  = true
+rust-version.workspace = true
+
+[features]
+default = []
+grpc    = ["dep:tonic"]
+
+[dependencies]
+rocketmq-error    = { workspace = true }
+rocketmq-model    = { workspace = true }
+rocketmq-observability = { workspace = true }
+rocketmq-protocol = { workspace = true }
+rocketmq-runtime  = { workspace = true }
+rocketmq-security-api = { workspace = true }
+rocketmq-transport = { workspace = true }
+
+cheetah-string = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+serde_yaml     = { workspace = true }
+chrono         = { version = "0.4.45", default-features = false, features = ["std"] }
+
+
+tracing = { workspace = true }
+
+# IP utilities for authorization models
+ipnetwork = "0.21.1"
+
+# Hex and Base64 encoding/decoding
+hex    = "0.4"
+base64 = "0.23.0"
+
+# Cryptographic operations
+aes-gcm = { version = "0.11.0", features = ["zeroize"] }
+arc-swap = "1.9"
+hmac  = "0.13.0"
+md-5  = "0.11"
+sha1  = "0.11"
+sha2  = "0.11"
+subtle = "2.6"
+
+# Optional: gRPC support
+tonic = { version = "0.14.6", optional = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Caching
+moka = { version = "0.12", features = ["sync"] }
+
+
+[dev-dependencies]
+criterion          = { version = "0.8", features = ["html_reports"] }
+tempfile           = "3"
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+

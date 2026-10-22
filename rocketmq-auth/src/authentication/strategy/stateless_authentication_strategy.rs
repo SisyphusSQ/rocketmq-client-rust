@@ -1,0 +1,294 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Stateless authentication strategy without caching.
+//!
+//! This strategy performs authentication for every request without caching results.
+//! Each authentication is independent and does not rely on historical state.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use crate::authentication::context::default_authentication_context::DefaultAuthenticationContext;
+use crate::authentication::provider::AuthenticationProvider;
+use crate::authentication::strategy::abstract_authentication_strategy::AbstractAuthenticationStrategy;
+use crate::authentication::strategy::authenticate_with_provider;
+use crate::authentication::strategy::authentication_strategy::AuthenticationStrategy;
+use crate::authentication::strategy::AuthenticationFuture;
+use crate::authorization::context::authentication_context::AuthenticationContext;
+use crate::config::AuthConfig;
+use crate::AuthFailureKind;
+use crate::AuthOperation;
+use crate::AuthServiceError;
+use crate::AuthServiceResult;
+
+/// Stateless authentication strategy.
+///
+/// Performs authentication for every request without any caching or state retention.
+/// This ensures that each authentication check is independent and current.
+///
+/// - No state shared between requests
+/// - No caching of authentication results
+/// - Suitable for scenarios requiring fresh validation on every request
+pub struct StatelessAuthenticationStrategy<P>
+where
+    P: AuthenticationProvider<Context = DefaultAuthenticationContext>,
+{
+    auth_config: AuthConfig,
+    authentication_white_set: HashSet<String>,
+    authentication_provider: Option<Arc<P>>,
+}
+
+impl<P> StatelessAuthenticationStrategy<P>
+where
+    P: AuthenticationProvider<Context = DefaultAuthenticationContext> + Send + Sync + 'static,
+{
+    /// Create a new stateless authentication strategy.
+    pub fn new(auth_config: AuthConfig, provider: Option<Arc<P>>) -> Self {
+        let mut authentication_white_set = HashSet::new();
+
+        let whitelist = auth_config.authentication_whitelist.to_string();
+        if !whitelist.is_empty() {
+            for rpc_code in whitelist.split(',') {
+                let trimmed = rpc_code.trim();
+                if !trimmed.is_empty() {
+                    authentication_white_set.insert(trimmed.to_string());
+                }
+            }
+        }
+
+        Self {
+            auth_config,
+            authentication_white_set,
+            authentication_provider: provider,
+        }
+    }
+
+    /// Perform authentication without caching.
+    async fn do_authenticate_internal(&self, context: &dyn AuthenticationContext) -> AuthServiceResult<()> {
+        if !self.auth_config.authentication_enabled {
+            return Ok(());
+        }
+
+        let default_context = context
+            .as_any()
+            .downcast_ref::<DefaultAuthenticationContext>()
+            .ok_or_else(|| AuthServiceError::new(AuthOperation::Authenticate, AuthFailureKind::InvalidInput))?;
+
+        if let Some(rpc_code) = default_context.base.rpc_code() {
+            if self.is_whitelisted(rpc_code.as_str()) {
+                return Ok(());
+            }
+        }
+
+        let provider = match &self.authentication_provider {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        authenticate_with_provider(provider.as_ref(), default_context).await
+    }
+
+    pub fn provider(&self) -> Option<&P> {
+        self.authentication_provider.as_deref()
+    }
+}
+
+impl<P> AbstractAuthenticationStrategy for StatelessAuthenticationStrategy<P>
+where
+    P: AuthenticationProvider<Context = DefaultAuthenticationContext> + Send + Sync + 'static,
+{
+    fn authentication_white_set(&self) -> &HashSet<String> {
+        &self.authentication_white_set
+    }
+}
+
+impl<P> AuthenticationStrategy for StatelessAuthenticationStrategy<P>
+where
+    P: AuthenticationProvider<Context = DefaultAuthenticationContext> + Send + Sync + 'static,
+{
+    fn authenticate<'a>(&'a self, context: &'a dyn AuthenticationContext) -> AuthenticationFuture<'a> {
+        Box::pin(self.do_authenticate_internal(context))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+
+    use super::*;
+    use crate::authentication::provider::DefaultAuthenticationProvider;
+    use cheetah_string::CheetahString;
+
+    struct CountingAuthenticationProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AuthenticationProvider for CountingAuthenticationProvider {
+        type Context = DefaultAuthenticationContext;
+
+        async fn initialize(
+            &mut self,
+            _config: AuthConfig,
+            _metadata_service: Option<Arc<dyn Any + Send + Sync>>,
+        ) -> AuthServiceResult<()> {
+            Ok(())
+        }
+
+        async fn authenticate(&self, _context: &Self::Context) -> AuthServiceResult<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn new_context_from_metadata(
+            &self,
+            _metadata: &std::collections::HashMap<String, String>,
+            _request: Box<dyn Any + Send>,
+        ) -> Self::Context {
+            DefaultAuthenticationContext::new()
+        }
+
+        fn new_context_from_command(
+            &self,
+            _command: &rocketmq_protocol::protocol::remoting_command::RemotingCommand,
+        ) -> Self::Context {
+            DefaultAuthenticationContext::new()
+        }
+    }
+
+    #[test]
+    fn test_stateless_strategy_creation() {
+        let config = AuthConfig::default();
+        let provider = Arc::new(DefaultAuthenticationProvider::new());
+
+        let strategy = StatelessAuthenticationStrategy::new(config, Some(provider));
+
+        assert!(strategy.provider().is_some());
+        assert!(strategy.authentication_white_set().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_authentication_disabled() {
+        let config = AuthConfig {
+            authentication_enabled: false,
+            ..Default::default()
+        };
+
+        let strategy: StatelessAuthenticationStrategy<DefaultAuthenticationProvider> =
+            StatelessAuthenticationStrategy::new(config, None);
+
+        let context = DefaultAuthenticationContext::new();
+        let result = strategy.authenticate(&context).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_whitelist_parsing() {
+        let config = AuthConfig {
+            authentication_whitelist: "SEND_MESSAGE,PULL_MESSAGE".into(),
+            ..Default::default()
+        };
+
+        let strategy: StatelessAuthenticationStrategy<DefaultAuthenticationProvider> =
+            StatelessAuthenticationStrategy::new(config, None);
+
+        assert!(strategy.authentication_white_set().contains("SEND_MESSAGE"));
+        assert!(strategy.authentication_white_set().contains("PULL_MESSAGE"));
+    }
+
+    #[test]
+    fn test_whitelist_with_spaces() {
+        let config = AuthConfig {
+            authentication_whitelist: " SEND_MESSAGE , PULL_MESSAGE , QUERY_MESSAGE ".into(),
+            ..Default::default()
+        };
+
+        let strategy: StatelessAuthenticationStrategy<DefaultAuthenticationProvider> =
+            StatelessAuthenticationStrategy::new(config, None);
+
+        assert_eq!(strategy.authentication_white_set().len(), 3);
+        assert!(strategy.authentication_white_set().contains("SEND_MESSAGE"));
+        assert!(strategy.authentication_white_set().contains("PULL_MESSAGE"));
+        assert!(strategy.authentication_white_set().contains("QUERY_MESSAGE"));
+    }
+
+    #[tokio::test]
+    async fn test_authentication_enabled_without_provider() {
+        let config = AuthConfig {
+            authentication_enabled: true,
+            ..Default::default()
+        };
+
+        let strategy: StatelessAuthenticationStrategy<DefaultAuthenticationProvider> =
+            StatelessAuthenticationStrategy::new(config, None);
+
+        let context = DefaultAuthenticationContext::new();
+        let result = strategy.authenticate(&context).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_whitelisted_rpc_code() {
+        let config = AuthConfig {
+            authentication_enabled: true,
+            authentication_whitelist: "100,200".into(),
+            ..Default::default()
+        };
+
+        let strategy: StatelessAuthenticationStrategy<DefaultAuthenticationProvider> =
+            StatelessAuthenticationStrategy::new(config, None);
+
+        let mut context = DefaultAuthenticationContext::new();
+        context.base.set_rpc_code(Some(CheetahString::from("100")));
+
+        let result = strategy.authenticate(&context).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_no_caching_behavior() {
+        let config = AuthConfig {
+            authentication_enabled: false,
+            ..Default::default()
+        };
+
+        let strategy: StatelessAuthenticationStrategy<DefaultAuthenticationProvider> =
+            StatelessAuthenticationStrategy::new(config, None);
+
+        let context = DefaultAuthenticationContext::new();
+
+        let result1 = strategy.authenticate(&context).await;
+        assert!(result1.is_ok());
+
+        let result2 = strategy.authenticate(&context).await;
+        assert!(result2.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticates_inside_current_thread_runtime_without_block_in_place_panic() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(CountingAuthenticationProvider { calls: calls.clone() });
+        let strategy = StatelessAuthenticationStrategy::new(
+            AuthConfig {
+                authentication_enabled: true,
+                ..Default::default()
+            },
+            Some(provider),
+        );
+        let context = DefaultAuthenticationContext::new();
+        assert!(strategy.authenticate(&context).await.is_ok());
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}

@@ -1,0 +1,98 @@
+# Copyright 2023 The RocketMQ Rust Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+[package]
+name                   = "rocketmq-client-rust"
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+homepage.workspace     = true
+repository.workspace   = true
+license.workspace      = true
+keywords               = ["rocketmq-rust", "async", "rocketmq-client", "futures"]
+categories             = ["api-bindings", "asynchronous"]
+readme                 = "README.md"
+description            = "Rust implementation of Apache rocketmq client"
+rust-version.workspace = true
+
+[features]
+default = ["admin-full"]
+admin-read = []
+admin-mutation = []
+admin-full = ["admin-read", "admin-mutation"]
+observability = [
+  "rocketmq-observability/otel-traces",
+  "rocketmq-transport/observability-traces",
+]
+observability-metrics = ["rocketmq-observability/otel-metrics", "rocketmq-transport/observability"]
+otlp-traces = ["observability", "rocketmq-observability/otlp-traces"]
+nameserver-dns-discovery = ["dep:hickory-resolver"]
+# Custom fork: SDK mock fixtures can exercise the actual public transport codec.
+test-support = ["rocketmq-transport/test-support"]
+
+[dependencies]
+# Custom: backreference/lookaround-capable native pattern helper for Java Validators.
+fancy-regex = "=0.19.0"
+rocketmq-model           = { workspace = true }
+rocketmq-protocol        = { workspace = true }
+rocketmq-runtime         = { workspace = true }
+rocketmq-security-api    = { workspace = true }
+rocketmq-transport       = { workspace = true, features = ["socks"] }
+rocketmq-error.workspace = true
+rocketmq-auth.workspace  = true
+rocketmq-observability   = { workspace = true }
+
+#json spupport
+serde.workspace      = true
+serde_json.workspace = true
+
+tokio.workspace      = true
+tokio-util.workspace = true
+
+trait-variant = { workspace = true }
+num_cpus      = { workspace = true }
+# Custom: native equivalent of BrokerConfig.localHostName, using the pinned workspace dependency.
+sysinfo       = { workspace = true }
+rand          = { workspace = true }
+
+#log
+tracing.workspace = true
+# Custom: object-owned TLS, reusing the exact version already present in Cargo.lock.
+thread_local = "=1.1.10"
+
+arc-swap    = "1.9"
+parking_lot = { workspace = true }
+bytes       = { workspace = true }
+dashmap     = { workspace = true }
+smallvec    = { workspace = true }
+
+futures        = { workspace = true }
+cheetah-string = { workspace = true }
+hickory-resolver = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+# Path-only on purpose: cargo drops path-only dev-dependencies when packaging.
+# A versioned entry must already be on crates.io, and cargo does not order
+# workspace publishing by dev-dependencies.
+rocketmq-namesrv   = { path = "../rocketmq-namesrv" }
+rocketmq-transport = { workspace = true, features = ["socks", "test-support", "tls"] }
+criterion = { version = "0.8.2", features = ["async_tokio"] }
+pkcs8.workspace = true
+rcgen = "0.14"
+tempfile = "3.27.0"
+tokio-rustls = "0.26"
+trybuild  = "1.0.116"
+

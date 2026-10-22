@@ -1,0 +1,480 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use cheetah_string::CheetahString;
+use rocketmq_model::common::message::message_queue::MessageQueue;
+use rocketmq_model::common::mix_all;
+use rocketmq_protocol::protocol::header::namesrv::topic_operation_header::TopicRequestHeader;
+use rocketmq_protocol::protocol::header::query_consumer_offset_request_header::QueryConsumerOffsetRequestHeader;
+use rocketmq_protocol::protocol::header::update_consumer_offset_header::UpdateConsumerOffsetRequestHeader;
+use rocketmq_transport::api::RpcRequestHeader;
+use tokio::sync::Mutex;
+use tracing::error;
+use tracing::info;
+use tracing::warn;
+
+use crate::consumer::store::controllable_offset::ControllableOffset;
+use crate::consumer::store::offset_store::OffsetStoreTrait;
+use crate::consumer::store::read_offset_type::ReadOffsetType;
+use crate::factory::mq_client_instance::MQClientInstance;
+
+pub struct RemoteBrokerOffsetStore {
+    client_instance: Arc<MQClientInstance>,
+    group_name: CheetahString,
+    offset_table: Arc<Mutex<HashMap<MessageQueue, ControllableOffset>>>,
+    persisted_offset_table: Arc<Mutex<HashMap<MessageQueue, i64>>>,
+}
+
+impl RemoteBrokerOffsetStore {
+    pub fn new(client_instance: Arc<MQClientInstance>, group_name: CheetahString) -> Self {
+        Self {
+            client_instance,
+            group_name,
+            offset_table: Arc::new(Mutex::new(HashMap::with_capacity(64))),
+            persisted_offset_table: Arc::new(Mutex::new(HashMap::with_capacity(64))),
+        }
+    }
+
+    async fn offset_needs_persist(&self, mq: &MessageQueue, offset: i64) -> bool {
+        let persisted_offset_table = self.persisted_offset_table.lock().await;
+        match persisted_offset_table.get(mq) {
+            Some(&persisted_offset) => persisted_offset != offset,
+            None => true,
+        }
+    }
+
+    pub(crate) async fn read_from_store_checked(&self, mq: &MessageQueue) -> crate::ClientResult<i64> {
+        match self.fetch_consume_offset_from_broker(mq).await {
+            Ok(offset) => {
+                self.update_offset(mq, offset, false).await;
+                Ok(offset)
+            }
+            Err(error)
+                if error.broker_response_code()
+                    == Some(rocketmq_protocol::code::response_code::ResponseCode::QueryNotFound as i32) =>
+            {
+                Ok(-1)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn mark_offset_persisted(&self, mq: &MessageQueue, offset: i64) {
+        let mut persisted_offset_table = self.persisted_offset_table.lock().await;
+        persisted_offset_table.insert(mq.clone(), offset);
+    }
+
+    // Custom fork: a scoped explicit commit must neither prune unrelated queues
+    // nor treat a one-way local write as an acknowledged Broker update.
+    pub(crate) async fn persist_all_checked(&self, mqs: &HashSet<MessageQueue>) -> crate::ClientResult<()> {
+        let snapshot: Vec<_> = self
+            .offset_table
+            .lock()
+            .await
+            .iter()
+            .filter(|(queue, _)| mqs.contains(*queue))
+            .map(|(queue, offset)| (queue.clone(), offset.get_offset()))
+            .collect();
+        for (queue, offset) in snapshot {
+            self.update_consume_offset_to_broker(&queue, offset, false).await?;
+            self.mark_offset_persisted(&queue, offset).await;
+        }
+        Ok(())
+    }
+
+    async fn fetch_consume_offset_from_broker(&self, mq: &MessageQueue) -> crate::ClientResult<i64> {
+        let broker_name = self.client_instance.get_broker_name_from_message_queue(mq).await;
+        let mut find_broker_result = self
+            .client_instance
+            .find_broker_address_in_subscribe(&broker_name, mix_all::MASTER_ID, true)
+            .await;
+
+        if find_broker_result.is_none() {
+            self.client_instance
+                .update_topic_route_info_from_name_server_topic(mq.topic())
+                .await;
+            let broker_name = self.client_instance.get_broker_name_from_message_queue(mq).await;
+            find_broker_result = self
+                .client_instance
+                .find_broker_address_in_subscribe(&broker_name, mix_all::MASTER_ID, false)
+                .await;
+        }
+        if let Some(find_broker_result) = find_broker_result {
+            let request_header = QueryConsumerOffsetRequestHeader {
+                consumer_group: self.group_name.clone(),
+                topic: mq.topic().clone(),
+                queue_id: mq.queue_id(),
+                set_zero_if_not_found: None,
+                topic_request_header: Some(TopicRequestHeader {
+                    lo: None,
+                    rpc: Some(RpcRequestHeader {
+                        namespace: None,
+                        namespaced: None,
+                        broker_name: Some(mq.broker_name().clone()),
+                        oneway: None,
+                    }),
+                }),
+            };
+            let Some(mq_client_api_impl) = self.client_instance.mq_client_api_impl.load_full() else {
+                return Err(crate::ClientError::not_initialized("MQClientAPIImpl"));
+            };
+            mq_client_api_impl
+                .query_consumer_offset(find_broker_result.broker_addr.as_str(), request_header, 5_000)
+                .await
+        } else {
+            Err(mq_client_err!(format!("broker not found, {}", mq.broker_name())))
+        }
+    }
+}
+
+impl OffsetStoreTrait for RemoteBrokerOffsetStore {
+    async fn load(&self) -> crate::ClientResult<()> {
+        Ok(())
+    }
+
+    async fn update_offset(&self, mq: &MessageQueue, offset: i64, increase_only: bool) {
+        let mut offset_table = self.offset_table.lock().await;
+        let offset_old = offset_table
+            .entry(mq.clone())
+            .or_insert_with(|| ControllableOffset::new(offset));
+        if increase_only {
+            offset_old.update(offset, true);
+        } else {
+            offset_old.update_unconditionally(offset);
+        }
+    }
+
+    async fn update_and_freeze_offset(&self, mq: &MessageQueue, offset: i64) {
+        let mut offset_table = self.offset_table.lock().await;
+        offset_table
+            .entry(mq.clone())
+            .or_insert_with(|| ControllableOffset::new(offset))
+            .update_and_freeze(offset);
+    }
+
+    async fn read_offset(&self, mq: &MessageQueue, type_: ReadOffsetType) -> i64 {
+        match type_ {
+            ReadOffsetType::ReadFromMemory => {
+                let offset_table = self.offset_table.lock().await;
+                if let Some(offset) = offset_table.get(mq) {
+                    return offset.get_offset();
+                }
+                -1
+            }
+            ReadOffsetType::MemoryFirstThenStore => {
+                let memory_offset = {
+                    let offset_table = self.offset_table.lock().await;
+                    offset_table.get(mq).map(ControllableOffset::get_offset)
+                };
+                if let Some(offset) = memory_offset {
+                    return offset;
+                }
+                match self.fetch_consume_offset_from_broker(mq).await {
+                    Ok(value) => {
+                        self.update_offset(mq, value, false).await;
+                        value
+                    }
+                    Err(error)
+                        if error.broker_response_code()
+                            == Some(rocketmq_protocol::code::response_code::ResponseCode::QueryNotFound as i32) =>
+                    {
+                        -1
+                    }
+                    Err(_) => {
+                        warn!("fetchConsumeOffsetFromBroker exception: {:?}", mq);
+                        -2
+                    }
+                }
+            }
+            ReadOffsetType::ReadFromStore => match self.fetch_consume_offset_from_broker(mq).await {
+                Ok(value) => {
+                    self.update_offset(mq, value, false).await;
+                    value
+                }
+                Err(error)
+                    if error.broker_response_code()
+                        == Some(rocketmq_protocol::code::response_code::ResponseCode::QueryNotFound as i32) =>
+                {
+                    -1
+                }
+                Err(_) => {
+                    warn!("fetchConsumeOffsetFromBroker exception: {:?}", mq);
+                    -2
+                }
+            },
+        }
+    }
+
+    async fn persist_all(&self, mqs: &HashSet<MessageQueue>) {
+        if mqs.is_empty() {
+            return;
+        }
+        let mut unused_mq = HashSet::new();
+        let mut used_mq = Vec::new();
+        let mut offset_table = self.offset_table.lock().await;
+        for (mq, offset) in offset_table.iter_mut() {
+            if mqs.contains(mq) {
+                let offset = offset.get_offset();
+                used_mq.push((mq.clone(), offset));
+            } else {
+                unused_mq.insert(mq.clone());
+            }
+        }
+        for mq in &unused_mq {
+            offset_table.remove(mq);
+            info!("remove unused mq, {}, {}", mq, self.group_name);
+        }
+        drop(offset_table);
+        if !unused_mq.is_empty() {
+            let mut persisted_offset_table = self.persisted_offset_table.lock().await;
+            for mq in &unused_mq {
+                persisted_offset_table.remove(mq);
+            }
+        }
+
+        for (mq, offset) in used_mq {
+            if !self.offset_needs_persist(&mq, offset).await {
+                continue;
+            }
+            match self.update_consume_offset_to_broker(&mq, offset, true).await {
+                Ok(_) => {
+                    // Custom fork: oneway is not an ACK; keep eligible for the next periodic write.
+                    info!(
+                        "[persistAll] Group: {} ClientId: {} updateConsumeOffsetToBroker {} {}",
+                        self.group_name, self.client_instance.client_id, mq, offset
+                    );
+                }
+                Err(e) => {
+                    error!("updateConsumeOffsetToBroker exception, {},{}", mq, e);
+                }
+            }
+        }
+    }
+
+    async fn persist(&self, mq: &MessageQueue) {
+        let offset_table = self.offset_table.lock().await;
+        let Some(offset) = offset_table.get(mq).map(ControllableOffset::get_offset) else {
+            return;
+        };
+        drop(offset_table);
+        if !self.offset_needs_persist(mq, offset).await {
+            return;
+        }
+        match self.update_consume_offset_to_broker(mq, offset, true).await {
+            Ok(_) => {
+                // Custom fork: oneway is not an ACK; keep eligible for the next periodic write.
+                info!(
+                    "[persist] Group: {} ClientId: {} updateConsumeOffsetToBroker {} {}",
+                    self.group_name, self.client_instance.client_id, mq, offset
+                );
+            }
+            Err(e) => {
+                error!("updateConsumeOffsetToBroker exception, {},{}", mq, e);
+            }
+        }
+    }
+
+    async fn remove_offset(&self, mq: &MessageQueue) {
+        let offset_table_size = {
+            let mut offset_table = self.offset_table.lock().await;
+            offset_table.remove(mq);
+            offset_table.len()
+        };
+        let mut persisted_offset_table = self.persisted_offset_table.lock().await;
+        persisted_offset_table.remove(mq);
+        info!(
+            "remove unnecessary messageQueue offset. group={}, mq={}, offsetTableSize={}",
+            mq, self.group_name, offset_table_size
+        );
+    }
+
+    async fn clone_offset_table(&self, topic: &str) -> HashMap<MessageQueue, i64> {
+        let offset_table = self.offset_table.lock().await;
+        offset_table
+            .iter()
+            .filter(|(mq, _)| mq.topic_str() == topic)
+            .map(|(mq, offset)| (mq.clone(), offset.get_offset()))
+            .collect()
+    }
+
+    async fn update_consume_offset_to_broker(
+        &self,
+        mq: &MessageQueue,
+        offset: i64,
+        is_oneway: bool,
+    ) -> crate::ClientResult<()> {
+        let broker_name = self.client_instance.get_broker_name_from_message_queue(mq).await;
+        let mut find_broker_result = self
+            .client_instance
+            .find_broker_address_in_subscribe(&broker_name, mix_all::MASTER_ID, false)
+            .await;
+
+        if find_broker_result.is_none() {
+            self.client_instance
+                .update_topic_route_info_from_name_server_topic(mq.topic())
+                .await;
+            let broker_name = self.client_instance.get_broker_name_from_message_queue(mq).await;
+            find_broker_result = self
+                .client_instance
+                .find_broker_address_in_subscribe(&broker_name, mix_all::MASTER_ID, false)
+                .await;
+        }
+
+        if let Some(find_broker_result) = find_broker_result {
+            let request_header = UpdateConsumerOffsetRequestHeader {
+                consumer_group: self.group_name.clone(),
+                topic: mq.topic().clone(),
+                queue_id: mq.queue_id(),
+                commit_offset: offset,
+                topic_request_header: Some(TopicRequestHeader {
+                    lo: None,
+                    rpc: Some(RpcRequestHeader {
+                        namespace: None,
+                        namespaced: None,
+                        broker_name: Some(mq.broker_name().clone()),
+                        oneway: None,
+                    }),
+                }),
+            };
+            let Some(mq_client_api_impl) = self.client_instance.mq_client_api_impl.load_full() else {
+                return Err(crate::ClientError::not_initialized("MQClientAPIImpl"));
+            };
+            if is_oneway {
+                mq_client_api_impl
+                    .update_consumer_offset_oneway(find_broker_result.broker_addr.as_str(), request_header, 5_000)
+                    .await?;
+            } else {
+                mq_client_api_impl
+                    .update_consumer_offset(&find_broker_result.broker_addr, request_header, 5_000)
+                    .await?;
+            };
+            Ok(())
+        } else {
+            Err(mq_client_err!(format!("broker not found, {}", mq.broker_name())))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::base::client_config::ClientConfig;
+
+    fn new_store() -> RemoteBrokerOffsetStore {
+        let runtime = crate::runtime::test_client_runtime("remote-broker-offset-store-test");
+        let client_instance = MQClientInstance::new_arc(
+            ClientConfig::default(),
+            0,
+            "remote-offset-coalescing-test",
+            None,
+            runtime.component("instance"),
+            runtime.telemetry_handle().clone(),
+            runtime.pool().request_future_holder(),
+        );
+        RemoteBrokerOffsetStore::new(client_instance, CheetahString::from_static_str("group-a"))
+    }
+
+    fn message_queue() -> MessageQueue {
+        MessageQueue::from_parts("topic-a", "broker-a", 0)
+    }
+
+    #[tokio::test]
+    async fn persisted_offset_coalescing_skips_only_identical_offsets() {
+        let store = new_store();
+        let mq = message_queue();
+
+        assert!(store.offset_needs_persist(&mq, 10).await);
+
+        store.mark_offset_persisted(&mq, 10).await;
+
+        assert!(!store.offset_needs_persist(&mq, 10).await);
+        assert!(store.offset_needs_persist(&mq, 9).await);
+        assert!(store.offset_needs_persist(&mq, 11).await);
+    }
+
+    #[tokio::test]
+    async fn remove_offset_clears_persisted_coalescing_state() {
+        let store = new_store();
+        let mq = message_queue();
+
+        store.mark_offset_persisted(&mq, 10).await;
+        assert!(!store.offset_needs_persist(&mq, 10).await);
+
+        store.remove_offset(&mq).await;
+
+        assert!(store.offset_needs_persist(&mq, 10).await);
+    }
+
+    #[tokio::test]
+    async fn read_from_memory_distinguishes_absent_queue_from_stored_zero_offset() {
+        let store = new_store();
+        let absent_mq = message_queue();
+        let zero_mq = MessageQueue::from_parts("topic-a", "broker-a", 1);
+
+        assert_eq!(store.read_offset(&absent_mq, ReadOffsetType::ReadFromMemory).await, -1);
+
+        store.update_offset(&zero_mq, 0, false).await;
+        assert_eq!(store.read_offset(&zero_mq, ReadOffsetType::ReadFromMemory).await, 0);
+    }
+
+    #[tokio::test]
+    async fn memory_first_then_store_returns_cached_value_without_network_fallback() {
+        let store = new_store();
+        let mq = message_queue();
+        store.update_offset(&mq, 42, false).await;
+
+        let offset = store.read_offset(&mq, ReadOffsetType::MemoryFirstThenStore).await;
+
+        assert_eq!(offset, 42);
+    }
+
+    #[tokio::test]
+    async fn clone_offset_table_filters_by_exact_topic_with_overlapping_broker_and_queue_ids() {
+        let store = new_store();
+        let topic_a_q0 = MessageQueue::from_parts("topic-a", "broker-a", 0);
+        let topic_b_q0 = MessageQueue::from_parts("topic-b", "broker-a", 0);
+
+        store.update_offset(&topic_a_q0, 5, false).await;
+        store.update_offset(&topic_b_q0, 9, false).await;
+
+        let table = store.clone_offset_table("topic-a").await;
+
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get(&topic_a_q0), Some(&5));
+
+        let missing = store.clone_offset_table("topic-missing").await;
+        assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clone_offset_table_snapshot_is_isolated_from_later_store_mutations() {
+        let store = new_store();
+        let mq = message_queue();
+        store.update_offset(&mq, 1, false).await;
+
+        let mut snapshot = store.clone_offset_table("topic-a").await;
+        snapshot.insert(mq.clone(), 999);
+        assert_eq!(store.read_offset(&mq, ReadOffsetType::ReadFromMemory).await, 1);
+
+        let snapshot_before_mutation = store.clone_offset_table("topic-a").await;
+        store.update_offset(&mq, 2, false).await;
+        store.remove_offset(&mq).await;
+
+        assert_eq!(snapshot_before_mutation.get(&mq), Some(&1));
+    }
+}

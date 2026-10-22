@@ -1,0 +1,128 @@
+# Copyright 2023 The RocketMQ Rust Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+[package]
+name                 = "rocketmq-controller"
+version.workspace    = true
+authors.workspace    = true
+edition.workspace    = true
+homepage.workspace   = true
+repository.workspace = true
+license.workspace    = true
+readme               = "README.md"
+description          = "RocketMQ Controller Module - High Availability Raft-based Controller"
+keywords             = ["rocketmq", "controller", "raft", "distributed", "messaging"]
+categories           = ["network-programming", "asynchronous"]
+
+[dependencies]
+rocketmq-auth     = { workspace = true }
+rocketmq-error    = { workspace = true }
+rocketmq-model    = { workspace = true }
+rocketmq-protocol = { workspace = true }
+rocketmq-runtime  = { workspace = true }
+rocketmq-store-api = { workspace = true }
+rocketmq-security-api = { workspace = true }
+rocketmq-observability = { workspace = true }
+rocketmq-transport = { workspace = true }
+
+# Core async runtime
+tokio      = { workspace = true }
+tokio-util = { workspace = true }
+
+# Raft consensus algorithm
+openraft = { version = "=0.10.0-alpha.21", default-features = false, features = [
+  "serde",
+  "tokio-rt",
+] }
+# OpenRaft prereleases use caret constraints internally. Keep the runtime crates
+# aligned with the core ABI. Pin macros separately: alpha.35 preserves the
+# runtime-related expansions used by alpha.21.
+openraft-macros   = "=0.10.0-alpha.35"
+openraft-rt       = "=0.10.0-alpha.21"
+openraft-rt-tokio = "=0.10.0-alpha.21"
+
+# gRPC networking
+tonic       = { version = "0.14.6", features = ["transport", "codegen"] }
+tonic-prost = "0.14"
+
+# Serialization
+serde      = { workspace = true }
+serde_json = { workspace = true }
+sha2       = "0.11"
+hex        = "0.4"
+
+# Networking and protocols
+bytes        = { workspace = true }
+prost        = "0.14"
+futures      = "0.3"
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+
+cheetah-string = { workspace = true }
+
+clap   = { version = "4.6.1", features = ["derive"] }
+config = { workspace = true }
+dirs   = { workspace = true }
+
+
+# Concurrent data structures
+arc-swap    = "1.9"
+dashmap     = { workspace = true }
+parking_lot = { workspace = true }
+anyhow      = { workspace = true }
+
+# Logging and tracing
+tracing = { workspace = true }
+
+# Async trait support
+async-trait = "0.1"
+
+# Storage backends
+rocksdb = { workspace = true, optional = true }
+
+[build-dependencies]
+protoc-bin-vendored = "=3.2.0"
+tonic-prost-build   = "0.14.6"
+
+[dev-dependencies]
+criterion          = { version = "0.8", features = ["async_tokio"] }
+# Path-only on purpose: cargo drops path-only dev-dependencies when packaging.
+# A versioned entry must already be on crates.io, and cargo does not order
+# workspace publishing by dev-dependencies. `default-features = false` matches
+# the `[workspace.dependencies]` entry.
+rocketmq-client-rust = { path = "../rocketmq-client", default-features = false }
+rocketmq-transport = { workspace = true, features = ["test-support"] }
+tempfile           = "3.27"
+tracing-subscriber = { workspace = true }
+
+[features]
+default         = ["storage-rocksdb"]
+storage-rocksdb = ["rocksdb"]
+storage-file    = []
+dev-single      = ["storage-file"]
+metrics         = [
+  "rocketmq-observability/otel-metrics",
+  "rocketmq-transport/observability",
+]
+metrics-otlp    = ["metrics", "rocketmq-observability/otlp-metrics"]
+metrics-prometheus = ["metrics", "rocketmq-observability/prometheus"]
+otel-traces     = ["rocketmq-observability/otel-traces"]
+otel-logs       = ["rocketmq-observability/otel-logs"]
+otlp-traces     = ["otel-traces", "rocketmq-observability/otlp-traces"]
+otlp-logs       = ["otel-logs", "rocketmq-observability/otlp-logs"]
+debug           = []
+
+[[bin]]
+name = "rocketmq-controller-rust"
+path = "src/bin/controller_bootstrap.rs"

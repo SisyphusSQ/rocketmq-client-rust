@@ -1,0 +1,237 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+pub use crate::semantic::metrics::BROKER_PERMISSION;
+pub use crate::semantic::metrics::BROKER_UP;
+pub use crate::semantic::metrics::COMMIT_MESSAGES_TOTAL;
+pub use crate::semantic::metrics::CONSUMER_CONNECTIONS;
+pub use crate::semantic::metrics::CONSUMER_GROUP_CREATE_EXECUTION_TIME;
+pub use crate::semantic::metrics::CONSUMER_GROUP_NUMBER;
+pub use crate::semantic::metrics::CONSUMER_INFLIGHT_MESSAGES;
+pub use crate::semantic::metrics::CONSUMER_LAG_LATENCY;
+pub use crate::semantic::metrics::CONSUMER_LAG_MESSAGES;
+pub use crate::semantic::metrics::CONSUMER_QUEUEING_LATENCY;
+pub use crate::semantic::metrics::CONSUMER_READY_MESSAGES;
+pub use crate::semantic::metrics::FINISH_MESSAGE_LATENCY;
+pub use crate::semantic::metrics::HALF_MESSAGES;
+pub use crate::semantic::metrics::MESSAGES_IN_TOTAL;
+pub use crate::semantic::metrics::MESSAGES_OUT_TOTAL;
+pub use crate::semantic::metrics::MESSAGE_SIZE;
+pub use crate::semantic::metrics::METRICS_LABEL_DROPPED_TOTAL;
+pub use crate::semantic::metrics::PROCESSOR_WATERMARK;
+pub use crate::semantic::metrics::PRODUCER_CONNECTIONS;
+pub use crate::semantic::metrics::ROLLBACK_MESSAGES_TOTAL;
+pub use crate::semantic::metrics::SEND_MESSAGE_LATENCY;
+pub use crate::semantic::metrics::SEND_TO_DLQ_MESSAGES_TOTAL;
+pub use crate::semantic::metrics::THROUGHPUT_IN_TOTAL;
+pub use crate::semantic::metrics::THROUGHPUT_OUT_TOTAL;
+pub use crate::semantic::metrics::TOPIC_CREATE_EXECUTION_TIME;
+pub use crate::semantic::metrics::TOPIC_NUMBER;
+
+#[cfg(not(feature = "otel-metrics"))]
+#[derive(Debug, Clone, Default)]
+pub struct BrokerMetrics;
+
+#[cfg(not(feature = "otel-metrics"))]
+impl BrokerMetrics {
+    pub fn noop() -> Self {
+        Self
+    }
+
+    #[inline]
+    pub fn record_messages_in(&self, _count: u64, _bytes: u64, _message_size: u64) {}
+
+    #[inline]
+    pub fn record_messages_out(&self, _count: u64, _bytes: u64) {}
+
+    #[inline]
+    pub fn record_metrics_label_dropped_total(&self, _count: u64, _attributes: &crate::MetricAttributes) {}
+
+    #[inline]
+    pub fn record_broker_up(&self, _value: u64, _attributes: &crate::MetricAttributes) {}
+}
+
+#[cfg(feature = "otel-metrics")]
+#[derive(Clone)]
+pub struct BrokerMetrics {
+    telemetry: Option<crate::TelemetryRecorder>,
+    messages_in_total: opentelemetry::metrics::Counter<u64>,
+    messages_out_total: opentelemetry::metrics::Counter<u64>,
+    throughput_in_total: opentelemetry::metrics::Counter<u64>,
+    throughput_out_total: opentelemetry::metrics::Counter<u64>,
+    message_size: opentelemetry::metrics::Histogram<u64>,
+    send_message_latency: opentelemetry::metrics::Histogram<u64>,
+    metrics_label_dropped_total: opentelemetry::metrics::Counter<u64>,
+    broker_up: opentelemetry::metrics::Gauge<u64>,
+}
+
+#[cfg(feature = "otel-metrics")]
+impl BrokerMetrics {
+    /// Creates a lifecycle-gated recorder from an explicit telemetry handle.
+    #[must_use]
+    pub fn from_handle(telemetry: &crate::TelemetryHandle) -> Option<Self> {
+        let telemetry = telemetry.child(crate::BROKER_METER_SCOPE);
+        let meter = telemetry.meter()?;
+        Some(Self::build(&meter, Some(telemetry)))
+    }
+
+    pub(crate) fn new(meter: &opentelemetry::metrics::Meter) -> Self {
+        Self::build(meter, None)
+    }
+
+    fn build(meter: &opentelemetry::metrics::Meter, telemetry: Option<crate::TelemetryRecorder>) -> Self {
+        let messages_in_total = meter
+            .u64_counter(MESSAGES_IN_TOTAL)
+            .with_description("Total number of messages received by broker")
+            .with_unit("{message}")
+            .build();
+
+        let messages_out_total = meter
+            .u64_counter(MESSAGES_OUT_TOTAL)
+            .with_description("Total number of messages sent out from broker")
+            .with_unit("{message}")
+            .build();
+
+        let throughput_in_total = meter
+            .u64_counter(THROUGHPUT_IN_TOTAL)
+            .with_description("Total bytes received by broker")
+            .with_unit("By")
+            .build();
+
+        let throughput_out_total = meter
+            .u64_counter(THROUGHPUT_OUT_TOTAL)
+            .with_description("Total bytes sent out from broker")
+            .with_unit("By")
+            .build();
+
+        let message_size = meter
+            .u64_histogram(MESSAGE_SIZE)
+            .with_description("Message body size distribution")
+            .with_unit("By")
+            .build();
+
+        let send_message_latency = meter
+            .u64_histogram(SEND_MESSAGE_LATENCY)
+            .with_description("Broker send message processing latency")
+            .with_unit("ms")
+            .build();
+
+        let metrics_label_dropped_total = meter
+            .u64_counter(METRICS_LABEL_DROPPED_TOTAL)
+            .with_description("Total number of metrics labels dropped by cardinality guard")
+            .with_unit("{label}")
+            .build();
+        let broker_up = meter
+            .u64_gauge(BROKER_UP)
+            .with_description("Broker process is initialized and serving")
+            .with_unit("1")
+            .build();
+
+        Self {
+            telemetry,
+            messages_in_total,
+            messages_out_total,
+            throughput_in_total,
+            throughput_out_total,
+            message_size,
+            send_message_latency,
+            metrics_label_dropped_total,
+            broker_up,
+        }
+    }
+
+    #[inline]
+    fn is_active(&self) -> bool {
+        self.telemetry.as_ref().is_none_or(crate::TelemetryRecorder::is_active)
+    }
+
+    #[inline]
+    pub fn record_messages_in_total(&self, count: u64, attributes: &crate::MetricAttributes) {
+        if self.is_active() {
+            self.messages_in_total.add(count, attributes.as_key_values());
+        }
+    }
+
+    #[inline]
+    pub fn record_messages_out_total(&self, count: u64, attributes: &crate::MetricAttributes) {
+        if self.is_active() {
+            self.messages_out_total.add(count, attributes.as_key_values());
+        }
+    }
+
+    #[inline]
+    pub fn record_throughput_in_total(&self, bytes: u64, attributes: &crate::MetricAttributes) {
+        if self.is_active() {
+            self.throughput_in_total.add(bytes, attributes.as_key_values());
+        }
+    }
+
+    #[inline]
+    pub fn record_throughput_out_total(&self, bytes: u64, attributes: &crate::MetricAttributes) {
+        if self.is_active() {
+            self.throughput_out_total.add(bytes, attributes.as_key_values());
+        }
+    }
+
+    #[inline]
+    pub fn record_message_size(&self, size: u64, attributes: &crate::MetricAttributes) {
+        if self.is_active() {
+            self.message_size.record(size, attributes.as_key_values());
+        }
+    }
+
+    #[inline]
+    pub fn record_send_message_latency(&self, latency_ms: u64, attributes: &crate::MetricAttributes) {
+        if self.is_active() {
+            self.send_message_latency.record(latency_ms, attributes.as_key_values());
+        }
+    }
+
+    #[inline]
+    pub fn record_metrics_label_dropped_total(&self, count: u64, attributes: &crate::MetricAttributes) {
+        if self.is_active() {
+            self.metrics_label_dropped_total.add(count, attributes.as_key_values());
+        }
+    }
+
+    #[inline]
+    pub fn record_broker_up(&self, value: u64, attributes: &crate::MetricAttributes) {
+        self.broker_up.record(value, attributes.as_key_values());
+    }
+}
+
+#[cfg(all(test, feature = "otel-metrics"))]
+mod tests {
+    use opentelemetry::metrics::MeterProvider;
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
+
+    use super::*;
+
+    #[test]
+    fn broker_metrics_constructs_and_records() {
+        let provider = SdkMeterProvider::builder().build();
+        let meter = provider.meter("broker-metrics-test");
+        let metrics = BrokerMetrics::new(&meter);
+        let attrs = crate::MetricAttributes::new().with("topic", "test-topic");
+
+        metrics.record_messages_in_total(1, &attrs);
+        metrics.record_messages_out_total(1, &attrs);
+        metrics.record_throughput_in_total(128, &attrs);
+        metrics.record_throughput_out_total(64, &attrs);
+        metrics.record_message_size(128, &attrs);
+        metrics.record_send_message_latency(10, &attrs);
+        metrics.record_metrics_label_dropped_total(1, &attrs);
+        metrics.record_broker_up(1, &attrs);
+    }
+}

@@ -1,0 +1,161 @@
+# Custom fork: SDK dependency closure selected from upstream 02f1a19a (2026-10-16).
+# Copyright 2023 The RocketMQ Rust Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+[workspace]
+members = [
+  "rocketmq-auth",
+  "rocketmq-client",
+  "rocketmq-controller",
+  "rocketmq-error",
+  "rocketmq-macros",
+  "rocketmq-model",
+  "rocketmq-namesrv",
+  "rocketmq-observability",
+  "rocketmq-protocol",
+  "rocketmq-runtime",
+  "rocketmq-security-api",
+  "rocketmq-store-api",
+  "rocketmq-transport",
+]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+authors = ["mxsm <mxsm@apache.org>"]
+edition = "2021"
+homepage = "https://github.com/SisyphusSQ/rocketmq-client-rust"
+# Custom: package metadata points at the controlled delivery source.
+repository = "https://github.com/SisyphusSQ/rocketmq-client-rust"
+license = "Apache-2.0"
+keywords = [
+  "apache-rocketmq",
+  "rocketmq-rust",
+  "rocketmq-rs",
+  "rust",
+  "rocketmq-client",
+]
+categories = ["asynchronous", "network-programming", "development-tools"]
+readme = "README.md"
+description = """
+Unofficial Rust implementation of Apache RocketMQ
+"""
+rust-version = "1.95.0"
+[workspace.dependencies]
+rocketmq-runtime     = { version = "1.0.0", path = "./rocketmq-runtime" }
+rocketmq-macros      = { version = "1.0.0", path = "./rocketmq-macros" }
+rocketmq-client-rust = { version = "1.0.0", path = "./rocketmq-client", default-features = false }
+rocketmq-error       = { version = "1.0.0", path = "./rocketmq-error" }
+rocketmq-auth        = { version = "1.0.0", path = "./rocketmq-auth" }
+rocketmq-controller  = { version = "1.0.0", path = "./rocketmq-controller" }
+rocketmq-namesrv     = { version = "1.0.0", path = "./rocketmq-namesrv" }
+rocketmq-observability = { version = "1.0.0", path = "./rocketmq-observability" }
+rocketmq-model       = { version = "1.0.0", path = "./rocketmq-model" }
+rocketmq-protocol    = { version = "1.0.0", path = "./rocketmq-protocol" }
+rocketmq-security-api = { version = "1.0.0", path = "./rocketmq-security-api" }
+rocketmq-store-api     = { version = "1.0.0", path = "./rocketmq-store-api", default-features = false }
+rocketmq-transport    = { version = "1.0.0", path = "./rocketmq-transport", default-features = false }
+
+tokio = { version = "1.52", features = [
+  "fs",
+  "io-std",
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+tokio-util = { version = "0.7.18", features = [
+  "codec",
+  "compat",
+  "io-util",
+  "net",
+  "rt",
+  "time",
+] }
+tokio-stream = { version = "0.1.18", features = [
+  "fs",
+  "io-util",
+  "net",
+  "signal",
+  "sync",
+  "time",
+] }
+
+tracing            = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["time", "env-filter", "json", "registry", "tracing-log"] }
+tracing-appender   = "0.2.5"
+tracing-log        = "0.2.0"
+
+thiserror = "2.0.18"
+
+
+#serde
+serde              = { version = "1.0", features = ["derive"] }
+serde_json         = "1.0"
+serde_yaml         = "0.9"
+serde_json_any_key = "2.1.0"
+anyhow             = "1.0.103"
+bytes              = "1.11.1"
+rand               = "0.10.1"
+zeroize            = "1.9.0"
+pkcs8              = { version = "0.11.0", features = ["encryption", "getrandom", "pem", "std"] }
+ipnet              = "2.12.0"
+num_cpus           = "1.17"
+
+config = "0.15.23"
+
+parking_lot   = "0.12"
+dirs          = "7.0"
+trait-variant = "0.1.2"
+
+mockall = "0.15.0"
+cfg-if  = "1.0.4"
+windows-sys = "0.61.2"
+
+sysinfo = "0.39.3"
+uuid = { version = "1.23.3", features = [
+  "v4",                # Lets you generate random UUIDs
+  "fast-rng",          # Use a faster (but still sufficiently random) RNG
+  "macro-diagnostics",
+] }
+
+
+futures = "0.3"
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["system-config", "tokio"] }
+
+cheetah-string = { version = "3.1.0", features = ["serde", "bytes", "simd"] }
+
+flate2   = "1.1.9"
+dashmap  = "6.2.1"
+strum    = { version = "0.28.0", features = ["derive"] }
+smallvec = "1.13"
+
+# Keep the OpenTelemetry API, SDK, and exporters on the same minor version.
+# tracing-opentelemetry 0.34 requires OpenTelemetry 0.33 types.
+opentelemetry                      = { version = "0.33", features = ["metrics"] }
+opentelemetry_sdk                  = { version = "0.33", features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp                 = { version = "0.33", default-features = false }
+opentelemetry-prometheus           = { version = "0.33", default-features = false }
+opentelemetry-appender-tracing     = { version = "0.33", default-features = false }
+opentelemetry-semantic-conventions = { version = "0.33" }
+tracing-opentelemetry              = { version = "0.34", default-features = false }
+prometheus                         = { version = "0.14", default-features = false }
+rocksdb                            = { version = "0.25", default-features = false, features = ["multi-threaded-cf", "lz4", "zstd"] }
+
+# Custom: candidate identity is the full Git revision, not the inherited crate version.

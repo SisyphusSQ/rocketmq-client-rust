@@ -1,0 +1,169 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use cheetah_string::CheetahString;
+use rocketmq_macros::RequestHeaderCodec;
+use serde::Deserialize;
+use serde::Serialize;
+
+use crate::protocol::header::message_operation_header::TopicRequestHeaderTrait;
+use crate::rpc::topic_request_header::TopicRequestHeader;
+
+const fn default_committed() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, RequestHeaderCodec)]
+#[header(
+    type_id = "rocketmq_protocol::protocol::header::get_max_offset_request_header::GetMaxOffsetRequestHeader",
+    java_class = "org.apache.rocketmq.remoting.protocol.header.GetMaxOffsetRequestHeader"
+)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMaxOffsetRequestHeader {
+    #[header(required)]
+    pub topic: CheetahString,
+
+    #[header(required)]
+    pub queue_id: i32,
+
+    #[serde(default = "default_committed")]
+    #[header(default_with = "default_committed", default_semantic = "literal:true")]
+    pub committed: bool,
+
+    #[serde(flatten)]
+    #[header(flatten, presence = "always")]
+    pub topic_request_header: Option<TopicRequestHeader>,
+}
+
+impl TopicRequestHeaderTrait for GetMaxOffsetRequestHeader {
+    fn set_lo(&mut self, lo: Option<bool>) {
+        if let Some(header) = self.topic_request_header.as_mut() {
+            header.lo = lo;
+        }
+    }
+
+    fn lo(&self) -> Option<bool> {
+        self.topic_request_header.as_ref().and_then(|h| h.lo)
+    }
+
+    fn set_topic(&mut self, topic: CheetahString) {
+        self.topic = topic;
+    }
+
+    fn topic(&self) -> &CheetahString {
+        &self.topic
+    }
+
+    fn broker_name(&self) -> Option<&CheetahString> {
+        self.topic_request_header
+            .as_ref()
+            .and_then(|h| h.rpc_request_header.as_ref())
+            .and_then(|h| h.broker_name.as_ref())
+    }
+
+    fn set_broker_name(&mut self, broker_name: CheetahString) {
+        if let Some(header) = self.topic_request_header.as_mut() {
+            if let Some(rpc_header) = header.rpc_request_header.as_mut() {
+                rpc_header.broker_name = Some(broker_name);
+            }
+        }
+    }
+
+    fn namespace(&self) -> Option<&str> {
+        self.topic_request_header
+            .as_ref()
+            .and_then(|h| h.rpc_request_header.as_ref())
+            .and_then(|r| r.namespace.as_deref())
+    }
+
+    fn set_namespace(&mut self, namespace: CheetahString) {
+        if let Some(header) = self.topic_request_header.as_mut() {
+            if let Some(rpc_header) = header.rpc_request_header.as_mut() {
+                rpc_header.namespace = Some(namespace);
+            }
+        }
+    }
+
+    fn namespaced(&self) -> Option<bool> {
+        self.topic_request_header
+            .as_ref()
+            .and_then(|h| h.rpc_request_header.as_ref())
+            .and_then(|r| r.namespaced)
+    }
+
+    fn set_namespaced(&mut self, namespaced: bool) {
+        if let Some(header) = self.topic_request_header.as_mut() {
+            if let Some(rpc_header) = header.rpc_request_header.as_mut() {
+                rpc_header.namespaced = Some(namespaced);
+            }
+        }
+    }
+
+    fn oneway(&self) -> Option<bool> {
+        self.topic_request_header
+            .as_ref()
+            .and_then(|h| h.rpc_request_header.as_ref())
+            .and_then(|r| r.oneway)
+    }
+
+    fn set_oneway(&mut self, oneway: bool) {
+        if let Some(header) = self.topic_request_header.as_mut() {
+            if let Some(rpc_header) = header.rpc_request_header.as_mut() {
+                rpc_header.oneway = Some(oneway);
+            }
+        }
+    }
+
+    fn queue_id(&self) -> i32 {
+        self.queue_id
+    }
+
+    fn set_queue_id(&mut self, queue_id: i32) {
+        self.queue_id = queue_id;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serde_defaults_committed_to_java_default() {
+        let header: GetMaxOffsetRequestHeader = serde_json::from_str(r#"{"topic":"topic-a","queueId":1}"#).unwrap();
+
+        assert!(header.committed);
+    }
+
+    #[test]
+    fn nested_setters_are_noops_without_an_rpc_envelope() {
+        let mut header = GetMaxOffsetRequestHeader {
+            topic: CheetahString::from("topic-a"),
+            queue_id: 1,
+            committed: true,
+            topic_request_header: None,
+        };
+
+        header.set_lo(Some(true));
+        header.set_broker_name(CheetahString::from("broker-a"));
+        header.set_namespace(CheetahString::from("namespace-a"));
+        header.set_namespaced(true);
+        header.set_oneway(true);
+
+        assert_eq!(header.lo(), None);
+        assert_eq!(header.broker_name(), None);
+        assert_eq!(header.namespace(), None);
+        assert_eq!(header.namespaced(), None);
+        assert_eq!(header.oneway(), None);
+    }
+}

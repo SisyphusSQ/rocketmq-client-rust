@@ -1,0 +1,380 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use cheetah_string::CheetahString;
+use rocketmq_model::common::message::message_queue::MessageQueue;
+use rocketmq_runtime::ChildServiceContext;
+
+use crate::base::client_config::ClientConfig;
+use crate::latency::latency_fault_tolerance::LatencyFaultTolerance;
+#[cfg(any(test, feature = "test-support"))]
+use crate::latency::latency_fault_tolerance_impl::FaultClock;
+use crate::latency::latency_fault_tolerance_impl::LatencyFaultToleranceImpl;
+use crate::producer::producer_impl::default_mq_producer_impl::DefaultResolver;
+use crate::producer::producer_impl::default_mq_producer_impl::DefaultServiceDetector;
+use crate::producer::producer_impl::queue_filter::QueueFilter;
+use crate::producer::producer_impl::topic_publish_info::TopicPublishInfo;
+
+#[derive(Clone)]
+pub struct MQFaultStrategy {
+    latency_fault_tolerance: Arc<LatencyFaultToleranceImpl<DefaultResolver, DefaultServiceDetector>>,
+    send_latency_fault_enable: Arc<AtomicBool>,
+    start_detector_enable: Arc<AtomicBool>,
+    latency_max: Vec<u64>,
+    not_available_duration: Vec<u64>,
+}
+
+impl MQFaultStrategy {
+    pub const DEFAULT_LATENCY_MAX: [u64; 7] = [50, 100, 550, 1000, 2000, 3000, 15000];
+    pub const DEFAULT_NOT_AVAILABLE_DURATION: [u64; 7] = [0, 0, 30000, 60000, 120000, 180000, 600000];
+    /// Custom: pinned Java applies a 30-second sample when isolating a broker.
+    const ISOLATION_LATENCY_MS: u64 = 30_000;
+
+    pub fn new(service_context: ChildServiceContext, client_config: &ClientConfig) -> Self {
+        let tolerance_impl = LatencyFaultToleranceImpl::new(service_context);
+        Self::from_tolerance_impl(tolerance_impl, client_config)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn new_with_fault_clock(
+        service_context: ChildServiceContext,
+        client_config: &ClientConfig,
+        clock: Arc<dyn FaultClock>,
+    ) -> Self {
+        let tolerance_impl = LatencyFaultToleranceImpl::new_with_clock(service_context, clock);
+        Self::from_tolerance_impl(tolerance_impl, client_config)
+    }
+
+    fn from_tolerance_impl(
+        tolerance_impl: LatencyFaultToleranceImpl<DefaultResolver, DefaultServiceDetector>,
+        client_config: &ClientConfig,
+    ) -> Self {
+        tolerance_impl.set_detect_interval(client_config.detect_interval);
+        tolerance_impl.set_detect_timeout(client_config.detect_timeout);
+        tolerance_impl.set_start_detector_enable(client_config.start_detector_enable);
+        let latency_fault_tolerance = Arc::new(tolerance_impl);
+        Self {
+            latency_fault_tolerance: Arc::clone(&latency_fault_tolerance),
+            send_latency_fault_enable: Arc::new(AtomicBool::new(client_config.send_latency_enable)),
+            start_detector_enable: Arc::new(AtomicBool::new(client_config.start_detector_enable)),
+            latency_max: Self::DEFAULT_LATENCY_MAX.to_vec(),
+            not_available_duration: Self::DEFAULT_NOT_AVAILABLE_DURATION.to_vec(),
+        }
+    }
+
+    pub fn start_detector(&self) {
+        LatencyFaultTolerance::start_detector(self.latency_fault_tolerance.clone());
+    }
+
+    pub(crate) fn set_resolve(&self, resolver: DefaultResolver) {
+        self.latency_fault_tolerance.set_resolver(resolver);
+    }
+
+    pub(crate) fn set_service_detector(&self, service_detector: DefaultServiceDetector) {
+        self.latency_fault_tolerance.set_service_detector(service_detector);
+    }
+
+    pub fn shutdown(&self) {
+        self.latency_fault_tolerance.shutdown();
+    }
+
+    pub async fn shutdown_async(&self) -> bool {
+        self.latency_fault_tolerance.shutdown_detector().await
+    }
+
+    pub fn is_start_detector_enable(&self) -> bool {
+        self.start_detector_enable.load(Ordering::Relaxed)
+    }
+
+    pub fn set_start_detector_enable(&self, start_detector_enable: bool) {
+        self.start_detector_enable
+            .store(start_detector_enable, Ordering::Relaxed);
+        self.latency_fault_tolerance
+            .set_start_detector_enable(start_detector_enable);
+    }
+
+    pub fn is_send_latency_fault_enable(&self) -> bool {
+        self.send_latency_fault_enable.load(Ordering::Relaxed)
+    }
+
+    pub fn select_one_message_queue(
+        &self,
+        tp_info: &TopicPublishInfo,
+        last_broker_name: Option<&CheetahString>,
+        reset_index: bool,
+    ) -> Option<MessageQueue> {
+        // Custom: exact 4.6.1 decision order, including its same-last-broker
+        // condition when latency isolation is enabled. No newer reachability fallback.
+        if reset_index {
+            tp_info.reset_index();
+        }
+        if self.send_latency_fault_enable.load(Ordering::Relaxed) {
+            if tp_info.message_queue_list.is_empty() {
+                return None;
+            }
+            let mut index = tp_info.send_which_queue.increment_and_get();
+            for _ in 0..tp_info.message_queue_list.len() {
+                let position =
+                    (i64::from(index.wrapping_abs()) % tp_info.message_queue_list.len() as i64).max(0) as usize;
+                index = index.wrapping_add(1);
+                let queue = &tp_info.message_queue_list[position];
+                if self.latency_fault_tolerance.is_available(queue.broker_name())
+                    && last_broker_name.is_none_or(|last| queue.broker_name() == last)
+                {
+                    return Some(queue.clone());
+                }
+            }
+            if let Some(broker) = self.latency_fault_tolerance.pick_one_at_least_java() {
+                let count = tp_info.get_write_queue_nums_by_broker(&broker);
+                if count > 0 {
+                    let mut queue = tp_info.select_one_message_queue()?;
+                    queue.set_broker_name(broker);
+                    queue.set_queue_id(tp_info.send_which_queue.increment_and_get() % count);
+                    return Some(queue);
+                }
+                self.latency_fault_tolerance.remove_java(&broker);
+            }
+            return tp_info.select_one_message_queue();
+        }
+        tp_info.select_one_message_queue_by_broker(last_broker_name)
+    }
+
+    pub fn get_latency_max(&self) -> &[u64] {
+        &self.latency_max
+    }
+
+    pub fn set_latency_max(&mut self, latency_max: impl Into<Vec<u64>>) {
+        self.latency_max = latency_max.into();
+    }
+
+    pub fn get_not_available_duration(&self) -> &[u64] {
+        &self.not_available_duration
+    }
+
+    pub fn set_not_available_duration(&mut self, not_available_duration: impl Into<Vec<u64>>) {
+        self.not_available_duration = not_available_duration.into();
+    }
+
+    pub async fn update_fault_item(
+        &self,
+        broker_name: CheetahString,
+        current_latency: u64,
+        isolation: bool,
+        reachable: bool,
+    ) {
+        self.update_fault_item_checked(broker_name, current_latency, isolation, reachable)
+            .await
+            .expect("Java latency policy duration array does not cover latencyMax");
+    }
+
+    /// Custom: native Result counterpart of Java's unchecked array-bound failure.
+    pub async fn update_fault_item_checked(
+        &self,
+        broker_name: CheetahString,
+        current_latency: u64,
+        isolation: bool,
+        reachable: bool,
+    ) -> crate::ClientResult<()> {
+        if self.send_latency_fault_enable.load(Ordering::Relaxed) {
+            Self::validate_java_latency_policy(&self.latency_max, &self.not_available_duration)?;
+            let effective_latency = if isolation {
+                Self::ISOLATION_LATENCY_MS
+            } else {
+                current_latency
+            };
+            let duration = self.compute_not_available_duration(effective_latency);
+            self.latency_fault_tolerance
+                .update_fault_item(broker_name, current_latency, duration, reachable)
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Java indexes durations by latencyMax; extra unused durations are valid.
+    pub fn validate_java_latency_policy(thresholds: &[u64], durations: &[u64]) -> crate::ClientResult<()> {
+        if durations.len() < thresholds.len() {
+            return Err(crate::ClientError::config_invalid(
+                "latency_fault_policy",
+                "duration array is shorter than latencyMax",
+                "provide a duration for every latencyMax threshold",
+            ));
+        }
+        Ok(())
+    }
+
+    fn compute_not_available_duration(&self, current_latency: u64) -> u64 {
+        let len = self.latency_max.len();
+        for i in (0..len).rev() {
+            if current_latency >= self.latency_max[i] {
+                return self.not_available_duration[i];
+            }
+        }
+        0
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn not_available_duration_for_test(&self, current_latency: u64, isolation: bool) -> u64 {
+        self.compute_not_available_duration(if isolation {
+            Self::ISOLATION_LATENCY_MS
+        } else {
+            current_latency
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn fault_item_state_for_test(&self, broker_name: &CheetahString) -> Option<(bool, bool, u64, u64)> {
+        self.latency_fault_tolerance.fault_item_state_for_test(broker_name)
+    }
+
+    #[inline]
+    pub fn set_send_latency_fault_enable(&self, send_latency_fault_enable: bool) {
+        self.send_latency_fault_enable
+            .store(send_latency_fault_enable, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BrokerFilter {
+    last_broker_name: Option<CheetahString>,
+}
+
+impl BrokerFilter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_last_broker_name(last_broker_name: Option<CheetahString>) -> Self {
+        Self { last_broker_name }
+    }
+
+    pub fn last_broker_name(&self) -> Option<&CheetahString> {
+        self.last_broker_name.as_ref()
+    }
+
+    pub fn get_last_broker_name(&self) -> Option<&CheetahString> {
+        self.last_broker_name()
+    }
+
+    pub fn set_last_broker_name(&mut self, last_broker_name: impl Into<CheetahString>) {
+        self.last_broker_name = Some(last_broker_name.into());
+    }
+
+    pub fn clear_last_broker_name(&mut self) {
+        self.last_broker_name = None;
+    }
+}
+
+impl QueueFilter for BrokerFilter {
+    fn filter(&self, message_queue: &MessageQueue) -> bool {
+        if let Some(last_broker_name) = &self.last_broker_name {
+            message_queue.broker_name() != last_broker_name
+        } else {
+            true
+        }
+    }
+}
+
+struct ReachableFilter {
+    latency_fault_tolerance: Arc<LatencyFaultToleranceImpl<DefaultResolver, DefaultServiceDetector>>,
+}
+
+impl QueueFilter for ReachableFilter {
+    fn filter(&self, message_queue: &MessageQueue) -> bool {
+        self.latency_fault_tolerance.is_reachable(message_queue.broker_name())
+    }
+}
+
+struct AvailableFilter {
+    latency_fault_tolerance: Arc<LatencyFaultToleranceImpl<DefaultResolver, DefaultServiceDetector>>,
+}
+
+impl QueueFilter for AvailableFilter {
+    fn filter(&self, message_queue: &MessageQueue) -> bool {
+        self.latency_fault_tolerance.is_available(message_queue.broker_name())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broker_filter_matches_java_last_broker_name_rule() {
+        let mq = MessageQueue::from_parts("topic", "broker-a", 0);
+        let mut filter = BrokerFilter::new();
+
+        assert!(filter.filter(&mq));
+        assert!(filter.get_last_broker_name().is_none());
+
+        filter.set_last_broker_name("broker-a");
+        assert_eq!(
+            filter.get_last_broker_name(),
+            Some(&CheetahString::from_static_str("broker-a"))
+        );
+        assert!(!filter.filter(&mq));
+
+        filter.set_last_broker_name("broker-b");
+        assert!(filter.filter(&mq));
+
+        filter.clear_last_broker_name();
+        assert!(filter.filter(&mq));
+    }
+
+    #[test]
+    fn mq_fault_strategy_copies_detector_config_like_java_constructor() {
+        let mut client_config = ClientConfig::default();
+        client_config.set_detect_interval(12_345);
+        client_config.set_detect_timeout(321);
+        client_config.set_start_detector_enable(true);
+
+        let strategy = MQFaultStrategy::new(
+            crate::runtime::test_service_context("mq-fault-strategy-test"),
+            &client_config,
+        );
+        let (detect_interval, detect_timeout) = strategy.latency_fault_tolerance.detector_config_for_test();
+
+        assert_eq!(detect_interval, 12_345);
+        assert_eq!(detect_timeout, 321);
+        assert!(strategy.is_start_detector_enable());
+        assert!(strategy.latency_fault_tolerance.is_start_detector_enable());
+    }
+
+    #[test]
+    fn cloned_strategy_shares_runtime_switches_and_snapshots_thresholds() {
+        let mut strategy = MQFaultStrategy::new(
+            crate::runtime::test_service_context("mq-fault-strategy-clone-test"),
+            &ClientConfig::default(),
+        );
+        strategy.set_latency_max(vec![10, 20, 30]);
+        strategy.set_not_available_duration(vec![0, 100, 200]);
+        strategy.set_send_latency_fault_enable(true);
+        strategy.set_start_detector_enable(true);
+
+        let snapshot = strategy.clone();
+
+        strategy.set_latency_max(vec![40, 50, 60]);
+        strategy.set_not_available_duration(vec![300, 400, 500]);
+        strategy.set_send_latency_fault_enable(false);
+        strategy.set_start_detector_enable(false);
+
+        assert_eq!(snapshot.get_latency_max(), &[10, 20, 30]);
+        assert_eq!(snapshot.get_not_available_duration(), &[0, 100, 200]);
+        assert!(!snapshot.is_send_latency_fault_enable());
+        assert!(!snapshot.is_start_detector_enable());
+    }
+}

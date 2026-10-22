@@ -1,0 +1,30 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::consumer::pull_result::PullResult;
+
+pub struct PullResultExt {
+    pub pull_result: PullResult,
+    pub suggest_which_broker_id: u64,
+    pub message_binary: Option<bytes::Bytes>,
+    pub offset_delta: Option<i64>,
+    /// Custom fork: Boolean.valueOf(TRACK_ON), false when absent.
+    pub track_enabled: bool,
+}
+
+impl PullResultExt {
+    pub fn is_track_enabled(&self) -> bool {
+        self.track_enabled
+    }
+}

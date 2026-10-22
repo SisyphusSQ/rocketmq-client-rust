@@ -1,0 +1,63 @@
+// Copyright 2023 The RocketMQ Rust Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Runtime-neutral RocketMQ wire protocol contracts.
+//!
+//! This crate defines request and response codes, [`RemotingCommand`] frames,
+//! custom-header codecs, protocol bodies, compression, and trace encoding.
+//! Its main entry points include [`RequestCode`], [`RemotingCommand`],
+//! [`CommandCustomHeader`], [`HeaderCodec`], and [`RpcRequestHeader`].
+//!
+//! Enable the `simd` feature to use accelerated protocol decoding paths.
+
+mod contract;
+mod error;
+
+pub mod code;
+pub mod common;
+pub mod protocol;
+pub mod rpc;
+pub mod trace;
+// Custom fork: custom code1000 protocol, separate from standard Trace Topic.
+pub mod track;
+
+pub use rocketmq_model::version;
+
+pub use code::request_code::RequestCode;
+pub use code::response_code::RemotingSysResponseCode;
+pub use contract::ProtocolContractViolation;
+pub use protocol::command_custom_header::CommandCustomHeader;
+pub use protocol::command_custom_header::FromMap;
+pub use protocol::command_custom_header::HeaderEncodeCapability;
+pub use protocol::command_custom_header::HeaderMap;
+pub use protocol::encoded_frame::EncodedFrame;
+pub use protocol::encoded_frame::EncodedFrameHead;
+pub use protocol::header_codec::HeaderCodec;
+pub use protocol::remoting_command::RemotingCommand;
+pub use protocol::rocketmq_serializable;
+pub use rpc::rpc_request_header::RpcRequestHeader;
+pub use rpc::topic_request_header::TopicRequestHeader;
+
+/// Stable implementation details used by RocketMQ derive macros.
+#[doc(hidden)]
+pub mod __request_header_codec {
+    pub use bytes::BytesMut;
+    pub use cheetah_string::CheetahString;
+    pub use rocketmq_error::Error;
+
+    /// Creates a descriptor-backed header validation error for generated codecs.
+    pub fn request_header_error(_detail: impl Into<String>) -> Error {
+        crate::error::request_header_failure()
+    }
+}
